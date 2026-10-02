@@ -1,0 +1,18 @@
+# 依赖（本仓库的扩展依赖由 pi 宿主提供，通常不需要 npm install）
+node_modules/
+package-lock.json
+
+# 凭据 / 本地配置 —— 绝对不要提交
+.env
+.env.*
+*.local
+.mcp.json
+.pi/mcp.json
+token.txt
+*.token
+
+# 日志 / 临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
