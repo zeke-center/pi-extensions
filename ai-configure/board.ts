@@ -3,7 +3,7 @@
  *
  * 一个 pi 扩展：在编辑器上方常驻一个"左大右小"的双栏面板。
  *   左栏：任务进度（AI 通过 progress 工具打点；自动跟踪当前动作）
- *   右栏：会话信息（模型 / token 用量 / git 分支 / MCP 服务 / 插件）
+ *   右栏：会话信息（MCP 服务 / 插件 / 助理）
  *
  * 命令:
  *   /board                 显示/隐藏整个面板
@@ -19,6 +19,7 @@ import { type Focusable, truncateToWidth, visibleWidth } from "@earendil-works/p
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
+import { loadTemplates } from "./delegate";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -78,6 +79,8 @@ let mounted = false;
 
 let cachedMcp: McpEntry[] = [];
 let cachedPlugins: string[] = [];
+/** 右栏「助理」栏：能派的名字 + 不能派的个数 */
+let cachedAssistants: { usable: string[]; blocked: number } = { usable: [], blocked: 0 };
 
 // ======================= 小工具 =======================
 /** 时长格式化：8s / 3m05s / 1h23m */
@@ -206,6 +209,23 @@ function rightLines(theme: Theme): string[] {
 		if (cachedPlugins.length > MAX_LISTED) out.push(` ${t.fg("dim", `+${cachedPlugins.length - MAX_LISTED}`)}`);
 	}
 
+	// --- 助理（delegate 能派谁）---
+	// 只列可派发的：base 是底座、demo 是样板，派了会被拒，列出来只会干扰
+	out.push(H(`助理 ${cachedAssistants.usable.length}`));
+	if (cachedAssistants.usable.length === 0) {
+		out.push(` ${t.fg("dim", "（无）")}`);
+	} else {
+		for (const n of cachedAssistants.usable.slice(0, MAX_LISTED)) {
+			out.push(` ${t.fg("success", "●")} ${t.fg("muted", shortText(n, RIGHT_WIDTH - 4))}`);
+		}
+		if (cachedAssistants.usable.length > MAX_LISTED) {
+			out.push(` ${t.fg("dim", `+${cachedAssistants.usable.length - MAX_LISTED}`)}`);
+		}
+	}
+	if (cachedAssistants.blocked > 0) {
+		out.push(` ${t.fg("dim", `○ ${cachedAssistants.blocked} 个不可派`)}`);
+	}
+
 	return out;
 }
 
@@ -316,6 +336,13 @@ function refreshData(ctx: ExtensionContext): void {
 		cachedPlugins = computePlugins();
 	} catch {
 		cachedPlugins = [];
+	}
+	try {
+		const all = loadTemplates(ctx.cwd);
+		const usable = all.filter((x) => x.base !== true && x.demo !== true).map((x) => x.key);
+		cachedAssistants = { usable, blocked: all.length - usable.length };
+	} catch {
+		cachedAssistants = { usable: [], blocked: 0 };
 	}
 }
 

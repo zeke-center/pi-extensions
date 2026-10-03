@@ -246,7 +246,7 @@ function resolveTemplate(t: Template, byKey: Map<string, Template>, seen: Set<st
 	};
 }
 
-function loadTemplates(cwd: string): Template[] {
+export function loadTemplates(cwd: string): Template[] {
 	const seen = new Set<string>();
 	const parsed: Template[] = [];
 	for (const dir of templateDirs(cwd)) {
