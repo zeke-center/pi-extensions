@@ -71,6 +71,11 @@ interface Template {
 	extends?: string;
 	/** base:true → 只给 extends 用，不直接派发（undefined = 没写） */
 	base?: boolean;
+	/**
+	 * demo:true → 示例模板：能看 / 能 show / 能 extends，但**绝对不能派**。
+	 * 和 base 的区别只是「怎么在列表里解释自己」：base 是底座、demo 是样板。
+	 */
+	demo?: boolean;
 	/** enabled:false → 列表里不显示、也不能派（undefined = 没写，视为 true） */
 	enabled?: boolean;
 	/** 是否带全局 AGENTS.md（frontmatter.agents_md）；undefined = 带。关掉省 ~1500 token/次 */
@@ -199,6 +204,7 @@ function parseTemplate(file: string, key: string): Template | null {
 		timeoutMs: meta.timeout ? parseDuration(meta.timeout) : undefined,
 		extends: meta.extends || undefined,
 		base: meta.base ? parseBool(meta.base, false) : undefined,
+		demo: meta.demo ? parseBool(meta.demo, false) : undefined,
 		enabled: meta.enabled ? parseBool(meta.enabled, true) : undefined,
 		agentsMd: meta.agents_md ? parseBool(meta.agents_md, true) : undefined,
 		mcpExposure: meta.mcp_exposure || undefined,
@@ -213,7 +219,7 @@ function parseTemplate(file: string, key: string): Template | null {
  *
  * 继承规则（写进 README 的那份）：
  *   继承：cwd / model / mcp / timeout / mcp_exposure / env / body
- *   不继承：base / enabled / agents_md（用自己写的，没写就是默认值）
+ *   不继承：base / demo / enabled / agents_md（用自己写的，没写就是默认值）
  *   mcp 是「覆盖」不是「合并」—— 避免「以为只挂了 1 个其实带了一堆」
  *
  * 最多 2 层（子 → 父 → 祖父），并检测循环。
@@ -751,7 +757,7 @@ function renderCard(r: RunResult): string {
  */
 function assistantHint(cwd: string): string {
 	try {
-		const tpls = loadTemplates(cwd).filter((t) => t.base !== true);
+		const tpls = loadTemplates(cwd).filter((t) => t.base !== true && t.demo !== true);
 		if (!tpls.length) return "";
 		const list = tpls.map((t) => `${t.key}（${t.name}：${oneLine(t.desc, 40)}）`).join("；");
 		return ` 可用：${list}`;
@@ -762,7 +768,7 @@ function assistantHint(cwd: string): string {
 
 function makeDelegateParams(hint: string) {
 	return Type.Object({
-		assistant: Type.String({ description: `助理模板名，如 db、backend。${hint}`.trim() }),
+		assistant: Type.String({ description: `助理模板名。${hint || "当前**没有**可派发的助理（都是 base / 示例模板），先用 /assistants 看看。"}` }),
 		task: Type.Optional(Type.String({ description: "一件事。写清目标 + 验收标准，别写「分析一下」这种模糊指令。" })),
 		tasks: Type.Optional(
 			Type.Array(Type.String(), {
@@ -866,8 +872,9 @@ function findTemplate(cwd: string, what: string): Template | undefined {
 }
 
 function notFound(ctx: ExtensionContext, cwd: string, what: string): void {
-	const have = loadTemplates(cwd).map((t) => t.key).join(", ") || "(一个都没有)";
-	ctx.ui.notify(`找不到助理「${what || "(没写)"}」。可用：${have}`, "warning");
+	const can = loadTemplates(cwd).filter((t) => t.base !== true && t.demo !== true);
+	const have = can.length ? `可派的有：${can.map((t) => t.key).join(", ")}` : `现在一个能派的都没有（只有 base 和示例模板）`;
+	ctx.ui.notify(`找不到助理「${what || "(没写)"}」。${have}`, "warning");
 }
 
 /** 向用户要一行文本（input 不可用就退化成 editor） */
@@ -924,15 +931,17 @@ function listAssistants(ctx: ExtensionContext, cwd: string): void {
 		);
 		return;
 	}
-	const usable = tpls.filter((t) => t.base !== true);
+	const usable = tpls.filter((t) => t.base !== true && t.demo !== true);
 	const bases = tpls.filter((t) => t.base === true);
+	const demos = tpls.filter((t) => t.demo === true);
 	const fmt = (t: Template): string =>
 		`• ${t.key} — ${t.name}\n` +
 		`    ${t.desc}\n` +
 		`    cwd: ${t.cwd}　mcp: ${t.mcp.length ? t.mcp.join(", ") : "—"}　timeout: ${t.timeoutMs ? `${Math.round(t.timeoutMs / 60000)}m` : "默认"}` +
 		(t.extends ? `\n    extends: ${t.extends}` : "");
-	const out = [`可派发的助理（${usable.length}）`, ...usable.map(fmt)];
+	const out = usable.length ? [`可派发的助理（${usable.length}）`, ...usable.map(fmt)] : ["可派发的助理（0）—— 现在没有能派的"];
 	if (bases.length) out.push("", `基础模板（${bases.length}，只给 extends 用，不能直接派）`, ...bases.map(fmt));
+	if (demos.length) out.push("", `示例模板（${demos.length}，给你看字段怎么写法的，不能派）`, ...demos.map(fmt));
 	out.push("", "细节：/assistants show <key>　配置：/assistants edit <key>　新建：/assistants new <key>");
 	ctx.ui.notify(out.join("\n"), "info");
 }
@@ -950,7 +959,7 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 		`超时    ${tpl.timeoutMs ? `${tpl.timeoutMs} ms` : "(默认 5 分钟)"}`,
 		`AGENTS  ${tpl.agentsMd === false ? "不带全局 AGENTS.md" : "带"}`,
 		`继承    ${tpl.extends ?? "(无)"}`,
-		`状态    ${tpl.base === true ? "基础模板（不能直接派）" : "可派发"}${tpl.enabled === false ? " · 已禁用" : ""}`,
+		`状态    ${tpl.demo === true ? "示例模板（不能派）" : tpl.base === true ? "基础模板（不能直接派）" : "可派发"}${tpl.enabled === false ? " · 已禁用" : ""}`,
 	];
 	const body = tpl.body ? `\n────── 提示词正文 ──────\n${tpl.body}` : "";
 	ctx.ui.notify(`${lines.join("\n")}${body}`, "info");
@@ -1121,10 +1130,28 @@ export function setupDelegate(api: ExtensionAPI): void {
 			const tpl = templates.find((t) => t.key === params.assistant || t.name === params.assistant);
 
 			if (!tpl) {
-				const have = templates.length ? templates.map((t) => `${t.key}(${t.name})`).join(", ") : "(一个都没有)";
+				const can = templates.filter((t) => t.base !== true && t.demo !== true);
+				const have = can.length
+					? `可派的有：${can.map((t) => `${t.key}(${t.name})`).join(", ")}`
+					: `可是现在**一个能派的都没有**（只有 base 和示例模板，用 /assistants 看）`;
 				return {
-					content: [{ type: "text" as const, text: `找不到助理「${params.assistant}」。可用：${have}` }],
+					content: [{ type: "text" as const, text: `找不到助理「${params.assistant}」。${have}` }],
 					details: { ok: false, reason: "template_not_found" },
+				};
+			}
+
+			// demo:true 是「示例模板」—— 只是拿来示范字段写法的，能看不能派
+			if (tpl.demo === true) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`「${tpl.name}」是示例模板（demo: true），不能派。` +
+								`它只是给你看字段怎么写法的 —— 想去掉限制就把它 frontmatter 里的 demo 那行删了。`,
+						},
+					],
+					details: { ok: false, reason: "template_is_demo" },
 				};
 			}
 

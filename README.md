@@ -23,10 +23,10 @@ pi-extensions/
 ├── assistants/          # 助理模板（每个 .md 一个助理）
 │   ├── role-dev.md      # 底座：开发类公共规矩（base，不能直接派）
 │   ├── role-ops.md      # 底座：只读类公共规矩（base，不能直接派）
-│   ├── frontend.md      # 前端助理（extends role-dev）
-│   ├── backend.md       # 后端助理（extends role-dev）
-│   ├── db.md            # 数据库助理（extends role-ops，挂 center-pg）
-│   └── server.md        # 服务器助理（extends role-ops，挂 nas-ubuntu24）
+│   ├── frontend.md      # 示例：前端助理（extends role-dev，demo）
+│   ├── backend.md       # 示例：后端助理（extends role-dev，demo）
+│   ├── db.md            # 示例：数据库助理（extends role-ops，demo，挂 center-pg）
+│   └── server.md        # 示例：服务器助理（extends role-ops，demo，挂 nas-ubuntu24）
 ├── install.ps1          # 同步脚本：源 → ~/.pi/agent/（Windows）
 ├── .gitignore
 └── README.md
@@ -354,6 +354,7 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `agents_md` | | `false` = 不带全局 `AGENTS.md`，每次省约 1500 token |
 | `extends` | | 继承父模板，见下 |
 | `base` | | `true` = **只给 extends 用，不能直接派**（拿来写公共规矩） |
+| `demo` | | `true` = **示例模板：能看 / 能 show / 能 extends，但绝对不能派** |
 | `enabled` | | `false` = 列表里不显示、也派不了 |
 
 #### 继承（`extends`）
@@ -392,6 +393,17 @@ mcp: center-pg
 以前只有 `cwd`，等于「在哪儿干活」和「能连什么」绑死了。现在解耦：想让某个助理只连数据库，`mcp: center-pg` 就行，不必专门给它造一个目录。
 
 **它是真隔离，不是过滤**：没选中的 MCP **进程根本不会启动**，凭据也不会进那个子进程。
+
+#### `base` 和 `demo` 都是「不能派」，区别只在说法
+
+| 标记 | 意思是 | 出现在 |
+|---|---|---|
+| `base: true` | 底座 —— 有别的模板 extends 它 | `/assistants` 的「基础模板」组 |
+| `demo: true` | 样板 —— 没有人 extends 它，纯给你看字段怎么写 | `/assistants` 的「示例模板」组 |
+
+两者都会被挡在三道门外：不列在 `delegate` 工具描述里（模型根本看不到）、`/assistants` 列表单独分组、真派了会被 `execute` 拒并告知原因。
+
+仓库里现在 6 个模板**全都是不能派的** —— 2 个 base + 4 个 demo。想要哪个能派，把它 frontmatter 里那行删了就行。
 
 #### 三个 MCP 来源
 

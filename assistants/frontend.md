@@ -1,6 +1,7 @@
 ---
 name: 前端助理
 desc: 改前端页面/组件/样式、修前端 bug、调接口对接时用我。会改 center_frontend 里的文件，推送后 Cloudflare 自动上线。互相独立的多件活可以一次并行派给我。
+demo: true
 extends: role-dev
 cwd: F:/AI/My_Center/center_frontend
 timeout: 15m

@@ -28,6 +28,8 @@ export const HELP_TEXT = `AI configure · 全部功能
   /assistants new  <名>   交互新建一个模板
   /assistants open <名>   用系统默认程序打开那个 .md
 
+  （base / demo 的模板不能直接派；能派的会列在 delegate 工具描述里）
+
 ▍工具（你不用打，模型按需调用）
 progress(action, ...)     更新输入框上方那个面板
   action       plan｜step｜block｜clear       必填
