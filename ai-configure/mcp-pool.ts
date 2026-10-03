@@ -93,9 +93,25 @@ export interface ShadowResult {
 	missing: string[];
 }
 
+/**
+ * 模板 key → 影子目录名。
+ *
+ * ⚠️ 不能只做「非 ASCII 换 _」：`个人中心数据库助理` 会被整串换成 `_________`，
+ * 于是两个同字数的中文助理会撞同一个目录，**并行派发时互相覆盖 mcp.json**。
+ * 所以末尾拼一个基于原名的短哈希 —— 名字不同目录必不同，还能看出是哪个助理。
+ */
 function safeName(s: string): string {
-	const t = s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40);
-	return t || "assistant";
+	const ascii = s
+		.replace(/[^A-Za-z0-9._-]/g, "_")
+		.slice(0, 32)
+		.replace(/^_+|_+$/g, "");
+	// FNV-1a，不引依赖，够用
+	let h = 0x811c9dc5;
+	for (let i = 0; i < s.length; i++) {
+		h ^= s.charCodeAt(i);
+		h = Math.imul(h, 0x01000193) >>> 0;
+	}
+	return `${ascii || "assistant"}-${h.toString(36).padStart(6, "0")}`;
 }
 
 /**

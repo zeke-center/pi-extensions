@@ -36,7 +36,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
-import { buildShadow, ensureCatalog, loadMcpPool, type McpPool, realSessionDir } from "./mcp-pool";
+import { buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool, realSessionDir } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -990,6 +990,30 @@ async function commitForm(
 		demo: (v.dispatchable ?? "是") === "是" ? undefined : "true",
 	};
 
+	// MCP 名字在三个来源里都找不到 → 问一声。
+	// 不硬拦：你可能就是先把模板写好、回头再补连接。但得让你知道派发时会被拒。
+	const wantMcp = (v.mcp ?? "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	const poolNow = loadMcpPool(cwdIn);
+	const unknownMcp = wantMcp.filter((n) => !poolNow.servers[n]);
+	if (unknownMcp.length) {
+		const go = await ctx.ui.confirm(
+			"这些 MCP 找不到定义",
+			`${unknownMcp.join(", ")}\n\n` +
+				`候选池里只有：${Object.keys(poolNow.servers).join(", ") || "(空)"}\n\n` +
+				`存下去的话，这个助理派发时会被直接拒绝（不会“连不上还假装干活”）。\n仍要保存？`,
+		);
+		if (!go) {
+			ctx.ui.notify(
+				`没保存。\n补连接：把定义放进本地目录 ${localCatalogPath()}\n或者 /ai 从配置中心拉（会写到项目级）`,
+				"info",
+			);
+			return;
+		}
+	}
+
 	try {
 		writeTemplate(file, updates, body);
 	} catch (e) {
@@ -1224,12 +1248,28 @@ export function setupDelegate(api: ExtensionAPI): void {
 				agentsMd: tpl.agentsMd !== false,
 				exposure: tpl.mcpExposure,
 			});
-			if (ctx.hasUI && shadow.missing.length) {
-				ctx.ui.notify(
-					`助理「${tpl.name}」要的 MCP 在候选池里找不到：${shadow.missing.join(", ")}` +
-						`（池子：${Object.keys(pool.servers).join(", ") || "空"}）`,
-					"warning",
-				);
+			// 要的 MCP 一个都找不到 → 直接拒绝。
+			// 为什么不只 warn：一个连不上库的「数据库助理」会假装在干活、给你编结果，
+			// 这比直接失败更吓人。此处还没进 Promise.all(runAssistant)，子进程一个都不会起。
+			if (shadow.missing.length) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`「${tpl.name}」要的 MCP 找不到定义：${shadow.missing.join(", ")}\n` +
+								` 实际挂上：${shadow.names.join(", ") || "(一个都没有)"}\n` +
+								` 候选池里只有：${Object.keys(pool.servers).join(", ") || "(空)"}\n\n` +
+								`三个来源（同名后者覆盖）：\n` +
+								`  本地目录  ${localCatalogPath()}\n` +
+								`  用户级    ${join(getAgentDir(), "mcp.json")}\n` +
+								`  项目级    ${join(tpl.cwd, ".pi", "mcp.json")}\n\n` +
+								`补法：把定义写进本地目录（它不会被主会话自动加载，只当助理候选），` +
+								`或者 /assistants edit ${tpl.key} 改挂一个池子里已有的。`,
+						},
+					],
+					details: { ok: false, reason: "mcp_not_found", missing: shadow.missing },
+				};
 			}
 
 			if (ctx.hasUI) {
