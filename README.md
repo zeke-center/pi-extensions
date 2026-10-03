@@ -11,6 +11,7 @@
 pi-extensions/
 ├── ai-config.ts     # 扩展 1：连接台账 → MCP
 ├── task-board.ts    # 扩展 2：进度看板 + 会话信息栏
+├── install.ps1      # 同步脚本：源 → ~/.pi/agent/extensions/（Windows）
 ├── .gitignore
 └── README.md
 ```
@@ -19,21 +20,46 @@ pi-extensions/
 
 ## 安装
 
-### 方式 A：手动复制（推荐）
+### 方式 A：同步脚本（推荐，Windows）
 
-pi 默认从 `~/.pi/agent/extensions/` 加载扩展。把两个 `.ts` 拷进去即可：
+pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把两个 `.ts` 同步过去：
+
+```powershell
+.\install.ps1
+```
+
+脚本用 **SHA256 比对**，所以会告诉你哪个文件真的变了，没变就不白写：
+
+```text
+pi 扩展同步
+  源    F:\AI\My_Center\pi-extensions
+  目标  C:\Users\zeke\.pi\agent\extensions
+
+  [更新] ai-config.ts  （2026-10-02 20:48 → 2026-10-02 20:49）
+  [最新] task-board.ts
+
+2 个扩展：1 更新, 0 新增, 1 未变
+→ 在 pi 里执行 /reload 生效
+```
+
+| 用法 | 作用 |
+|---|---|
+| `.\install.ps1` | 同步全部扩展 |
+| `.\install.ps1 ai-config` | 只同步指定的（可写多个，不带 `.ts`） |
+| `.\install.ps1 -List` | **只对比、不写文件**，用来检查两份是否一致 |
+| `.\install.ps1 -Force` | 跳过错比对，无条件覆盖 |
+
+目标目录取 `$env:PI_CODING_AGENT_DIR`，没设就用默认的 `~\.pi\agent`；目录不存在会自动创建。
+
+若 PowerShell 拦执行策略，用 `powershell -ExecutionPolicy Bypass -File .\install.ps1`。
+
+### 方式 A′：手动复制（macOS / Linux）
 
 ```bash
-# macOS / Linux
 cp pi-extensions/*.ts ~/.pi/agent/extensions/
 ```
 
-```powershell
-# Windows PowerShell
-Copy-Item .\pi-extensions\*.ts $env:USERPROFILE\.pi\agent\extensions\
-```
-
-然后在 pi 里 `/reload`（或重开 pi）。依赖 `@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox` 都由 **pi 宿主提供**，不用自己装。
+无论哪种方式，同步完在 pi 里执行 `/reload`（或重开 pi）。依赖 `@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox` 都由 **pi 宿主提供**，不用自己装。
 
 ### 方式 B：用 settings 指向本目录
 
@@ -45,7 +71,7 @@ Copy-Item .\pi-extensions\*.ts $env:USERPROFILE\.pi\agent\extensions\
 }
 ```
 
-> ⚠️ **本仓库是「源」，`~/.pi/agent/extensions/` 里的是「生效副本」。** 两份是独立文件、不会自动同步。改了源之后要重新 `cp` 一遍再 `/reload`；用方式 B 就没这个问题。
+> ⚠️ **本仓库是「源」，`~/.pi/agent/extensions/` 里的是「生效副本」。** 两份是独立文件、不会自动同步。改了源之后要跑一遍 ``.\install.ps1`` 再 `/reload`（或者用 `-List` 先确认差异）；用方式 B 就没这个问题。
 
 ---
 
@@ -153,9 +179,12 @@ Copy-Item .\pi-extensions\*.ts $env:USERPROFILE\.pi\agent\extensions\
 
 ## 开发 / 同步
 
-```bash
+```powershell
 # 改完源文件 → 同步到生效目录 → 在 pi 里 /reload
-cp F:/AI/My_Center/pi-extensions/*.ts ~/.pi/agent/extensions/
+.\install.ps1
+
+# 只想看看改了哪个、不写文件
+.\install.ps1 -List
 ```
 
 单个扩展就是一个默认导出的工厂函数：
