@@ -23,10 +23,11 @@ export const HELP_TEXT = `AI configure · 全部功能
   /board right | mid      显示 / 隐藏 右栏 / 中栏
 /assistants               助理模板
   /assistants show <名>   展开全部字段 + 继承链 + 提示词正文
-  /assistants edit <名>   弹窗配置（MCP 多选 / 超时 / AGENTS.md / 存哪儿）
-  /assistants mcp  <名>   只改 MCP（快捷版，就地写回）
-  /assistants new  <名>   交互新建一个模板
+  /assistants edit <名>   弹面板改：MCP / 超时 / AGENTS.md / 存哪儿 / 正文
+  /assistants mcp  <名>   同上，只是光标直接落在 MCP 那行
+  /assistants new  <名>   弹同一个面板新建
   /assistants open <名>   用系统默认程序打开那个 .md
+  （面板：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消）
 
   （base / demo 的模板不能直接派；能派的会列在 delegate 工具描述里）
 

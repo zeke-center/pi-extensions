@@ -29,14 +29,14 @@
  *   PI_CLI          手动指定 pi 的 CLI 入口（默认自动找）
  *   PI_PACKAGE_DIR  覆盖 pi 包目录（Nix/Guix 场景）
  */
-import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
-import { buildShadow, ensureCatalog, loadMcpPool, realSessionDir } from "./mcp-pool";
+import { type FormResult, type FormField, showForm, type PickItem } from "./form";
+import { buildShadow, ensureCatalog, loadMcpPool, type McpPool, realSessionDir } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -784,82 +784,6 @@ function makeDelegateParams(hint: string) {
 
 // ======================= /assistants 的界面 =======================
 
-interface PickItem {
-	value: string;
-	label: string;
-	hint?: string;
-	checked: boolean;
-}
-
-/** 右补空格到 w 列（按终端可见宽度算，中文算 2 列） */
-function padRight(s: string, w: number): string {
-	const vw = visibleWidth(s);
-	return vw >= w ? truncateToWidth(s, w) : s + " ".repeat(w - vw);
-}
-
-/** 多选框（和 /ai 那个同一套写法） */
-class MultiSelect implements Focusable {
-	focused = false;
-	private sel = 0;
-
-	constructor(
-		private theme: Theme,
-		private title: string,
-		private items: PickItem[],
-		private done: (values: string[] | null) => void,
-	) {}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.done(null);
-			return;
-		}
-		if (matchesKey(data, "up")) {
-			if (this.items.length) this.sel = (this.sel - 1 + this.items.length) % this.items.length;
-			return;
-		}
-		if (matchesKey(data, "down")) {
-			if (this.items.length) this.sel = (this.sel + 1) % this.items.length;
-			return;
-		}
-		if (matchesKey(data, "space")) {
-			const it = this.items[this.sel];
-			if (it) it.checked = !it.checked;
-			return;
-		}
-		if (matchesKey(data, "return")) {
-			this.done(this.items.filter((i) => i.checked).map((i) => i.value));
-		}
-	}
-
-	render(width: number): string[] {
-		const t = this.theme;
-		const w = Math.min(78, width);
-		const inner = w - 2;
-		const b = (s: string) => t.fg("border", s);
-		const out: string[] = [];
-		out.push(b(`╭${"─".repeat(inner)}╮`));
-		out.push(b("│") + padRight(" " + t.fg("accent", t.bold(this.title)), inner) + b("│"));
-		out.push(b(`├${"─".repeat(inner)}┤`));
-		if (!this.items.length) {
-			out.push(b("│") + padRight(" " + t.fg("dim", "（候选池是空的）"), inner) + b("│"));
-		}
-		this.items.forEach((it, i) => {
-			const isSel = i === this.sel;
-			const box = it.checked ? t.fg("success", "[x]") : t.fg("dim", "[ ]");
-			const text = isSel ? t.fg("accent", it.label) : t.fg("text", it.label);
-			const prefix = isSel ? t.fg("accent", "▶ ") : "  ";
-			let line = ` ${prefix}${box} ${text}`;
-			if (it.hint) line += `  ${t.fg("dim", it.hint)}`;
-			out.push(b("│") + padRight(truncateToWidth(line, inner), inner) + b("│"));
-		});
-		out.push(b(`├${"─".repeat(inner)}┤`));
-		out.push(b("│") + padRight(" " + t.fg("dim", "↑↓ 移动 · 空格 勾选 · 回车 确定 · esc 取消"), inner) + b("│"));
-		out.push(b(`╰${"─".repeat(inner)}╯`));
-		return out;
-	}
-}
-
 /** 按 key 或 name 找模板（先精确，再模糊） */
 function findTemplate(cwd: string, what: string): Template | undefined {
 	const tpls = loadTemplates(cwd);
@@ -878,31 +802,23 @@ function notFound(ctx: ExtensionContext, cwd: string, what: string): void {
 }
 
 /** 向用户要一行文本（input 不可用就退化成 editor） */
-async function ask(ctx: ExtensionContext, title: string, initial: string): Promise<string | undefined> {
-	const ui = ctx.ui as unknown as {
-		input?: (t: string, v?: string) => Promise<string | undefined> | string | undefined;
-		editor?: (t: string, v: string) => Promise<string | undefined> | string | undefined;
-	};
-	if (typeof ui.input === "function") return await ui.input(title, initial);
-	if (typeof ui.editor === "function") return await ui.editor(title, initial);
-	return undefined;
-}
-
-/** 写回模板 frontmatter：只改指定的键，保留其它键和正文 */
-function writeTemplateFields(file: string, updates: Record<string, string | undefined>): void {
-	const raw = readFileSync(file, "utf8");
-	const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
-	const body = m ? raw.slice(m[0].length) : raw;
+/** 写模板文件：不认识的键原样保留；body 传了才换正文 */
+function writeTemplate(file: string, updates: Record<string, string | undefined>, body?: string): void {
+	let raw = "";
+	if (existsSync(file)) raw = readFileSync(file, "utf8");
+	const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+	const oldBody = fm ? raw.slice(fm[0].length) : raw;
 	const lines: string[] = [];
 	const handled = new Set<string>();
-	if (m) {
-		for (const line of m[1].split(/\r?\n/)) {
+	if (fm) {
+		for (const line of fm[1].split(/\r?\n/)) {
 			const i = line.indexOf(":");
 			if (i <= 0) {
 				if (line.trim()) lines.push(line);
 				continue;
 			}
 			const k = line.slice(0, i).trim().toLowerCase();
+			// updates 里出现过的键归我们管：有新值就写，空串 / undefined 就把这行删掉
 			if (k in updates) {
 				handled.add(k);
 				const v = updates[k];
@@ -917,9 +833,177 @@ function writeTemplateFields(file: string, updates: Record<string, string | unde
 		lines.push(`${k}: ${v}`);
 	}
 	mkdirSync(dirname(file), { recursive: true });
-	writeFileSync(file, `---\n${lines.join("\n")}\n---\n${body}`, "utf8");
+	writeFileSync(file, `---\n${lines.join("\n")}\n---\n${(body ?? oldBody).trim()}\n`, "utf8");
 }
 
+const SCOPE_GLOBAL = "全局（所有项目都能用）";
+const SCOPE_PROJECT = "项目级（只在这个项目里生效）";
+
+function globalAssistantDir(): string {
+	return join(getAgentDir(), "assistants");
+}
+
+function projectAssistantDir(cwd: string): string {
+	return join(cwd, ".pi", "assistants");
+}
+
+/** 这个模板文件是不是放在「项目级」目录里 */
+function isProjectFile(file: string, cwd: string): boolean {
+	const norm = (s: string): string => s.replace(/\\/g, "/").toLowerCase();
+	return norm(dirname(file)).startsWith(norm(join(cwd, ".pi")));
+}
+
+function humanTimeout(ms: number): string {
+	if (ms % 60000 === 0) return `${ms / 60000}m`;
+	if (ms % 1000 === 0) return `${ms / 1000}s`;
+	return `${ms}ms`;
+}
+
+/** 候选池 → 多选项（池子里的 + 当前挂的，去重排序） */
+function mcpItems(pool: McpPool, current: string[]): PickItem[] {
+	const all = [...new Set([...Object.keys(pool.servers), ...current])].sort();
+	return all.map((n) => ({
+		value: n,
+		label: n,
+		hint: pool.servers[n] ? `(${pool.origin[n] ?? ""})` : "(候选池里没有，写了也连不上)",
+		checked: current.includes(n),
+	}));
+}
+
+/** 面板上的行 —— new 和 edit 共用同一套 */
+function buildFields(o: {
+	key: string;
+	name: string;
+	desc: string;
+	cwd: string;
+	model: string;
+	timeout: string;
+	agentsMd: boolean;
+	dispatchable: boolean;
+	dispatchNote?: string;
+	scope: string;
+	bodyChars: number;
+	keyEditable: boolean;
+}): FormField[] {
+	return [
+		{
+			key: "key",
+			label: "文件名",
+			value: o.key,
+			kind: "text",
+			readonly: !o.keyEditable,
+			hint: o.keyEditable ? "(去掉 .md —— 派它时就用这个名字)" : "(改名＝新建一个，用 /assistants new)",
+		},
+		{ key: "name", label: "显示名", value: o.name, kind: "text", hint: "(中文也行)" },
+		{
+			key: "desc",
+			label: "描述",
+			value: o.desc,
+			kind: "text",
+			hint: "(写「什么时候用我」，主 pi 靠它决定派谁)",
+		},
+		{
+			key: "cwd",
+			label: "工作目录",
+			value: o.cwd,
+			kind: "text",
+			hint: "(在哪儿干活：文件读写 / 项目 AGENTS.md)",
+		},
+		{ key: "model", label: "模型", value: o.model, kind: "text", hint: "(留空 = 继承默认)" },
+		{ key: "timeout", label: "超时", value: o.timeout, kind: "text", hint: "(10m / 90s / 1.5h，留空 = 5 分钟)" },
+		{
+			key: "agents_md",
+			label: "带 AGENTS.md",
+			value: o.agentsMd ? "是" : "否",
+			kind: "bool",
+			hint: "(关掉每次省约 1500 token)",
+		},
+		{ key: "mcp", label: "MCP", value: "", kind: "mcp", hint: "(回车勾选能连什么 —— 跟工作目录无关)" },
+		{
+			key: "dispatchable",
+			label: "可派发",
+			value: o.dispatchable ? "是" : "否",
+			kind: "bool",
+			readonly: o.dispatchNote !== undefined,
+			hint: o.dispatchNote ?? "(关掉 = 写 demo: true：能看能改，但派不了)",
+		},
+		{
+			key: "scope",
+			label: "保存到",
+			value: o.scope,
+			kind: "enum",
+			options: [SCOPE_GLOBAL, SCOPE_PROJECT],
+			hint: "(全局在 ~/.pi/agent/assistants/)",
+		},
+		{
+			key: "body",
+			label: "提示词正文",
+			value: `(${o.bodyChars} 字)`,
+			kind: "action",
+			hint: "回车 = 保存并打开编辑器",
+		},
+	];
+}
+
+/** 面板交回来的值 → 真正写盘 */
+async function commitForm(
+	ctx: ExtensionContext,
+	o: { form: FormResult; cwd: string; original: Template | null },
+): Promise<void> {
+	const v = o.form.values;
+	const key = (v.key ?? "").trim();
+	if (!key) {
+		ctx.ui.notify("「文件名」不能是空的，什么都没存。", "warning");
+		return;
+	}
+	const timeout = (v.timeout ?? "").trim();
+	if (timeout && !parseDuration(timeout)) {
+		ctx.ui.notify(`看不懂的超时「${timeout}」（写成 10m / 90s / 1.5h），什么都没存。`, "warning");
+		return;
+	}
+	const cwdIn = (v.cwd ?? "").trim() || o.cwd;
+	if (!existsSync(cwdIn)) {
+		ctx.ui.notify(`工作目录不存在：${cwdIn}\n什么都没存。`, "warning");
+		return;
+	}
+
+	const file =
+		(v.scope ?? "") === SCOPE_PROJECT
+			? join(projectAssistantDir(o.cwd), `${key}.md`)
+			: join(globalAssistantDir(), `${key}.md`);
+
+	// 只有「提示词正文」那行被按了回车，才动正文 —— 平时改 MCP 不该顺手把正文覆盖了
+	let body: string | undefined;
+	if (o.form.openBody) {
+		const edited = await ctx.ui.editor(`「${v.name || key}」的提示词正文`, o.original?.body ?? "");
+		if (typeof edited === "string") body = edited;
+	}
+
+	const updates: Record<string, string | undefined> = {
+		name: (v.name ?? "").trim() || key,
+		desc: (v.desc ?? "").trim(),
+		cwd: cwdIn,
+		model: (v.model ?? "").trim(),
+		timeout,
+		agents_md: (v.agents_md ?? "是") === "是" ? undefined : "false",
+		mcp: (v.mcp ?? "").trim(),
+		demo: (v.dispatchable ?? "是") === "是" ? undefined : "true",
+	};
+
+	try {
+		writeTemplate(file, updates, body);
+	} catch (e) {
+		ctx.ui.notify(`写入失败：${(e as Error).message}`, "error");
+		return;
+	}
+
+	const notes: string[] = [];
+	if (o.original && o.original.file !== file && existsSync(o.original.file)) {
+		notes.push(`原来的那份没动：${o.original.file}（本项目里新的这份优先）`);
+	}
+	if (body === undefined && !o.original) notes.push(`正文还是空的 —— 用 /assistants open ${key} 去写`);
+	ctx.ui.notify(`已保存\n${file}\n${notes.join("\n")}\n\n改模板不用 /reload，下次派发立即生效。`, "info");
+}
 function listAssistants(ctx: ExtensionContext, cwd: string): void {
 	const tpls = loadTemplates(cwd);
 	const dirs = templateDirs(cwd);
@@ -965,7 +1049,7 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 	ctx.ui.notify(`${lines.join("\n")}${body}`, "info");
 }
 
-async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, mcpOnly: boolean): Promise<void> {
+async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, focusKey?: string): Promise<void> {
 	const tpl = findTemplate(cwd, what);
 	if (!tpl) return notFound(ctx, cwd, what);
 	if (!ctx.hasUI) {
@@ -974,120 +1058,58 @@ async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, m
 	}
 
 	const pool = loadMcpPool(tpl.cwd);
-	const all = [...new Set([...Object.keys(pool.servers), ...tpl.mcp])].sort();
-	const items: PickItem[] = all.map((n) => ({
-		value: n,
-		label: n,
-		hint: pool.servers[n] ? `(${pool.origin[n] ?? ""})` : "(候选池里没有，写了也连不上)",
-		checked: tpl.mcp.includes(n),
-	}));
-
-	const picked = await ctx.ui.custom<string[] | null>(
-		(_tui, theme, _kb, done) => new MultiSelect(theme, `MCP 挂载 · ${tpl.name}`, items, done),
-		{ overlay: true },
-	);
-	if (!picked) {
+	const fields = buildFields({
+		key: tpl.key,
+		name: tpl.name,
+		desc: tpl.desc,
+		cwd: tpl.cwd,
+		model: tpl.model ?? "",
+		timeout: tpl.timeoutMs ? humanTimeout(tpl.timeoutMs) : "",
+		agentsMd: tpl.agentsMd !== false,
+		dispatchable: tpl.demo !== true,
+		dispatchNote: tpl.base === true ? "(base：底座，不能在这儿改)" : undefined,
+		scope: isProjectFile(tpl.file, cwd) ? SCOPE_PROJECT : SCOPE_GLOBAL,
+		bodyChars: tpl.body.length,
+		keyEditable: false,
+	});
+	const r = await showForm(ctx, `${tpl.name} · 配置`, fields, mcpItems(pool, tpl.mcp), focusKey);
+	if (!r) {
 		ctx.ui.notify("已取消，什么都没改。", "info");
 		return;
 	}
-	if (!picked.length) {
-		const ok = await ctx.ui.confirm("一个都不挂？", `「${tpl.name}」将不连接任何 MCP。`);
-		if (!ok) return;
-	}
-
-	const updates: Record<string, string | undefined> = { mcp: picked.join(", ") };
-
-	if (!mcpOnly) {
-		const exp = await ctx.ui.select("MCP 暴露方式", [
-			"保持现状",
-			"codemode（默认：工具不占上下文，但要写脚本调）",
-			"direct（工具直接可见，专职助理更省事）",
-			"deferred",
-		]);
-		if (exp === undefined) return;
-		if (exp?.startsWith("codemode")) updates.mcp_exposure = "codemode";
-		else if (exp?.startsWith("direct")) updates.mcp_exposure = "direct";
-		else if (exp?.startsWith("deferred")) updates.mcp_exposure = "deferred";
-
-		const to = await ask(ctx, "超时（如 10m / 90s；留空 = 默认 5 分钟）", tpl.timeoutMs ? `${Math.round(tpl.timeoutMs / 1000)}s` : "");
-		if (to === undefined) return;
-		if (to.trim() === "") updates.timeout = undefined;
-		else if (parseDuration(to)) updates.timeout = to.trim();
-		else ctx.ui.notify(`看不懂的超时「${to}」，这项没改。`, "warning");
-
-		const am = await ctx.ui.confirm(
-			"带全局 AGENTS.md 吗？",
-			`当前：${tpl.agentsMd === false ? "不带" : "带"}\n带 → 更守你的全局规矩；不带 → 每次省约 1500 token。`,
-		);
-		updates.agents_md = am ? "true" : "false";
-	}
-
-	// 保存到哪（写回模板文件；mcp 快捷模式默认就地改）
-	let target = tpl.file;
-	if (!mcpOnly) {
-		const projDir = join(cwd, ".pi", "assistants");
-		const inProject = dirname(tpl.file).toLowerCase().startsWith(join(cwd, ".pi").toLowerCase());
-		const opts = inProject
-			? ["保存到原文件（项目级）"]
-			: [
-					"保存到原文件（全局模板 —— 会影响所有用到它的项目）",
-					`另存为项目级：${join(projDir, `${tpl.key}.md`)}`,
-				];
-		const where = await ctx.ui.select("保存到哪？", opts);
-		if (where === undefined) return;
-		if (where.startsWith("另存为")) {
-			target = join(projDir, `${tpl.key}.md`);
-			mkdirSync(projDir, { recursive: true });
-			try {
-				writeFileSync(target, readFileSync(tpl.file, "utf8"), "utf8");
-			} catch {
-				/* 后面 writeTemplateFields 会建 */
-			}
-		}
-	}
-
-	try {
-		writeTemplateFields(target, updates);
-		ctx.ui.notify(`已写入\n${target}\n\n改模板不用 /reload，下次派发立即生效。`, "info");
-	} catch (e) {
-		ctx.ui.notify(`写入失败：${(e as Error).message}`, "error");
-	}
+	await commitForm(ctx, { form: r, cwd, original: tpl });
 }
 
 async function newAssistant(ctx: ExtensionContext, cwd: string, key: string): Promise<void> {
-	if (!key) {
-		ctx.ui.notify("用法：/assistants new <文件名>\n例：/assistants new personal-backend", "warning");
-		return;
-	}
-	const dir = join(getAgentDir(), "assistants");
-	const file = join(dir, `${key}.md`);
-	if (existsSync(file)) {
-		ctx.ui.notify(`已存在：${file}\n想改就 /assistants edit ${key}`, "warning");
-		return;
-	}
 	if (!ctx.hasUI) {
 		ctx.ui.notify("这个命令需要交互界面（TUI）。", "warning");
 		return;
 	}
-
-	const name = await ask(ctx, "显示名（中文也行）", key);
-	if (name === undefined) return;
-	const desc = await ask(ctx, "一句话描述（主会话靠它决定派谁）", "");
-	if (desc === undefined) return;
-	const cwdIn = await ask(ctx, "工作目录", cwd);
-	if (cwdIn === undefined) return;
-	const model = await ask(ctx, "模型（留空 = 继承默认）", "");
-	if (model === undefined) return;
-
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(
-		file,
-		`---\nname: ${name || key}\ndesc: ${desc}\ncwd: ${cwdIn || cwd}${model ? `\nmodel: ${model}` : ""}\n---\n你是……（这里写它的职责和规矩）\n`,
-		"utf8",
-	);
-	ctx.ui.notify(`已创建\n${file}\n\n接着配 MCP：/assistants edit ${key}`, "info");
+	if (key && existsSync(join(globalAssistantDir(), `${key}.md`))) {
+		ctx.ui.notify(`已经有个全局模板叫「${key}」了。\n想改它：/assistants edit ${key}`, "warning");
+		return;
+	}
+	const pool = loadMcpPool(cwd);
+	const fields = buildFields({
+		key,
+		name: key,
+		desc: "",
+		cwd,
+		model: "",
+		timeout: "",
+		agentsMd: true,
+		dispatchable: true,
+		scope: SCOPE_GLOBAL,
+		bodyChars: 0,
+		keyEditable: true,
+	});
+	const r = await showForm(ctx, "助理模板 · 新建", fields, mcpItems(pool, []), "key");
+	if (!r) {
+		ctx.ui.notify("已取消，什么都没建。", "info");
+		return;
+	}
+	await commitForm(ctx, { form: r, cwd, original: null });
 }
-
 function openAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 	const tpl = findTemplate(cwd, what);
 	if (!tpl) return notFound(ctx, cwd, what);
@@ -1259,8 +1281,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 			const rest = parts.slice(1).join(" ");
 
 			if (sub === "show") return showAssistant(ctx, cwd, rest);
-			if (sub === "edit") return editAssistant(ctx, cwd, rest, false);
-			if (sub === "mcp") return editAssistant(ctx, cwd, rest, true);
+			if (sub === "edit") return editAssistant(ctx, cwd, rest);
+			if (sub === "mcp") return editAssistant(ctx, cwd, rest, "mcp");
 			if (sub === "new") return newAssistant(ctx, cwd, rest);
 			if (sub === "open") return openAssistant(ctx, cwd, rest);
 			return listAssistants(ctx, cwd);
