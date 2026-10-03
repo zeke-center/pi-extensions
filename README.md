@@ -6,12 +6,17 @@
 |---|---|---|
 | `ai-config.ts` | **AI 配置中心** · `/ai` | 从 Center 后端拉「连接台账」，选完立刻在本会话注册成 MCP server |
 | `task-board.ts` | **任务进度看板** · `/board` + `progress` 工具 | 输入框上方常驻双/三栏面板：左任务进度、右会话信息 |
+| `delegate.ts` | **派活给临时助理** · `delegate` 工具 | 另起一个独立 pi 干活，只把一张卡（状态/结论/证据）带回来 |
 
 ```text
 pi-extensions/
 ├── ai-config.ts     # 扩展 1：连接台账 → MCP
 ├── task-board.ts    # 扩展 2：进度看板 + 会话信息栏
-├── install.ps1      # 同步脚本：源 → ~/.pi/agent/extensions/（Windows）
+├── delegate.ts      # 扩展 3：把活派给临时助理
+├── assistants/      # 助理模板（每个 .md 一个助理）
+│   ├── db.md
+│   └── backend.md
+├── install.ps1      # 同步脚本：源 → ~/.pi/agent/（Windows）
 ├── .gitignore
 └── README.md
 ```
@@ -22,7 +27,7 @@ pi-extensions/
 
 ### 方式 A：同步脚本（推荐，Windows）
 
-pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把两个 `.ts` 同步过去：
+pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把扩展和助理模板同步过去：
 
 ```powershell
 .\install.ps1
@@ -33,19 +38,23 @@ pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把两个 `.ts` �
 ```text
 pi 扩展同步
   源    F:\AI\My_Center\pi-extensions
-  目标  C:\Users\zeke\.pi\agent\extensions
+  目标  C:\Users\zeke\.pi\agent
 
   [更新] ai-config.ts  （2026-10-02 20:48 → 2026-10-02 20:49）
   [最新] task-board.ts
 
-2 个扩展：1 更新, 0 新增, 1 未变
+  [最新] backend.md
+  [最新] db.md
+
+3 个扩展：1 更新, 0 新增, 2 未变
+2 个助理模板：0 更新, 0 新增, 2 未变
 → 在 pi 里执行 /reload 生效
 ```
 
 | 用法 | 作用 |
 |---|---|
 | `.\install.ps1` | 同步全部扩展 |
-| `.\install.ps1 ai-config` | 只同步指定的（可写多个，不带 `.ts`） |
+| `.\install.ps1 ai-config` | 只同步指定的（可写多个，不带扩展名），同时匹配 `.ts` 和 `.md` |
 | `.\install.ps1 -List` | **只对比、不写文件**，用来检查两份是否一致 |
 | `.\install.ps1 -Force` | 跳过错比对，无条件覆盖 |
 
@@ -56,7 +65,9 @@ pi 扩展同步
 ### 方式 A′：手动复制（macOS / Linux）
 
 ```bash
-cp pi-extensions/*.ts ~/.pi/agent/extensions/
+cp pi-extensions/*.ts          ~/.pi/agent/extensions/
+mkdir -p ~/.pi/agent/assistants
+cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 ```
 
 无论哪种方式，同步完在 pi 里执行 `/reload`（或重开 pi）。依赖 `@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox` 都由 **pi 宿主提供**，不用自己装。
@@ -169,11 +180,72 @@ cp pi-extensions/*.ts ~/.pi/agent/extensions/
 
 ---
 
+## 扩展 3 · delegate（把活派给临时助理）
+
+主 pi 多一个 `delegate` 工具：**另起一个独立的 pi 进程干活，只把一张卡带回来**。中间过程不进主对话（但会话文件在，可以回看）。
+
+| 什么时候用 | 什么时候别用 |
+|---|---|
+| 过程很脏、要试错、**你只要结论** | 查一条数据你**也想看过程** —— 那自己用 MCP 查 |
+
+### 用法
+
+| 做什么 | 怎么写 |
+|---|---|
+| 看有哪些助理 | `/assistants` |
+| 派活 | 让模型调 `delegate(assistant="db", task="…")` |
+
+### 助理模板
+
+放在 `<项目>/.pi/assistants/*.md`（项目级）或 `~/.pi/agent/assistants/*.md`（全局），**项目级优先**。
+
+```markdown
+---
+name: 数据查询员
+desc: 连数据库查数据、验证数据、探表结构时用我      # 主 pi 靠这句判断该不该叫你
+cwd: F:/AI/My_Center                              # 工作目录 —— 决定它有哪些 MCP
+model: cc-switch-deep-seek/deepseek-v4-flash
+---
+（下面是这个助理的系统提示词）
+```
+
+只有 4 个字段，**`cwd` 必填**（其余可省：`model` 省掉就继承默认）。
+
+### 交卡格式
+
+交卡要求由扩展自动追加到任务后面，助理必须按这三行回：
+
+```
+状态: 完成 或 卡住 或 需要信息
+结论: 一句话说清结果（要数据/结论，不要过程）
+证据: 你怎么确认的，最多 3 行
+```
+
+### 刻意保持最小的地方
+
+| 决定 | 原因 |
+|---|---|
+| **同步跑**，不并行 | 先能跑通，慢一点无所谓 |
+| **不走 RPC** | 临时工不需要「托管」，一次调用就够 |
+| **助理不能再派人**（自动加 `-xt delegate`） | 防止递归打转 |
+| **不做面板** | 会话名自动带 `助理:` 前缀，能在 sessions 列表里被看到 |
+| 超时 **10 分钟** | 超时杀掉并返回「超时」卡 |
+
+### 已知限制
+
+- ⚠️ **模板里的「只读」是提示词层面的自律，不是配置闸门。** 助理的 `cwd` 决定它继承哪些 MCP；那个目录的 MCP 可写，它就有写的能力。要真限制，得给它独立目录 + 只读的 `.pi/mcp.json`，或用 ai-config 台账的 `access: read`。
+- 项目级模板和项目级 MCP 都**要求该目录被 pi 信任**（`trust.json`）。
+- 每个助理是**独立进程 + 独立模型调用**，会再多花一份钱。
+- 找 pi 的 CLI 入口的顺序：`$PI_CLI` → `$PI_PACKAGE_DIR/dist/bundle/cli.js` → `process.argv[1]`；找不到就报错。
+
+---
+
 ## 安全须知
 
 - **不要把敏感信息提交进本仓库。** Master 密钥（`CENTER_TOKEN`）只走环境变量或 `/ai token` 的输入框（内存态，不落盘）；`.gitignore` 已经排除 `.env`、`.pi/mcp.json`、`*.local`、`token.txt` 等。
 - **项目级应用模式会把连接串（含明文密码）写进你项目的 `.pi/mcp.json`。** 那个文件属于你的项目仓库，务必确认它已被忽略，别提交出去。
 - `/ai` 拉回来的 MCP 配置里带着凭据，`/ai status` 只显示状态、不打印密钥。
+- **`delegate` 起的助理继承了它 `cwd` 目录下的全部 MCP 凭据**（含写权限）。派活前想一下这个目录该不该让它碰。
 
 ---
 
