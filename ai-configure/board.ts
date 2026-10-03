@@ -76,7 +76,6 @@ let lastCtx: ExtensionContext | undefined;
 let widgetTui: { requestRender(): void } | undefined;
 let mounted = false;
 
-let gitBranch: string | undefined;
 let cachedMcp: McpEntry[] = [];
 let cachedPlugins: string[] = [];
 
@@ -119,12 +118,6 @@ function padTo(s: string, w: number): string {
 function fit(s: string, w: number): string {
 	if (w <= 0) return "";
 	return padTo(truncateToWidth(s, w), w);
-}
-
-function fmtK(n: number): string {
-	if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
-	if (n >= 1000) return `${Math.round(n / 1000)}k`;
-	return `${n}`;
 }
 
 function shortText(s: string, max: number): string {
@@ -183,28 +176,11 @@ function leftLines(theme: Theme): string[] {
 	return out;
 }
 
-// ======================= 右栏：会话信息 =======================
+// ======================= 右栏：MCP + 插件 =======================
 function rightLines(theme: Theme): string[] {
 	const t = theme;
-	const ctx = lastCtx;
 	const out: string[] = [];
 	const H = (s: string) => t.fg("accent", t.bold(s));
-
-	// --- 模型 / 用量 / 分支 ---
-	out.push(H("会话"));
-	const model = ctx?.model;
-	const modelName = model?.name ?? model?.id ?? "-";
-	out.push(` ${t.fg("muted", "模型")} ${t.fg("text", shortText(modelName, RIGHT_WIDTH - 7))}`);
-	if (model?.provider) out.push(` ${t.fg("muted", "提供")} ${t.fg("dim", shortText(model.provider, RIGHT_WIDTH - 7))}`);
-
-	const usage = ctx?.getContextUsage();
-	if (usage && usage.tokens != null && usage.percent != null) {
-		out.push(
-			` ${t.fg("muted", "上下文")} ${t.fg("text", `${Math.round(usage.percent)}%`)} ${t.fg("dim", `(${fmtK(usage.tokens)}/${fmtK(usage.contextWindow)})`)}`,
-		);
-	}
-	if (ctx?.thinkingLevel) out.push(` ${t.fg("muted", "思考")} ${t.fg("text", ctx.thinkingLevel)}`);
-	if (gitBranch) out.push(` ${t.fg("muted", "分支")} ${t.fg("text", shortText(gitBranch, RIGHT_WIDTH - 7))}`);
 
 	// --- MCP 服务 ---
 	out.push(H(`MCP ${cachedMcp.length}`));
@@ -329,16 +305,6 @@ function computePlugins(): string[] {
 	return [...byPath.values()].sort();
 }
 
-async function refreshGitBranch(cwd: string): Promise<void> {
-	try {
-		const r = await pi.exec("git", ["branch", "--show-current"], { cwd });
-		const b = String(r?.stdout ?? "").trim();
-		gitBranch = b || undefined;
-	} catch {
-		gitBranch = undefined;
-	}
-}
-
 function refreshData(ctx: ExtensionContext): void {
 	lastCtx = ctx;
 	try {
@@ -451,12 +417,9 @@ function startTimer(): void {
 			renderWidget();
 			return;
 		}
-		// 空闲时低频刷新（更新 token 用量 / git 分支 / MCP 连接状态）
+		// 空闲时低频刷新（更新 token 用量 / MCP 连接状态）
 		if (tickCount % 8 === 0) {
-			if (lastCtx) {
-				refreshData(lastCtx);
-				void refreshGitBranch(lastCtx.cwd);
-			}
+			if (lastCtx) refreshData(lastCtx);
 			renderWidget();
 		}
 	}, 300);
@@ -519,7 +482,7 @@ const ProgressParams = Type.Object({
 });
 
 // ======================= 扩展入口 =======================
-export default function (api: ExtensionAPI): void {
+export function setupBoard(api: ExtensionAPI): void {
 	pi = api;
 
 	// ---------- 工具：模型用来汇报进度 ----------
@@ -838,7 +801,6 @@ ${planLine}
 		}
 
 		refreshData(ctx);
-		void refreshGitBranch(ctx.cwd);
 		startTimer();
 		refresh(true);
 	});

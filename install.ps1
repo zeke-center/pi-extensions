@@ -3,11 +3,18 @@
   把本仓库的 pi 扩展和助理模板同步到 pi 的配置目录。
 
 .DESCRIPTION
-  源 1：本脚本所在目录下的 *.ts                → <agentDir>\extensions
-  源 2：本脚本所在目录下 assistants\*.md       → <agentDir>\assistants
+  源 1：本脚本所在目录下的扩展 → <agentDir>\extensions
+        扩展有两种形态：
+          ① 根级单文件    xxx.ts
+          ② 目录式插件    <名字>\index.ts（·整棵目录一起同步）
+  源 2：本脚本所在目录下 assistants\*.md → <agentDir>\assistants
   <agentDir> = $env:PI_CODING_AGENT_DIR，默认 ~\.pi\agent
 
   用哈希比对，所以能看出「哪个文件真的变了」，不会白写一遍。
+
+  还会「清理孤儿」：目标目录里已经不存在于源里的根级 .ts/.js 和插件目录会被删掉。
+  这一步是必要的 —— pi 会同时加载 extensions\*.ts 和 extensions\<name>\index.ts，
+  旧形态没删干净就会和新目录同时生效，同一个工具被注册两遍。
 
 .PARAMETER Name
   只同步指定的名字（不带扩展名，可写多个），同时匹配 .ts 和 .md。
@@ -63,32 +70,57 @@ Write-Host "  目标  $agentDir"
 if ($List) { Write-Host '  模式  仅对比（-List），不写文件' -ForegroundColor Yellow }
 Write-Host ''
 
-# ---------- 2. 收集待同步文件 ----------
-$sources = @(Get-ChildItem -Path (Join-Path $srcDir '*.ts') -File -ErrorAction SilentlyContinue)
+# ---------- 2. 收集待同步的文件 ----------
+# 扩展有两种形态：
+#   ① 根级单文件      xxx.ts
+#   ② 目录式插件      <名字>/index.ts（整棵目录一起同步）
+# pi 两种都加载 —— 所以两种都要同步。
+$extItems = New-Object System.Collections.Generic.List[object]
+$pluginNames = New-Object System.Collections.Generic.List[string]
+
+foreach ($f in @(Get-ChildItem -Path (Join-Path $srcDir '*.ts') -File -ErrorAction SilentlyContinue)) {
+	$extItems.Add([pscustomobject]@{ Rel = $f.Name; Src = $f.FullName; Key = $f.BaseName; Stamp = $f.LastWriteTime })
+}
+foreach ($d in @(Get-ChildItem -Path $srcDir -Directory -ErrorAction SilentlyContinue)) {
+	$entry = @('index.ts', 'index.js') |
+		ForEach-Object { Join-Path $d.FullName $_ } |
+		Where-Object { Test-Path -LiteralPath $_ } |
+		Select-Object -First 1
+	if (-not $entry) { continue }
+	$pluginNames.Add($d.Name)
+	foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue)) {
+		$rel = $f.FullName.Substring($srcDir.Length).TrimStart('\', '/')
+		$extItems.Add([pscustomobject]@{ Rel = $rel; Src = $f.FullName; Key = $d.Name; Stamp = $f.LastWriteTime })
+	}
+}
+
 $asstFiles = @(Get-ChildItem -Path (Join-Path $asstSrcDir '*.md') -File -ErrorAction SilentlyContinue)
 
-if ($sources.Count -eq 0 -and $asstFiles.Count -eq 0) {
-	Write-Host "错误：在 $srcDir 里没找到任何 .ts 扩展，也没有 assistants\*.md。" -ForegroundColor Red
+if ($extItems.Count -eq 0 -and $asstFiles.Count -eq 0) {
+	Write-Host "错误：在 $srcDir 里没找到任何扩展（.ts 或含 index.ts 的目录），也没有 assistants\*.md。" -ForegroundColor Red
 	exit 1
 }
 
+$partial = $false
 if ($Name -and $Name.Count -gt 0) {
+	$partial = $true
 	$wanted = @($Name | ForEach-Object { $_.Trim() -replace '\.(ts|md)$', '' } | Where-Object { $_ })
-	$allKeys = @($sources.BaseName) + @($asstFiles.BaseName)
+	$allKeys = @($extItems.Key | Sort-Object -Unique) + @($asstFiles.BaseName)
 	$missing = @($wanted | Where-Object { $allKeys -notcontains $_ })
 	if ($missing.Count -gt 0) {
 		Write-Host ("错误：找不到这些名字：{0}" -f ($missing -join ', ')) -ForegroundColor Red
 		Write-Host ("  可用：{0}" -f (($allKeys | Sort-Object) -join ', ')) -ForegroundColor DarkGray
 		exit 1
 	}
-	$sources = @($sources | Where-Object { $wanted -contains $_.BaseName })
+	$extItems = @($extItems | Where-Object { $wanted -contains $_.Key })
+	$pluginNames = @($pluginNames | Where-Object { $wanted -contains $_ })
 	$asstFiles = @($asstFiles | Where-Object { $wanted -contains $_.BaseName })
 }
 
 # ---------- 3. 比对并同步 ----------
-function Sync-Files {
+function Sync-Tree {
 	param(
-		[System.IO.FileInfo[]]$Files,
+		[object[]]$Items,
 		[string]$Dest
 	)
 	$added = 0
@@ -104,8 +136,9 @@ function Sync-Files {
 		}
 	}
 
-	foreach ($f in $Files) {
-		$target = Join-Path $Dest $f.Name
+	foreach ($it in $Items) {
+		$target = Join-Path $Dest $it.Rel
+		$parent = Split-Path -Path $target -Parent
 		$status = $null
 		$color = 'Gray'
 
@@ -118,7 +151,7 @@ function Sync-Files {
 			$color = 'Yellow'
 			$updated++
 		} else {
-			$hSrc = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+			$hSrc = (Get-FileHash -LiteralPath $it.Src -Algorithm SHA256).Hash
 			$hDst = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
 			if ($hSrc -eq $hDst) {
 				$status = '最新'
@@ -131,33 +164,74 @@ function Sync-Files {
 			}
 		}
 
-		$line = "  [{0}] {1}" -f $status, $f.Name
+		$line = "  [{0}] {1}" -f $status, $it.Rel
 		if ($status -eq '更新' -or $status -eq '覆盖') {
-			$line += ("  （{0} → {1}）" -f $f.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), (Get-Item -LiteralPath $target).LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
+			$line += ("  （{0} → {1}）" -f $it.Stamp.ToString('yyyy-MM-dd HH:mm'), (Get-Item -LiteralPath $target).LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
 		}
 		Write-Host $line -ForegroundColor $color
 
 		if (-not $List -and $status -ne '最新') {
-			Copy-Item -LiteralPath $f.FullName -Destination $target -Force
+			if (-not (Test-Path -LiteralPath $parent)) {
+				New-Item -ItemType Directory -Path $parent -Force | Out-Null
+			}
+			Copy-Item -LiteralPath $it.Src -Destination $target -Force
 		}
 	}
 
-	return [pscustomobject]@{ Added = $added; Updated = $updated; Same = $same; Total = $Files.Count }
+	return [pscustomobject]@{ Added = $added; Updated = $updated; Same = $same; Total = $Items.Count }
 }
 
-$extResult = Sync-Files -Files $sources -Dest $destDir
+$extResult = Sync-Tree -Items $extItems -Dest $destDir
+
+# ---------- 3b. 清理孤儿 ----------
+# pi 同时加载 extensions\*.ts 和 extensions\<name>\index.ts。
+# 旧形态没删干净 = 新旧同时生效 = 同一个工具被注册两遍。
+# 删除范围严格限定：① 根级 .ts / .js  ② 含 index.ts / index.js 的子目录。
+if (-not $partial) {
+	$orphans = @()
+	if (Test-Path -LiteralPath $destDir) {
+		$keepRel = @($extItems.Rel)
+		foreach ($f in @(Get-ChildItem -LiteralPath $destDir -File -ErrorAction SilentlyContinue)) {
+			if ($f.Extension -notin @('.ts', '.js')) { continue }
+			if ($keepRel -contains $f.Name) { continue }
+			$orphans += [pscustomobject]@{ Path = $f.FullName; Rel = $f.Name; IsDir = $false }
+		}
+		$keepPlugins = @($pluginNames)
+		foreach ($d in @(Get-ChildItem -LiteralPath $destDir -Directory -ErrorAction SilentlyContinue)) {
+			if ($keepPlugins -contains $d.Name) { continue }
+			$looksLikePlugin = @('index.ts', 'index.js') |
+				Where-Object { Test-Path -LiteralPath (Join-Path $d.FullName $_) }
+			if (-not $looksLikePlugin) { continue }
+			$orphans += [pscustomobject]@{ Path = $d.FullName; Rel = "$($d.Name)\  （整个目录）"; IsDir = $true }
+		}
+	}
+	if ($orphans.Count -gt 0) {
+		Write-Host ''
+		foreach ($o in $orphans) {
+			$tag = if ($List) { '待清理' } else { '清理' }
+			Write-Host ("  [{0}] {1}" -f $tag, $o.Rel) -ForegroundColor Magenta
+			if (-not $List) { Remove-Item -LiteralPath $o.Path -Recurse -Force }
+		}
+	} elseif ($partial) {
+		Write-Host ''
+		Write-Host '  （指定了 -Name，跳过孤儿清理）' -ForegroundColor DarkGray
+	}
+}
 
 $asstResult = $null
 if ($asstFiles.Count -gt 0) {
 	Write-Host ''
-	$asstResult = Sync-Files -Files $asstFiles -Dest $asstDestDir
+	$asstItems = @($asstFiles | ForEach-Object {
+		[pscustomobject]@{ Rel = $_.Name; Src = $_.FullName; Key = $_.BaseName; Stamp = $_.LastWriteTime }
+	})
+	$asstResult = Sync-Tree -Items $asstItems -Dest $asstDestDir
 }
 
 # ---------- 4. 汇总 ----------
 Write-Host ''
 $changed = $extResult.Updated + $extResult.Added
 if ($extResult.Total -gt 0) {
-	Write-Host ("{0} 个扩展：{1} 更新, {2} 新增, {3} 未变" -f $extResult.Total, $extResult.Updated, $extResult.Added, $extResult.Same)
+	Write-Host ("扩展：{0} 个文件（{1} 更新, {2} 新增, {3} 未变）" -f $extResult.Total, $extResult.Updated, $extResult.Added, $extResult.Same)
 }
 if ($asstResult -and $asstResult.Total -gt 0) {
 	$changed += $asstResult.Updated + $asstResult.Added

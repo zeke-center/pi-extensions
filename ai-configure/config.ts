@@ -1,8 +1,8 @@
 /**
- * AI 配置中心 · pi 扩展
+ * AI configure · 配置中心模块
  *
  * 从"AI 配置中心"（你的 Center 后端）拉取连接台账，选完之后**在会话内生效**。
- * 台账只存"账面信息"，把它翻译成 pi 能用的 MCP 配置这件事由本扩展负责。
+ * 台账只存"账面信息"，把它翻译成 pi 能用的 MCP 配置这件事由本模块负责。
  *
  * 用法:
  *   /ai                拉取台账 → 多选 → 选应用方式 → 生效
@@ -10,6 +10,7 @@
  *   /ai off            撤销本次会话级注册
  *   /ai project off    从当前项目的 .pi/mcp.json 移除本扩展写入的条目
  *   /ai status         看当前状态
+ *   /ai help           打印全部功能（= /aihelp）
  *
  * 环境变量（可选）:
  *   CENTER_TOKEN       Master 密钥；不设的话 /ai 时会弹框让你输
@@ -20,6 +21,7 @@ import { type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@eare
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { showHelp } from "./help";
 
 const API = (process.env.CENTER_API ?? "https://api.zeke0419.top").replace(/\/+$/, "");
 /** Master 密钥：优先环境变量 CENTER_TOKEN；没有的话 /ai 时会弹框让你输（只存在内存） */
@@ -302,14 +304,20 @@ function refreshStatus(): void {
 }
 
 // ======================= 命令 =======================
-export default function (api: ExtensionAPI): void {
+export function setupConfig(api: ExtensionAPI): void {
 	pi = api;
 
 	api.registerCommand("ai", {
-		description: "从 AI 配置中心拉取连接，选完在会话内生效（/ai off | /ai status）",
+		description: "从 AI 配置中心拉取连接（/ai help 看全部功能）",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			lastCtx = ctx;
 			const a = (args ?? "").trim().toLowerCase();
+
+			// ---------- /ai help ----------
+			if (a === "help" || a === "?" || a === "h") {
+				showHelp(ctx);
+				return;
+			}
 
 			// ---------- /ai off ----------
 			if (a === "off") {
