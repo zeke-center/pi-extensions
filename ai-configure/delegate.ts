@@ -1700,10 +1700,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 				for (const task of list) {
 					const seq = resumeId ? 0 : nextSeq(tpl.key);
 					const names = buildNames(main, tpl, seq, resumeId);
-					const id = names.id;
-					ids.push(id);
+					// bg 文件名加随机后缀：中文 key 会被 sanitize 掉，两个助理同一秒派发会撞 id、互相覆盖 .bg 文件
+					const bgId = `${names.id}-${Math.random().toString(36).slice(2, 8)}`;
+					ids.push(names.id);
 					writeBgTask({
-						id, key: tpl.key, name: tpl.name, task, sessionId: id,
+						id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
 						startedAt: Date.now(), status: "running",
 					});
 					void runAssistant(tpl, task, {
@@ -1714,8 +1715,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 						shadowDir: shadow.dir,
 						sessionDir: ensureAssistantSessionDir(tpl.key),
 						onSettle: (r) => {
-							const prev = readBgTask(id) ?? {
-								id, key: tpl.key, name: tpl.name, task, sessionId: id,
+							const prev = readBgTask(bgId) ?? {
+								id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
 								startedAt: Date.now(), status: "running" as const,
 							};
 							writeBgTask({
