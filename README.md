@@ -70,6 +70,8 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `mcp <key>` | 同上，只是光标直接落在 MCP 那行 |
 | | `new <key>` | 弹同一个面板新建 |
 | | `open <key>` | 用系统默认程序打开那个 `.md` |
+| **`/resume-agent`** | — | 翻看助理的**历次会话**（它们**不在 `/resume` 里**），选中直接切过去看 |
+| | `<key>` | 只看某个助理的（例 `/resume-agent db`） |
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
 
@@ -265,7 +267,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 ## 模块 3 · delegate.ts（派活给临时助理）
 
-主 pi 多一个 `delegate` 工具：**另起独立的 pi 进程干活，只把一张卡带回来**。中间过程不进主对话（但会话文件在，可以回看）。
+主 pi 多一个 `delegate` 工具：**另起独立的 pi 进程干活，只把一张卡带回来**。中间过程不进主对话（但会话文件在，可以回看），且助理会话**不污染 `/resume`** —— 用 `/resume-agent` 单独翻。
 
 | 什么时候用 | 什么时候别用 |
 |---|---|
@@ -316,7 +318,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 | | 格式 | 例子 |
 |---|---|---|
-| **显示名**（`/resume` 里看到的） | `<主进程名>-<代理名><序号>` | `修复登录bug-数据库助理1` |
+| **显示名**（`/resume-agent` 里看到的） | `<主进程名>-<代理名><序号>` | `修复登录bug-数据库助理1` |
 | **会话 ID**（ASCII，机器用） | `<slug>-<年月日>-<时分秒>-<序号>` | `db-20261003-195122-1` |
 
 - 主进程名 = 主 pi 的 `/name`；没设就是 `主进程`
@@ -324,9 +326,22 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 - **时间戳在 ID 里**，所以你能知道「哪个任务、什么时候」干的
 - 会话 ID 只允许 ASCII 字母数字 `-_.`（pi 的硬性要求），所以中文显示名和 ID 是分开的
 
-### 找回某个子会话
+### 会话存在哪儿（为什么 `/resume` 里看不到）
 
-每次派发的卡片尾部都有一块：
+**助理会话不落在 `~/.pi/agent/sessions/` 里** —— 否则派几次就把主项目的 `/resume` 列表刷满了。
+它们单独放在：
+
+```
+~/.pi/agent/assistant-sessions/<助理 key>/<时间戳>_<会话ID>.jsonl
+```
+
+| 想干什么 | 怎么做 |
+|---|---|
+| 在 pi 里翻（推荐） | **`/resume-agent`** ← 列出历次会话，选中就切过去看；`/resume-agent db` 只看某个助理 |
+| 拿文件路径直接进 | `pi --session "<文件路径>"` |
+| 自己扫目录 | `ls ~/.pi/agent/assistant-sessions/<助理 key>/` |
+
+卡片尾部的「找回」那行会直接把可粘贴的命令打给你：
 
 ```
 ──── 本次派发 ────
@@ -336,14 +351,8 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 目录    F:/AI/My_Center
 任务    查 records 表有多少行
 耗时    6s
-找回    pi --session-id db-20261003-195122-1
+找回    /resume-agent 里挑，或 pi --session "C:\...\assistant-sessions\db\<时间戳>_db-20261003-195122-1.jsonl"
 ```
-
-三种找回方式：
-
-- `pi --session-id db-20261003-195122-1` ← 直接进
-- `cd <目录> && pi --resume` ← 按名字挑
-- 文件：`~/.pi/agent/sessions/<目录 slug>/<时间戳>_<会话ID>.jsonl`
 
 ### 超时与续期
 
@@ -540,7 +549,7 @@ mcp: center-pg
 | **不做后台模式**（派完就走、回头再收） | 那需要往对话里注入消息，属于 durable 的领域 |
 | **不走 RPC** | 临时工不需要「托管」，一次调用就够 |
 | **助理不能再派人**（自动加 `-xt delegate`） | 防止递归打转 |
-| **不做面板** | 会话名可读 + `pi --resume` 够了 |
+| **不做面板** | 会话名可读 + `/resume-agent` 够了 |
 | **超时到点就杀** | 宁可杀掉再靠 `resume` 续跑，也不留孤儿进程 |
 
 ### 已知限制

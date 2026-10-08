@@ -181,9 +181,9 @@ export function buildShadow(
 	return { dir, names: Object.keys(chosen), missing };
 }
 
-/** 真实会话根目录（配合 --session-dir，保证子会话还能 pi --resume 找到） */
-export function realSessionDir(): string {
-	return join(getAgentDir(), "sessions");
+/** 助理会话根目录：刻意**不在** sessions/ 下，这样 pi 自带的 /resume 看不见助理会话 */
+export function assistantSessionRoot(): string {
+	return join(getAgentDir(), "assistant-sessions");
 }
 
 /** 影子目录的根（调试用） */

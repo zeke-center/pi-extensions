@@ -9,14 +9,16 @@
  *   - 同步停止：Esc / 主进程退出 / 主进程被强杀（看门狗），三层都杀，不留孤儿
  *   - 超时：到点就**杀**，返回「半成品 + 调过的工具 + 会话ID」；要接着做就带 resume 续跑
  *   - 助理之间不能互相派活（给子进程加了 -xt delegate）
- *   - 会话都留在磁盘上：名字可读、ID 可续、随时能翻
+ *   - 会话都留在磁盘上，但**不在 sessions/ 里**（否则 pi 自带的 /resume 会被助理刷满）：
+ *     ~/.pi/agent/assistant-sessions/<助理 slug>/<时间戳>_<会话ID>.jsonl
+ *     要单独翻看：/resume-agent（或 pi --session "<文件路径>"）
  *
  * 模板 = <项目>/.pi/assistants/*.md 或 <agentDir>/assistants/*.md
  *   frontmatter: name / desc / cwd / model
  *   正文 = 该助理的系统提示词
  *
  * 命名规则：
- *   显示名（/resume 里看到的）  <主进程名>-<代理名><序号>   例：修复登录bug-数据库助理1
+ *   显示名（/resume-agent 里看到的）  <主进程名>-<代理名><序号>   例：修复登录bug-数据库助理1
  *   会话 ID（ASCII，机器用）    <slug>-<yyyymmdd>-<hhmmss>-<序号>  例：db-20261003-114801-1
  *
  * 用法:
@@ -29,14 +31,14 @@
  *   PI_CLI          手动指定 pi 的 CLI 入口（默认自动找）
  *   PI_PACKAGE_DIR  覆盖 pi 包目录（Nix/Guix 场景）
  */
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
-import { buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool, realSessionDir } from "./mcp-pool";
+import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -552,8 +554,30 @@ interface RunOptions {
 	resumed: boolean;
 	/** 影子 agentDir（只含本助理该有的 mcp.json） */
 	shadowDir: string;
-	/** 真实会话根目录，保证子会话还能 pi --resume 找到 */
+	/** 助理专属会话目录（不在 sessions/ 下，/resume 看不见） */
 	sessionDir: string;
+}
+
+/** 给助理准备专属会话目录：不存在就建 */
+function ensureAssistantSessionDir(key: string): string {
+	const dir = join(assistantSessionRoot(), key);
+	try {
+		mkdirSync(dir, { recursive: true });
+	} catch {
+		/* ignore */
+	}
+	return dir;
+}
+
+/** 按会话 ID 反查会话文件（文件名以 `_<会话ID>.jsonl` 结尾） */
+function sessionFileFor(key: string, id: string): string | undefined {
+	const dir = join(assistantSessionRoot(), key);
+	try {
+		const hit = readdirSync(dir).find((f) => f.endsWith(`_${id}.jsonl`));
+		return hit ? join(dir, hit) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<RunResult> {
@@ -728,6 +752,8 @@ function renderCard(r: RunResult): string {
 			break;
 	}
 
+	const file = sessionFileFor(r.tpl.key, r.names.id);
+
 	return [
 		head,
 		"",
@@ -741,7 +767,7 @@ function renderCard(r: RunResult): string {
 		`连接    ${r.tpl.mcp.length ? r.tpl.mcp.join(", ") : "(不连 MCP)"}`,
 		`任务    ${oneLine(r.task, 40)}`,
 		`耗时    ${secs}s`,
-		`找回    pi --session-id ${r.names.id}`,
+		`找回    /resume-agent 里挑${file ? `，或 pi --session "${file}"` : ""}`,
 	].join("\n");
 }
 
@@ -1148,6 +1174,141 @@ function openAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 	}
 }
 
+// ======================= /resume-agent：翻助理的会话 =======================
+/** 列表一次最多列这么多条 */
+const SESSION_LIST_LIMIT = 30;
+
+interface AgentSession {
+	file: string;
+	key: string;
+	ts: number;
+	name: string;
+	first: string;
+	kb: number;
+}
+
+/** 只读到“会话名 + 首条任务”就停（文件再大也只扫一遍行） */
+function readSessionHead(file: string): { name: string; first: string } {
+	let name = "";
+	let first = "";
+	let text = "";
+	try {
+		text = readFileSync(file, "utf-8");
+	} catch {
+		return { name, first };
+	}
+	for (const line of text.split("\n")) {
+		if (!name && line.includes('"session_info"')) {
+			try {
+				const d = JSON.parse(line) as { type?: string; name?: string };
+				if (d.type === "session_info" && d.name) name = d.name;
+			} catch {
+				/* ignore */
+			}
+		}
+		if (!first && line.includes('"role":"user"')) {
+			try {
+				const d = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
+				if (d.type === "message" && d.message?.role === "user") {
+					const c = d.message.content;
+					first =
+						typeof c === "string"
+							? c
+							: Array.isArray(c)
+								? c.map((x) => (x && typeof x === "object" && "text" in x ? String((x as { text: unknown }).text) : "")).join(" ")
+								: "";
+				}
+			} catch {
+				/* ignore */
+			}
+		}
+		if (name && first) break;
+	}
+	return { name: name.trim(), first: first.replace(/\s+/g, " ").trim() };
+}
+
+/** 扫 ~/.pi/agent/assistant-sessions/<助理>/，按时间倒序 */
+function scanAssistantSessions(onlyKey?: string): AgentSession[] {
+	const root = assistantSessionRoot();
+	let keys: string[] = [];
+	try {
+		keys = readdirSync(root).filter((k) => {
+			try {
+				return statSync(join(root, k)).isDirectory();
+			} catch {
+				return false;
+			}
+		});
+	} catch {
+		return [];
+	}
+
+	const rows: AgentSession[] = [];
+	for (const key of keys) {
+		if (onlyKey && key !== onlyKey) continue;
+		const dir = join(root, key);
+		let files: string[] = [];
+		try {
+			files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+		} catch {
+			continue;
+		}
+		for (const f of files) {
+			const file = join(dir, f);
+			try {
+				const st = statSync(file);
+				const head = readSessionHead(file);
+				rows.push({ file, key, ts: st.mtimeMs, name: head.name, first: head.first, kb: Math.round(st.size / 1024) });
+			} catch {
+				continue;
+			}
+		}
+	}
+	rows.sort((a, b) => b.ts - a.ts);
+	return rows;
+}
+
+function fmtClock(ms: number): string {
+	const d = new Date(ms);
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function resumeAgent(ctx: ExtensionCommandContext, arg: string): Promise<void> {
+	const only = (arg ?? "").trim().split(/\s+/).filter(Boolean)[0];
+	const rows = scanAssistantSessions(only);
+	if (!rows.length) {
+		ctx.ui.notify(
+			only
+				? `没找到助理「${only}」的会话。\n助理会话目录：${assistantSessionRoot()}`
+				: `还没有助理会话。\n派活之后它们会出现在：${assistantSessionRoot()}`,
+			"info",
+		);
+		return;
+	}
+
+	const shown = rows.slice(0, SESSION_LIST_LIMIT);
+	const labels = shown.map(
+		(r, i) =>
+			`${String(i + 1).padStart(2, "0")}  ${fmtClock(r.ts)} · ${r.key} · ${r.name || "(无名)"} · ${r.kb}KB · ${r.first.slice(0, 36) || "(无任务)"}`,
+	);
+	const picked = await ctx.ui.select(`助理会话（${shown.length}/${rows.length} 条，选中后切过去看，Esc 取消）`, labels);
+	if (!picked) return;
+	const row = shown[labels.indexOf(picked)];
+	if (!row) return;
+
+	const back = "想回来：/resume 选你原来的会话。";
+	if (!ctx.hasUI) {
+		ctx.ui.notify(`${row.key} · ${row.name}\n${row.file}\n\n查看：pi --session "${row.file}"`, "info");
+		return;
+	}
+	await ctx.switchSession(row.file, {
+		withSession: async (next) => {
+			next.ui.notify(`已切到助理会话：${row.key} · ${row.name || "(无名)"}\n${back}`, "info");
+		},
+	});
+}
+
 // ======================= 注册 =======================
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
@@ -1161,7 +1322,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 			"把任务派给**临时助理**（另起独立 pi 进程），只把卡片（状态/结论/证据）带回来。" +
 			"适合过程很脏、只要结论的活；不适合你想看过程的活。" +
 			"多件互不依赖的活用 tasks 并行派；超时/失败过的活用 resume 续跑。" +
-			"助理不能互相派活；每次都会回报会话名和会话 ID，可用 pi --resume 翻看。",
+			"助理不能互相派活；每次都会回报会话名和会话 ID，要翻看用 /resume-agent。",
 		parameters: params,
 
 		async execute(
@@ -1288,7 +1449,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 							names,
 							resumed: Boolean(resumeId),
 							shadowDir: shadow.dir,
-							sessionDir: realSessionDir(),
+							sessionDir: ensureAssistantSessionDir(tpl.key),
 						});
 					}),
 				);
@@ -1327,5 +1488,10 @@ export function setupDelegate(api: ExtensionAPI): void {
 			if (sub === "open") return openAssistant(ctx, cwd, rest);
 			return listAssistants(ctx, cwd);
 		},
+	});
+
+	api.registerCommand("resume-agent", {
+		description: "翻看助理的历次会话（它们不在 /resume 里）；可 /resume-agent db 只看某个助理",
+		handler: async (args: string, ctx) => resumeAgent(ctx, args ?? ""),
 	});
 }
