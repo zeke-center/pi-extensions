@@ -564,13 +564,16 @@ function summarizeTools(tools: string[]): string {
 // ======================= 跑一个助理 =======================
 interface RunOptions {
 	timeoutMs: number;
-	signal: AbortSignal;
+	/** 可选：后台任务不传（不随本轮 turn 结束被 abort） */
+	signal?: AbortSignal;
 	names: Names;
 	resumed: boolean;
 	/** 影子 agentDir（只含本助理该有的 mcp.json） */
 	shadowDir: string;
 	/** 助理专属会话目录（不在 sessions/ 下，/resume 看不见） */
 	sessionDir: string;
+	/** 后台任务完成时回调（写状态文件、触发回投）。同步模式不用。 */
+	onSettle?: (r: RunResult) => void;
 }
 
 /** 给助理准备专属会话目录：不存在就建 */
@@ -655,7 +658,7 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			opt.signal.removeEventListener("abort", onAbort);
+			opt.signal?.removeEventListener("abort", onAbort);
 			liveJobs.delete(child);
 			// 面板终态：写在这里而不是事件里 —— agent_end 不代表进程结束（可能还会重试/续跑）
 			const liveStatus: EndStatus = outcome === "timeout" ? "timeout" : outcome === "failed" ? "failed" : "done";
@@ -670,7 +673,9 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 							? `子进程退出码 ${exitCode}`
 							: undefined,
 			);
-			done(base(outcome, exitCode));
+			const r = base(outcome, exitCode);
+			opt.onSettle?.(r);
+			done(r);
 		};
 
 		const timer = setTimeout(() => {
@@ -682,7 +687,7 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 			timedOut = false;
 			killTree(child);
 		};
-		opt.signal.addEventListener("abort", onAbort);
+		opt.signal?.addEventListener("abort", onAbort);
 
 		child.stdout?.on("data", (d: Buffer) => read(d.toString("utf8")));
 		child.stderr?.on("data", (d: Buffer) => {
@@ -838,7 +843,96 @@ function makeDelegateParams(hint: string) {
 		timeoutMs: Type.Optional(
 			Type.Number({ description: `超时毫秒（模板可用 timeout 字段给默认值；上限 ${MAX_TIMEOUT_MS}）。` }),
 		),
+		wait: Type.Optional(
+			Type.Boolean({ description: "默认 false（异步）：派完立即返回「已派发」，子进程后台跑，完成后自动把结果回投到主会话（不打断，排队到当前轮后面）。true = 同步等结果（阻塞，派多路时等全部回来）才返回。" }),
+		),
 	});
+}
+
+// ======================= 默认同步/异步模式 =======================
+/** 模式持久化文件：~/.pi/agent/delegate-mode，内容 sync|async */
+function delegateModeFile(): string {
+	return join(getAgentDir(), "delegate-mode");
+}
+function readDelegateMode(): "sync" | "async" {
+	try {
+		const v = readFileSync(delegateModeFile(), "utf8").trim();
+		return v === "sync" ? "sync" : "async";
+	} catch {
+		return "async"; // 默认异步（派完就走 + 自动回投）
+	}
+}
+function writeDelegateMode(mode: "sync" | "async"): void {
+	try {
+		writeFileSync(delegateModeFile(), mode, "utf8");
+	} catch {
+		/* 写不进去就只生效本次 */
+	}
+}
+
+// ======================= 后台任务（异步派活）=======================
+interface BgTaskFile {
+	id: string;
+	key: string;
+	name: string;
+	task: string;
+	sessionId: string;
+	startedAt: number;
+	status: "running" | "done" | "timeout" | "failed" | "empty";
+	resultText?: string;
+	finishedAt?: number;
+	delivered?: boolean;
+}
+
+function bgRoot(): string {
+	const d = join(assistantSessionRoot(), ".bg");
+	try {
+		mkdirSync(d, { recursive: true });
+	} catch {
+		/* ignore */
+	}
+	return d;
+}
+function bgFile(id: string): string {
+	return join(bgRoot(), `${id}.json`);
+}
+function writeBgTask(t: BgTaskFile): void {
+	try {
+		writeFileSync(bgFile(t.id), JSON.stringify(t, null, 2), "utf8");
+	} catch {
+		/* ignore */
+	}
+}
+function readBgTask(id: string): BgTaskFile | undefined {
+	try {
+		return JSON.parse(readFileSync(bgFile(id), "utf8")) as BgTaskFile;
+	} catch {
+		return undefined;
+	}
+}
+function listBgTasks(): BgTaskFile[] {
+	try {
+		return readdirSync(bgRoot())
+			.filter((f) => f.endsWith(".json"))
+			.map((f) => {
+				try {
+					return JSON.parse(readFileSync(join(bgRoot(), f), "utf8")) as BgTaskFile;
+				} catch {
+					return undefined;
+				}
+			})
+			.filter((t): t is BgTaskFile => !!t);
+	} catch {
+		return [];
+	}
+}
+function outcomeToStatus(o: Outcome): BgTaskFile["status"] {
+	switch (o) {
+		case "done": return "done";
+		case "timeout": return "timeout";
+		case "empty": return "empty";
+		default: return "failed";
+	}
 }
 
 // ======================= /assistants 的界面 =======================
@@ -1388,9 +1482,48 @@ async function backToMain(ctx: ExtensionCommandContext): Promise<void> {
 	});
 }
 
+// ======================= 后台轮询 + 自动回投 =======================
+let apiRef: ExtensionAPI | undefined;
+let bgTimer: ReturnType<typeof setInterval> | undefined;
+
+/** 每秒扫一遍后台任务：终态且没回投过的 → 回投主会话（followUp 不打断，排到当前轮后面） */
+function pollBgTasks(): void {
+	if (!apiRef) return;
+	for (const t of listBgTasks()) {
+		if (t.status === "running" || t.delivered) continue;
+		// 先标记再回投：避免回投异常导致下个 tick 重复投、主 agent 反复处理同一条
+		writeBgTask({ ...t, delivered: true });
+		try {
+			apiRef.sendUserMessage(
+				`子Agent「${t.name}」回来了（后台任务）\n${t.resultText || "（没有结果文本）"}\n\n会话ID：${t.sessionId}（要翻看：/resume-agent）`,
+				{ deliverAs: "followUp" },
+			);
+		} catch {
+			/* 吞掉：不刷屏 */
+		}
+	}
+}
+
 // ======================= 注册 =======================
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
+	apiRef = api; // 供后台轮询回投用
+
+	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
+	api.on("session_start", async () => {
+		if (bgTimer) clearInterval(bgTimer);
+		bgTimer = setInterval(() => {
+			try {
+				pollBgTasks();
+			} catch {
+				/* 吞掉，别把进程干挂 */
+			}
+		}, 1000);
+	});
+	api.on("session_shutdown", async () => {
+		if (bgTimer) clearInterval(bgTimer);
+		bgTimer = undefined;
+	});
 	// 助理清单在加载时算一次，拼进工具参数描述（零额外开销）
 	const params = makeDelegateParams(assistantHint(process.cwd()));
 
@@ -1406,11 +1539,13 @@ export function setupDelegate(api: ExtensionAPI): void {
 
 		async execute(
 			_toolCallId: string,
-			params: { assistant: string; task?: string; tasks?: string[]; resume?: string; timeoutMs?: number },
+			params: { assistant: string; task?: string; tasks?: string[]; resume?: string; timeoutMs?: number; wait?: boolean },
 			signal: AbortSignal,
 			_onUpdate: unknown,
 			ctx: ExtensionContext,
 		) {
+			// wait 参数优先；没传才用 /delegate-mode 的默认（默认异步）
+			const wait = params.wait ?? (readDelegateMode() === "sync");
 			const cwd = ctx.cwd ?? process.cwd();
 			const templates = loadTemplates(cwd);
 			const tpl = templates.find((t) => t.key === params.assistant || t.name === params.assistant);
@@ -1520,25 +1655,74 @@ export function setupDelegate(api: ExtensionAPI): void {
 			ensureAgentPanel(ctx);
 
 			let results: RunResult[];
-			try {
-				results = await Promise.all(
-					list.map((task, i) => {
-						const seq = resumeId ? 0 : nextSeq(tpl.key);
-						const names = buildNames(main, tpl, seq, resumeId);
-						return runAssistant(tpl, task, {
-							timeoutMs: total,
-							signal,
-							names,
-							resumed: Boolean(resumeId),
-							shadowDir: shadow.dir,
-							sessionDir: ensureAssistantSessionDir(tpl.key),
-						});
-					}),
-				);
-			} finally {
+			if (wait) {
+				try {
+					results = await Promise.all(
+						list.map((task) => {
+							const seq = resumeId ? 0 : nextSeq(tpl.key);
+							const names = buildNames(main, tpl, seq, resumeId);
+							return runAssistant(tpl, task, {
+								timeoutMs: total,
+								signal,
+								names,
+								resumed: Boolean(resumeId),
+								shadowDir: shadow.dir,
+								sessionDir: ensureAssistantSessionDir(tpl.key),
+							});
+						}),
+					);
+				} finally {
+					if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+					// 跑完了不马上收面板：留一会儿让你看完，再自动收起（其间又派活会取消）
+					autoClosePanel(ctx);
+				}
+			} else {
+				// 异步：派完就走，登记后台任务；子进程后台跑，完成由轮询回投（见 pollBgTasks）
 				if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
-				// 跑完了不马上收面板：留一会儿让你看完，再自动收起（其间又派活会取消）
-				autoClosePanel(ctx);
+				const ids: string[] = [];
+				for (const task of list) {
+					const seq = resumeId ? 0 : nextSeq(tpl.key);
+					const names = buildNames(main, tpl, seq, resumeId);
+					const id = names.id;
+					ids.push(id);
+					writeBgTask({
+						id, key: tpl.key, name: tpl.name, task, sessionId: id,
+						startedAt: Date.now(), status: "running",
+					});
+					void runAssistant(tpl, task, {
+						timeoutMs: total,
+						// 不传 signal：不随本轮 turn 结束被 abort
+						names,
+						resumed: Boolean(resumeId),
+						shadowDir: shadow.dir,
+						sessionDir: ensureAssistantSessionDir(tpl.key),
+						onSettle: (r) => {
+							const prev = readBgTask(id) ?? {
+								id, key: tpl.key, name: tpl.name, task, sessionId: id,
+								startedAt: Date.now(), status: "running" as const,
+							};
+							writeBgTask({
+								...prev,
+								status: outcomeToStatus(r.outcome),
+								resultText: renderCard(r),
+								finishedAt: Date.now(),
+								delivered: false,
+							});
+						},
+					}).catch(() => { /* runAssistant 自身不 reject，兜底 */ });
+				}
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`已派发 ${list.length} 个任务给「${tpl.name}」（后台跑，完成后自动回投主会话）：\n` +
+								ids.map((id) => `  · 会话ID ${id}`).join("\n") +
+								`\n\n中途想切同步/异步：/delegate-mode async | sync`,
+						},
+					],
+					details: { ok: true, async: true, sessions: ids },
+				};
 			}
 
 			const sep = `\n\n${"─".repeat(48)}\n\n`;
@@ -1582,6 +1766,24 @@ export function setupDelegate(api: ExtensionAPI): void {
 	api.registerCommand("agent-resume-back", {
 		description: "从助理会话一键返回主会话（/resume 在助理会话里看不到主会话，用这个）",
 		handler: async (_args: string, ctx) => backToMain(ctx),
+	});
+
+	api.registerCommand("delegate-mode", {
+		description: "切 delegate 默认模式：async=派完就走+自动回投（默认），sync=派完等结果",
+		handler: async (args: string, ctx) => {
+			const sub = (args ?? "").trim().toLowerCase();
+			const cur = readDelegateMode();
+			if (!sub) {
+				ctx.ui.notify(`delegate 默认模式：${cur}\n用法：/delegate-mode async | sync`, "info");
+				return;
+			}
+			if (sub === "async" || sub === "sync") {
+				writeDelegateMode(sub);
+				ctx.ui.notify(`delegate 默认模式已切成：${sub}\n（delegate 工具没传 wait 时按这个来；传了 wait 以 wait 为准）`, "info");
+				return;
+			}
+			ctx.ui.notify(`不认识「${sub}」。用法：/delegate-mode [async|sync]`, "info");
+		},
 	});
 
 	// ---------- /agents：子代理实时面板 ----------

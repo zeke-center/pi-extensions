@@ -86,6 +86,9 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | **`/resume-agent`** | — | 翻看助理的**历次会话**（它们**不在 `/resume` 里**），选中直接切过去看 |
 | | `<key>` | 只看某个助理的（例 `/resume-agent db`） |
 | **`/agent-resume-back`** | — | 从助理会话**一键返回主会话**。切进助理会话后 `/resume` 只扫助理目录、看不到主会话，用这个回来 |
+| **`/delegate-mode`** | （无参数） | 看 delegate 默认是同步还是异步 |
+| | `async` | 默认**异步**：派完就走，后台跑，完成自动回投主会话（不打断） |
+| | `sync` | 默认**同步**：派完等结果才继续（老行为） |
 | **`/agents`** | （无参数） | 开**子代理实时面板**（派活时本来就会自动出现；手动敲=重新叫回） |
 | | `off` | 关掉（下次派活也不再自动弹） |
 | | `detail` | 展开 / 折叠它的思考过程 |
@@ -97,7 +100,7 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | 工具 | 参数 | 干什么 |
 |---|---|---|
 | `progress` | `action`（必填：`plan`/`step`/`block`/`clear`）、`title`、`steps`、`index`、`status`、`text`、`skipConfirm` | 更新输入框上方那个面板 |
-| `delegate` | `assistant`（必填）、`task` \| `tasks`、`resume`、`timeoutMs` | 派活给临时助理（另起独立 pi 进程）|
+| `delegate` | `assistant`（必填）、`task` \| `tasks`、`resume`、`timeoutMs`、`wait` | 派活给临时助理（另起独立 pi 进程）；`wait` 默认 false=异步派完就走、完成自动回投，true=同步等结果 |
 
 > 带完整参数说明的版本敲 **`/aihelp`**。
 

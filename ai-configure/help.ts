@@ -42,6 +42,9 @@ export const HELP_TEXT = `AI configure · 全部功能
 /resume-agent             翻看助理的历次会话（它们不在 /resume 里），选中切过去看
   /resume-agent <key>     只看某个助理的
 /agent-resume-back        从助理会话一键返回主会话（/resume 在助理会话里看不到主会话）
+/delegate-mode            看 delegate 默认是同步还是异步
+  /delegate-mode async    默认异步：派完就走，后台跑，完成自动回投主会话（不打断）
+  /delegate-mode sync     默认同步：派完等结果才继续（老行为）
 
   （面板显示：状态 · 已跑多久 · 当前在跑哪个工具及参数 · 结果 · token；
     超过 25 秒没有新事件会提示「⚠ Ns无动静」—— 用来判断它是卡住还是在等；
@@ -63,6 +66,7 @@ delegate(assistant, ...)  派活给临时助理（另起独立 pi 进程），�
   tasks        字符串数组 多件互不依赖的事，并行跑（总耗时≈最慢那件）
   resume       字符串    续跑上次的会话 ID（卡片里那个）
   timeoutMs    数字      超时毫秒，默认 300000，上限 1800000
+  wait         布尔      默认 false（异步）派完就走；true = 同步等结果。不传用 /delegate-mode 的默认
 
 ▍顺带一提：这几个内置命令你会用到
 /reload    改完扩展代码必须执行（改助理模板不用）
