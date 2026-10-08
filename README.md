@@ -114,6 +114,10 @@ pi install git:github.com/zeke-center/pi-extensions
 
 前置：装好 pi（`npm i -g @earendil-works/pi-coding-agent`）。**不需要额外 `npm install`** —— `typebox`、`pi-tui` 这些依赖都由 pi 宿主提供。
 
+> ⚠️ **装的时候别带 `@具体commit`**。git 包按 ref 锁定版本：带 `@<commit>` 装的话，
+> `pi update --extensions` 只会「对齐到那个 ref」，**永远不会往前拉**。
+> 想能自动更新 → 装裸地址（跟踪默认分支 main）；想锁死版本 → 才用 `@<tag或commit>`。
+
 pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` 加载 `ai-configure/index.ts`。
 仓库自带的 `assistants/*.md` 也会一起被找到 —— **装完就有一个能派的「通用助理」**，不用自己写。
 
@@ -131,8 +135,23 @@ pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` �
 | 命令 | 作用 |
 |---|---|
 | `pi list` | 看装了哪些包 |
-| `pi update --extensions` | 拉最新版（对 git 包就是重新 clone/pull）|
+| `pi update --extensions` | 拉最新版（见下） |
 | `pi remove git:github.com/zeke-center/pi-extensions` | 卸载 |
+
+**已装的人怎么更新到最新**（实测：`80074fc` → `8ab89ae` 一步到位）：
+
+```bash
+pi update --extensions
+```
+
+**怎么确认自己装的是最新版**（跟仓库 HEAD 对一眼）：
+
+```bash
+git -C ~/.pi/agent/git/github.com/zeke-center/pi-extensions log --oneline -1
+git ls-remote https://github.com/zeke-center/pi-extensions refs/heads/main
+```
+
+两行打出来的 commit 一样，就是最新。
 
 > 本地改代码时：`pi install ./pi-extensions`（路径直接生效，不用复制，也不用 `/reload`）。
 > 已经发到 npm 的话：`pi install npm:@zeke-center/pi-extensions`（目前未发布）。
@@ -140,6 +159,9 @@ pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` �
 > 只想抄一份模板、不想装插件：把 `assistants/general.md` 拷到 `~/.pi/agent/assistants/` 就行。
 
 ### 方式 B：同步脚本（Windows —— 自己改代码时用）
+
+> 别跟方式 A 混用：一个走 `pi install`、一个手动拷到 `extensions/`，混用会**各加载一份、命令注册两遍**。
+> 自己开发用 B，装给别人用 A。
 
 pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把扩展和助理模板同步过去：
 
