@@ -699,7 +699,7 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 		});
 		child.on("close", (code) => {
 			if (settled) return;
-			if (opt.signal.aborted) {
+			if (opt.signal?.aborted) {
 				finish("failed", code);
 			} else if (timedOut) {
 				finish("timeout", code);
@@ -1504,6 +1504,22 @@ function pollBgTasks(): void {
 	}
 }
 
+/** 孤儿任务清理：running 但超过 10 分钟（正常 timeout 最多 5 分钟）→ 标 failed */
+function reapStaleBgTasks(): void {
+	const now = Date.now();
+	for (const t of listBgTasks()) {
+		if (t.status === "running" && now - t.startedAt > 10 * 60 * 1000) {
+			writeBgTask({
+				...t,
+				status: "failed",
+				resultText: "（孤儿任务：子进程已消失，标记为失败）",
+				finishedAt: now,
+				delivered: false,
+			});
+		}
+	}
+}
+
 // ======================= 注册 =======================
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
@@ -1511,6 +1527,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 
 	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
 	api.on("session_start", async () => {
+		reapStaleBgTasks(); // 先清理上个会话留下的孤儿任务
 		if (bgTimer) clearInterval(bgTimer);
 		bgTimer = setInterval(() => {
 			try {
