@@ -6,7 +6,7 @@
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
 ```
 
-装完就能用 `/board`、`/ai`、`/assistants`、`/resume-agent`、`/agents`，以及一个能直接派的**通用助理**。
+装完就能用 `/board`、`/ai`、`/assistants`、`/resume-agent`、`/agent-resume-back`、`/agents`，以及一个能直接派的**通用助理**。
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
@@ -85,6 +85,7 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `open <key>` | 用系统默认程序打开那个 `.md` |
 | **`/resume-agent`** | — | 翻看助理的**历次会话**（它们**不在 `/resume` 里**），选中直接切过去看 |
 | | `<key>` | 只看某个助理的（例 `/resume-agent db`） |
+| **`/agent-resume-back`** | — | 从助理会话**一键返回主会话**。切进助理会话后 `/resume` 只扫助理目录、看不到主会话，用这个回来 |
 | **`/agents`** | （无参数） | 开**子代理实时面板**（派活时本来就会自动出现；手动敲=重新叫回） |
 | | `off` | 关掉（下次派活也不再自动弹） |
 | | `detail` | 展开 / 折叠它的思考过程 |

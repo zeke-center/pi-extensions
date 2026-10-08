@@ -1307,6 +1307,27 @@ function fmtClock(ms: number): string {
 	return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 记录「主会话」路径，供 /agent-resume-back 切回来。
+ *  为什么存文件而不是内存变量：切会话时扩展模块会重载，内存变量会丢。 */
+function returnPathFile(): string {
+	return join(getAgentDir(), ".return-to-main");
+}
+function saveReturnPath(file: string): void {
+	try {
+		writeFileSync(returnPathFile(), file, "utf8");
+	} catch {
+		// 写不进去就算了，/agent-resume-back 会提示找不到
+	}
+}
+function loadReturnPath(): string | undefined {
+	try {
+		const p = readFileSync(returnPathFile(), "utf8").trim();
+		return p || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function resumeAgent(ctx: ExtensionCommandContext, arg: string): Promise<void> {
 	const only = (arg ?? "").trim().split(/\s+/).filter(Boolean)[0];
 	const rows = scanAssistantSessions(only);
@@ -1330,14 +1351,39 @@ async function resumeAgent(ctx: ExtensionCommandContext, arg: string): Promise<v
 	const row = shown[labels.indexOf(picked)];
 	if (!row) return;
 
-	const back = "想回来：/resume 选你原来的会话。";
+	// 切走前记下主会话路径，/agent-resume-back 才能一键回来（/resume 在助理会话里看不到主会话）
+	const prev = ctx.sessionManager.getSessionFile();
+	if (prev) saveReturnPath(prev);
+
+	const back = "想回来：/agent-resume-back（一键返回主会话）。";
 	if (!ctx.hasUI) {
-		ctx.ui.notify(`${row.key} · ${row.name}\n${row.file}\n\n查看：pi --session "${row.file}"`, "info");
+		ctx.ui.notify(`${row.key} · ${row.name}\n${row.file}\n\n查看：pi --session "${row.file}"\n回来：/agent-resume-back`, "info");
 		return;
 	}
 	await ctx.switchSession(row.file, {
 		withSession: async (next) => {
 			next.ui.notify(`已切到助理会话：${row.key} · ${row.name || "(无名)"}\n${back}`, "info");
+		},
+	});
+}
+
+/** /agent-resume-back：从助理会话切回主会话 */
+async function backToMain(ctx: ExtensionCommandContext): Promise<void> {
+	const target = loadReturnPath();
+	if (!target || !existsSync(target)) {
+		ctx.ui.notify(
+			"没找到可返回的主会话路径。\n你大概本来就已在主会话里，或还没用 /resume-agent 切进过助理会话。",
+			"info",
+		);
+		return;
+	}
+	if (ctx.sessionManager.getSessionFile() === target) {
+		ctx.ui.notify("已经在主会话里了。", "info");
+		return;
+	}
+	await ctx.switchSession(target, {
+		withSession: async (next) => {
+			next.ui.notify("已返回主会话。", "info");
 		},
 	});
 }
@@ -1531,6 +1577,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 	api.registerCommand("resume-agent", {
 		description: "翻看助理的历次会话（它们不在 /resume 里）；可 /resume-agent db 只看某个助理",
 		handler: async (args: string, ctx) => resumeAgent(ctx, args ?? ""),
+	});
+
+	api.registerCommand("agent-resume-back", {
+		description: "从助理会话一键返回主会话（/resume 在助理会话里看不到主会话，用这个）",
+		handler: async (_args: string, ctx) => backToMain(ctx),
 	});
 
 	// ---------- /agents：子代理实时面板 ----------

@@ -39,6 +39,10 @@ export const HELP_TEXT = `AI configure · 全部功能
   /agents float           改成右侧浮层（会盖住一块，只在你想让它飘着时用）
   /agents text            把当前状态打印成纯文本（RPC / 调试用）
 
+/resume-agent             翻看助理的历次会话（它们不在 /resume 里），选中切过去看
+  /resume-agent <key>     只看某个助理的
+/agent-resume-back        从助理会话一键返回主会话（/resume 在助理会话里看不到主会话）
+
   （面板显示：状态 · 已跑多久 · 当前在跑哪个工具及参数 · 结果 · token；
     超过 25 秒没有新事件会提示「⚠ Ns无动静」—— 用来判断它是卡住还是在等；
     跑完后停 45 秒再自动收起；没在跑的时候占 0 行，不碍事）
