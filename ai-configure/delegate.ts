@@ -36,6 +36,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
 import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool } from "./mcp-pool";
@@ -119,13 +120,20 @@ interface RunResult {
 }
 
 // ======================= 模板加载 =======================
-/** 模板搜索目录：项目级优先，全局其次 */
+/** 扩展自己的目录（…/ai-configure），以及包根目录（…/）—— 包自带的模板在包根的 assistants/ 下 */
+const EXT_DIR = dirname(fileURLToPath(import.meta.url));
+const PACKAGE_DIR = dirname(EXT_DIR);
+
+/** 模板搜索目录：项目级优先，全局其次，最后是包自带的（pi install 装进来的） */
 function templateDirs(cwd: string): string[] {
 	const dirs: string[] = [];
 	const project = join(cwd, ".pi", "assistants");
 	if (existsSync(project)) dirs.push(project);
 	const global = join(getAgentDir(), "assistants");
 	if (existsSync(global)) dirs.push(global);
+	// 包自带：别人 pi install 装完就有一份能看的样板，同名时前面两个优先
+	const bundled = join(PACKAGE_DIR, "assistants");
+	if (existsSync(bundled)) dirs.push(bundled);
 	return dirs;
 }
 
@@ -193,8 +201,8 @@ function parseTemplate(file: string, key: string): Template | null {
 		}
 	}
 
-	// cwd 可以由 extends 继承，所以「两边都没有」才算无效模板
-	if (!meta.cwd && !meta.extends) return null;
+	// cwd 可以由 extends 继承、也可以省略（省略 = 跟随当前项目），所以只有「什么都没写」才算无效模板
+	if (!meta.cwd && !meta.extends && !meta.name && !meta.desc) return null;
 
 	return {
 		key,
@@ -275,14 +283,15 @@ export function loadTemplates(cwd: string): Template[] {
 		}
 	}
 
-	// 先把 extends 解开，再过滤掉关闭的 / cwd 解析不出来的
+	// 先把 extends 解开，再过滤掉关闭的
 	const byKey = new Map(parsed.map((t) => [t.key, t]));
 	const out: Template[] = [];
 	for (const t of parsed) {
 		const r = resolveTemplate(t, byKey, new Set());
 		if (r.enabled === false) continue;
-		if (!r.cwd) continue; // 继承完还是没有工作目录
-		out.push(r);
+		// cwd 省略 → 跟随主进程当前所在的项目目录。
+		// 这样模板可以跨机器复用（不然里面会写死某台机器的绝对路径）。
+		out.push({ ...r, cwd: r.cwd || cwd });
 	}
 	return out;
 }

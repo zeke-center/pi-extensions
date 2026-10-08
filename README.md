@@ -2,6 +2,12 @@
 
 我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（里面 6 个模块）**，外加一份助理模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
+```bash
+pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
+```
+
+装完就能用 `/board`、`/ai`、`/assistants`、`/resume-agent`，以及一个能直接派的**通用助理**。
+
 | 文件 | 功能 | 入口 |
 |---|---|---|
 | `ai-configure/index.ts` | 入口：装配下面五个模块 + 注册 `/aihelp` | — |
@@ -23,6 +29,7 @@ pi-extensions/
 │   ├── form.ts          # 弹窗面板（表单 + 多选）
 │   └── help.ts          # /aihelp 的说明书文案
 ├── assistants/          # 助理模板（每个 .md 一个助理）
+│   ├── general.md       # ✅ 可派：通用助理（装完就能用它）
 │   ├── role-dev.md      # 底座：开发类公共规矩（base，不能直接派）
 │   ├── role-ops.md      # 底座：只读类公共规矩（base，不能直接派）
 │   ├── frontend.md      # 示例：前端助理（extends role-dev，demo）
@@ -30,6 +37,8 @@ pi-extensions/
 │   ├── db.md            # 示例：数据库助理（extends role-ops，demo，挂 center-pg）
 │   └── server.md        # 示例：服务器助理（extends role-ops，demo，挂 nas-ubuntu24）
 ├── install.ps1          # 同步脚本：源 → ~/.pi/agent/（Windows）
+├── package.json         # pi 包清单（pi.extensions 指到 ai-configure/index.ts）
+├── LICENSE              # MIT
 ├── .gitignore
 └── README.md
 ```
@@ -86,7 +95,27 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 
 ## 安装
 
-### 方式 A：同步脚本（推荐，Windows）
+### 方式 A：`pi install`（推荐 —— 给别人用就走这条）
+
+把仓库当 pi 包装进来。**在终端里敲**（不是在 pi 聊天框里）：
+
+```bash
+pi install git:github.com/zeke-center/pi-extensions
+```
+
+pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` 加载 `ai-configure/index.ts`。
+仓库自带的 `assistants/*.md` 也会一起被找到 —— **装完就有一个能派的「通用助理」**，不用自己写。
+
+| 命令 | 作用 |
+|---|---|
+| `pi list` | 看装了哪些包 |
+| `pi update --extensions` | 拉最新版 |
+| `pi remove git:github.com/zeke-center/pi-extensions` | 卸载 |
+
+> 本地改代码时：`pi install ./pi-extensions`（路径直接生效，不用复制，也不用 `/reload`）。
+> 已经发到 npm 的话：`pi install npm:@zeke-center/pi-extensions`（目前未发布）。
+
+### 方式 B：同步脚本（Windows —— 自己改代码时用）
 
 pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把扩展和助理模板同步过去：
 
@@ -140,7 +169,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 无论哪种方式，同步完在 pi 里执行 `/reload`（或重开 pi）。依赖 `@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox` 都由 **pi 宿主提供**，不用自己装。
 
-### 方式 B：用 settings 指向本目录
+### 方式 C：用 settings 指向本目录
 
 不想复制、想直接编辑本仓库的，在 `~/.pi/agent/settings.json` 里加路径（用户设置的相对路径以 agent 目录为基准，绝对路径和 `~` 也支持）：
 
@@ -173,7 +202,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `CENTER_TOKEN` | 无 | Master 密钥。不设的话 `/ai` 时会弹框让你输 |
-| `CENTER_API` | `https://api.zeke0419.top` | 后端地址（末尾斜杠会自动去掉） |
+| `CENTER_API` | **必填** | 你的配置中心地址，例 `https://api.example.com`（末尾斜杠自动去掉）。**没设 → `/ai` 直接报错，不会连任何服务器** |
 
 流程：`GET {CENTER_API}/api/ai/connectors`（带密钥）→ 过滤 `enabled` → 按 `kind` 翻译。
 
@@ -203,6 +232,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
   - 任何类型 → 名字像写操作的 MCP 工具被设成 `hidden`（`write_*`、`insert_*`、`update_*`、`delete_*`、`drop_*`、`create_*`、`alter_*`、`truncate*`、`upload*`、`execute` 等）
 - `ssh` 一律加 `--pty false`：否则 `systemctl status` / `journalctl` 会起分页器卡住。
 - 用 `postgres` 时选的是 `mcp-postgres-server` 而**不是**官方 `server-postgres`——后者只有只读查询，体现不了台账里的「可修改」。
+- **密钥只管「能不能看到连接串」**：`GET /api/ai/connectors` 不带密钥也返回 `200`（前端的只读模式要用它），但 **`conn` 一律给空字符串** —— 主机 / 端口 / 库名一个都不下发；带了正确密钥才给明文。插件侧反过来更严：拿不到明文（`reveal: false`）就**直接拒绝**，不会拿半截台账去连。
 
 ---
 
@@ -380,14 +410,21 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 
 ### 助理模板
 
-放在 `<项目>/.pi/assistants/*.md`（项目级）或 `~/.pi/agent/assistants/*.md`（全局），**项目级优先**。
+三处都能找到模板，**前面的优先**（同名时后面的直接忽略）：
+
+| 位置 | 用途 |
+|---|---|
+| `<项目>/.pi/assistants/*.md` | 项目级 —— 这个项目专用的助理 |
+| `~/.pi/agent/assistants/*.md` | 全局 —— 所有项目都能用 |
+| `<包根>/assistants/*.md` | 包自带 —— `pi install` 装进来时自带的那几个样板 |
+
 文件名（去掉 `.md`）就是 `key`。
 
 #### 字段
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `cwd` | ✅ | **在哪儿干活**。文件读写、相对路径、项目 `AGENTS.md` 都看它。可以被 `extends` 继承 |
+| `cwd` | | **在哪儿干活**。文件读写、相对路径、项目 `AGENTS.md` 都看它。**省略 = 跟随主进程当前所在的项目目录**（所以模板能跨机器复用，别在里面写死绝对路径） |
 | `name` | | 显示名（中文也行）。省掉用文件名 |
 | `desc` | | **什么时候该叫我**。不只是给人看的 —— 主 pi 就是靠这句话决定派谁，所以写「什么时候用我」，别写「我是谁」 |
 | `mcp` | | 要挂的 MCP 名字，逗号分隔（`mcp: center-pg, nas-ubuntu24`）。**留空 = 一个都不挂** |
@@ -453,7 +490,6 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 ---
 name: 开发助理（底座）
 desc: 只给其它模板 extends 用，不能直接派
-cwd: F:/AI/My_Center
 base: true
 timeout: 10m
 ---

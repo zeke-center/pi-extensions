@@ -12,9 +12,11 @@
  *   /ai status         看当前状态
  *   /ai help           打印全部功能（= /aihelp）
  *
- * 环境变量（可选）:
+ * 环境变量:
+ *   CENTER_API         **必填**：你的配置中心地址（例：https://api.example.com）
  *   CENTER_TOKEN       Master 密钥；不设的话 /ai 时会弹框让你输
- *   CENTER_API         默认 https://api.zeke0419.top
+ *
+ * 刻意没有默认地址 —— 这是一个通用插件，不该把别人导向某个人的服务器。
  */
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -23,7 +25,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { showHelp } from "./help";
 
-const API = (process.env.CENTER_API ?? "https://api.zeke0419.top").replace(/\/+$/, "");
+// 没有默认值：没设就报错提示，而不是偷偷指向某个人的服务器
+const API = (process.env.CENTER_API ?? "").replace(/\/+$/, "");
 /** Master 密钥：优先环境变量 CENTER_TOKEN；没有的话 /ai 时会弹框让你输（只存在内存） */
 let token = process.env.CENTER_TOKEN ?? "";
 const STATUS_KEY = "ai-config";
@@ -248,6 +251,9 @@ function padTo(s: string, w: number): string {
 
 // ======================= 网络 =======================
 async function fetchConnectors(tok: string): Promise<Connector[]> {
+	if (!API) {
+		throw new Error("没设配置中心地址。请先设环境变量 CENTER_API（例：CENTER_API=https://api.example.com）");
+	}
 	const r = await fetch(`${API}/api/ai/connectors`, {
 		headers: { "X-Brain-Token": tok },
 		signal: AbortSignal.timeout(10000),

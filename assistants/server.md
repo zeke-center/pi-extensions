@@ -3,7 +3,6 @@ name: 服务器助理
 desc: 看服务器状态、翻日志、查进程/磁盘/端口、排查服务为什么挂了时用我。默认只读，不重启服务、不改服务器上的文件。
 demo: true
 extends: role-ops
-cwd: F:/AI/My_Center
 mcp: nas-ubuntu24
 timeout: 8m
 ---

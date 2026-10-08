@@ -1,8 +1,6 @@
 ---
 name: 开发助理（底座）
 desc: 开发类助理的公共底座，只给其它模板 extends 用，不能直接派。
-cwd: F:/AI/My_Center
-model: cc-switch-deep-seek/deepseek-v4-flash
 base: true
 agents_md: true
 timeout: 10m
