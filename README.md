@@ -103,17 +103,32 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 pi install git:github.com/zeke-center/pi-extensions
 ```
 
+前置：装好 pi（`npm i -g @earendil-works/pi-coding-agent`）。**不需要额外 `npm install`** —— `typebox`、`pi-tui` 这些依赖都由 pi 宿主提供。
+
 pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` 加载 `ai-configure/index.ts`。
 仓库自带的 `assistants/*.md` 也会一起被找到 —— **装完就有一个能派的「通用助理」**，不用自己写。
+
+**怎么确认装好了**：
+
+| 敲什么 | 应该看到 |
+|---|---|
+| `pi list`（终端） | 列表里有这条包 |
+| `/assistants`（pi 里） | 有个 `general — 通用助理`，且**可以派** |
+| `/aihelp`（pi 里） | 全部命令的说明书 |
+
+> **一个 MCP 都不配也能用。** `general` 不挂任何 MCP，靠读文件 / 跑命令 / 改代码干活；
+> 只有 `/ai`（从你自己的台账批量生成 MCP）才需要额外配 `CENTER_API` 和密钥。
 
 | 命令 | 作用 |
 |---|---|
 | `pi list` | 看装了哪些包 |
-| `pi update --extensions` | 拉最新版 |
+| `pi update --extensions` | 拉最新版（对 git 包就是重新 clone/pull）|
 | `pi remove git:github.com/zeke-center/pi-extensions` | 卸载 |
 
 > 本地改代码时：`pi install ./pi-extensions`（路径直接生效，不用复制，也不用 `/reload`）。
 > 已经发到 npm 的话：`pi install npm:@zeke-center/pi-extensions`（目前未发布）。
+>
+> 只想抄一份模板、不想装插件：把 `assistants/general.md` 拷到 `~/.pi/agent/assistants/` 就行。
 
 ### 方式 B：同步脚本（Windows —— 自己改代码时用）
 
