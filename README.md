@@ -15,7 +15,7 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 | `ai-configure/board.ts` | **任务进度看板** | `/board` + `progress` 工具 |
 | `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` + `delegate` 工具 |
 | `ai-configure/live.ts` | 子代理实时状态机（把 JSON 事件流翻成可画的行） | — |
-| `ai-configure/panel.ts` | 右侧子代理实时面板（浮层，不行退 widget） | `/agents` |
+| `ai-configure/panel.ts` | 子代理实时面板（看板正上方整宽，默认） | `/agents` |
 | `ai-configure/mcp-pool.ts` | MCP 候选池 + 影子目录（`mcp` 隔离的底层） | — |
 | `ai-configure/form.ts` | 弹窗面板（表单 + 多选，`new`/`edit` 共用） | — |
 | `ai-configure/help.ts` | 说明书文案（`/aihelp` 与 `/ai help` 共用一份）| — |
@@ -28,7 +28,7 @@ pi-extensions/
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
 │   ├── live.ts          # 子代理实时状态机（JSON 事件流 → 可画的行）
-│   ├── panel.ts         # 子代理实时面板（/agents，右侧浮层）
+│   ├── panel.ts         # 子代理实时面板（/agents，看板正上方整宽）
 │   ├── mcp-pool.ts      # MCP 候选池 + 影子 agentDir
 │   ├── form.ts          # 弹窗面板（表单 + 多选）
 │   └── help.ts          # /aihelp 的说明书文案
@@ -85,10 +85,10 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `open <key>` | 用系统默认程序打开那个 `.md` |
 | **`/resume-agent`** | — | 翻看助理的**历次会话**（它们**不在 `/resume` 里**），选中直接切过去看 |
 | | `<key>` | 只看某个助理的（例 `/resume-agent db`） |
-| **`/agents`** | （无参数） | 开**子代理实时面板**（派活时本来就会自动弹出；手动敲=重新叫回） |
+| **`/agents`** | （无参数） | 开**子代理实时面板**（派活时本来就会自动出现；手动敲=重新叫回） |
 | | `off` | 关掉（下次派活也不再自动弹） |
 | | `detail` | 展开 / 折叠它的思考过程 |
-| | `widget` \| `overlay` | 换成输入框上方那个形态 / 换回右侧浮层 |
+| | `widget` \| `float` | 换成看板正上方的整宽面板（默认） / 换成右侧浮层 |
 | | `text` | 把当前状态打印成纯文本（RPC / 调试用） |
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
@@ -660,26 +660,30 @@ mcp: center-pg
    - 一切面板失败都不允许连累派活（`openAgentPanel` 整体 try/catch）
 
 ### 面板长什么样
+它就在**任务看板正上方，整宽**（同一套 widget 机制）：
 
-```
-┌─ 主对话 ─────────────────────────┬─ 🤖 子代理 ────────┐
-│ 你 › 帮我把后端部署一下           │ ● 服务器助理 1:23   │
-│ pi › 派个人去干。                 │   ⚙ bash           │
-│      ⚙ delegate 服务器助理         │     git pull --rebase│
-│ （主对话不卡，可以继续打字）        │   ↳ Already up to date│
-│                                   │   ⚠ 42s无动静       │
+```text
+…对话（滚动区）…
+ ▛ 子代理 1 个在跑
+ ● 个人中心服务器助理  1:23
+   在 VM 上修好记忆中心的依赖安装，能修好就一路把环境准备跑完
+   ✗ execute_command  cd ~/memory-center && pip install…  → Validation failed…
+   ⚙ bash  git pull --rebase  已跑 5s
+ ▛ 任务 记忆中心上 VM 并接入中心 · 8/8
+ ✓ 1 修 VM 依赖安装      │ ⚙ 运行     │ 会话信息
+> 输入框（照常可用，面板在它上面、不盖住它）
 ```
 
 实现要点（都是官方开关，不用自己造反制）：
 
 | 需求 | 怎么做的 |
 |---|---|
-| 贴右侧、像侧栏 | `overlayOptions: { anchor: "right-center", width: "42%", margin: { right: 0 } }` |
-| **不抢键盘焦点**（左边照常打字） | `nonCapturing: true` |
-| **窄屏自动隐藏** | `visible: (w) => w >= 100` |
-| 矮/窄面板只给一行摘要 | 内部 `COMPACT_COLS` / `COMPACT_ROWS` 阈值 |
-| **不遮住看板与输入框** | 高度**按内容走**、最多占屏幕 60% —— **绝不补空行铺满**（一开始就是这么写的，实测被用户点出来：「下半部分被遮住了」） |
-| 浮层起不来（非 TUI / `custom()` 抛错） | 自动退到 `setWidget(…, { placement: "aboveEditor" })` |
+| **看板正上方、整宽** | `setWidget(key, factory, { placement: "aboveEditor" })` —— 它是**布局的一部分**，顶上去只把对话区缩几行，**永不覆盖** |
+| **稳定排在看板前面** | 在 `session_start` **注册一次就不再注册**（`setupPanel` 必须在 `setupBoard` 之前调）。pi 的 widget 按注册顺序从上往下排，而且 `setWidget` 每次都会把该 key **挪到末尾** —— 重复注册就把自己送到看板后面去了 |
+| 高度不会无限涨 | `MAX_WIDGET_ROWS = 10`（对齐 pi 对字符串数组 widget 的 `MAX_WIDGET_LINES = 10`） |
+| 不占地方 | 没在跑 / 被关掉时 `render()` 返回 `[]` → 占 **0 行**（所以能一直挂着） |
+| 窄屏降级 | `< 100` 列 → 只画一行摘要 |
+| `/agents float` 换成浮层 | `anchor: "right-center"` + `width: "42%"` + `nonCapturing: true`（不抢键盘焦点）+ `visible: (w) => w >= 100` + `maxHeight: 60%` |
 | 跑完不一直占着屏幕 | 全部结束后停 45 秒自动收起（期间又派活则取消） |
 
 ### 与 `ASSISTANT` 相关的事实

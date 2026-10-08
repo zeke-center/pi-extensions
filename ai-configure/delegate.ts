@@ -40,7 +40,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
 import { addJob, beginRun, consume, markEnd, newJob, type EndStatus, type LiveJob } from "./live";
-import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferWidget, snapshotLines, toggleDetail } from "./panel";
+import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
@@ -1533,9 +1533,9 @@ export function setupDelegate(api: ExtensionAPI): void {
 		handler: async (args: string, ctx) => resumeAgent(ctx, args ?? ""),
 	});
 
-	// ---------- /agents：右侧子代理实时面板 ----------
+	// ---------- /agents：子代理实时面板 ----------
 	api.registerCommand("agents", {
-		description: "子代理实时面板：直接敲=开；off 关；detail 展开思考；widget 换成输入框上方；text 打印快照",
+		description: "子代理实时面板：直接敲=开；off 关；detail 展开思考；text 打印快照；float 改成右侧浮层，widget 改回看板上方",
 		handler: async (args: string, ctx) => {
 			const sub = (args ?? "").trim().toLowerCase();
 
@@ -1554,23 +1554,22 @@ export function setupDelegate(api: ExtensionAPI): void {
 				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
-			if (sub === "widget") {
-				setPreferWidget(true);
+			if (sub === "widget" || sub === "w" || sub === "fixed") {
+				setPreferOverlay(false);
 				closeAgentPanel({ user: false });
-				ensureAgentPanel(ctx);
-				ctx.ui.notify(`面板形态：${panelMode()}（widget 版在输入框上方）`, "info");
+				openAgentPanel(ctx, { force: true });
+				ctx.ui.notify(`面板形态：${panelMode()}（看板正上方的整宽面板）`, "info");
 				return;
 			}
 			if (sub === "overlay" || sub === "float") {
-				setPreferWidget(false);
+				setPreferOverlay(true);
 				closeAgentPanel({ user: false });
 				openAgentPanel(ctx, { force: true });
-				ctx.ui.notify(`面板形态：${panelMode()}`, "info");
+				ctx.ui.notify(`面板形态：${panelMode()}（右侧浮层，会盖住一块）`, "info");
 				return;
 			}
 
-			// 直接敲 /agents = 打开（并解开「用户关过」的封印）
-			setPreferWidget(false);
+			// 直接敲 /agents = 打开（并解开「用户关过」的封印）；形态沿用上次选的
 			openAgentPanel(ctx, { force: true });
 			ctx.ui.notify(`子代理面板：${panelMode()}`, "info");
 		},

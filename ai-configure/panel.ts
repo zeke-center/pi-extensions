@@ -1,20 +1,22 @@
 /**
  * 子代理实时面板 —— 把 live.ts 的状态画到屏幕上。
  *
- * 主路线：**右侧浮层**（overlay）
- *   - `anchor: "right-center"` + `width: "42%"` + `margin.right: 0` → 贴右边缘，视觉上就是一根侧栏
- *   - `nonCapturing: true`  → **不抢键盘焦点**，左边对话与输入框照常能用（这是官方开关，不用自己造反制）
- *   - `visible: (w) => w >= MIN_TERM_COLS` → 太窄自动不渲染（官方内置的响应式降级）
- *   - 高度补齐到底，看起来像侧栏而不是一块飘着的框
+ * 落点：**看板正上方的整宽 widget**（就是任务看板那套机制）
+ *   - `setWidget(key, factory, { placement: "aboveEditor" })` → 整宽、高度按内容走（上限 10 行）
+ *   - 它是**布局的一部分**：顶上去会把对话区缩小几行，但**永远不覆盖任何东西**
+ *   - 窄屏（< MIN_TERM_COLS 列）自动降级成一行摘要
+ *   - ⚠️ **只在 session_start 注册一次**，之后只 requestRender：
+ *     pi 的 widget 按**注册顺序**从上往下排，而每次 setWidget 都会把该 key 挪到末尾 ——
+ *     重复注册会把自己送到看板后面去。想稳定排在看板**前面**，就得比看板早一步注册且不再注册。
  *   - **每秒 requestRender 一次**：长命令跑着的时候事件流是静默的（bash 不吐 partial），
  *     「已跑 2:31 / 40s 无动静」这两个数字只能靠自己走表，否则用户会以为死机
  *
- * 退路：输入框上方的 widget（跟任务看板同一机制）
- *   - overlay 起不来（ctx.mode 不是 tui、custom() 抛错）时自动降级
- *   - 也可以 /agents widget 手动切
+ * 备选：`/agents float` 换成右侧浮层（overlay）
+ *   - nonCapturing 不抢键盘焦点；visible() 窄屏自动不渲染；maxHeight 60% 保住底部
+ *   - 但浮层再漂亮也会盖住右边一块（实测被用户点出来两次），所以只是「我就想让它飘着」时的选项
  */
 
-import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	clearJobs,
@@ -30,16 +32,18 @@ import {
 
 const WIDGET_KEY = "agent-live";
 
-/** 比这窄就不画浮层（直接靠 visible() 让 pi 不渲染）—— 注意这是**终端列数** */
+/** 终端列数比这窄 → 面板只画一行摘要（两种形态共用这个阈值） */
 const MIN_TERM_COLS = 100;
-/** 面板自身列数比这窄、或高度不够，就只画一行摘要（浮层占 42%，所以对应约 95 列终端） */
+/**
+ * 整宽 widget 的**行数上限**。
+ * 取 10 是跟 pi 自己对齐：字符串数组形式的 widget 会被 `MAX_WIDGET_LINES = 10` 截断，
+ * 组件形式虽然不受限，但超过这个高度就该用户自己决定要不要看了。
+ */
+const MAX_WIDGET_ROWS = 10;
+/** 浮层形态：面板自己算出来比这窄 / 比这矮，也只画一行 */
 const COMPACT_COLS = 40;
 const COMPACT_ROWS = 12;
-/**
- * 面板最多占屏幕高度的比例。
- * 为什么不铺到底：实测被用户点出来了 —— 补空行铺满会把**任务看板与输入框**那几行遮住，
- * 而那几行恰好是你一边看面板一边要用的。所以高度**按内容走**，再压一个上限保住底部。
- */
+/** 浮层形态：最多占屏幕高度比例（保住底部的看板与输入框） */
 const MAX_ROWS_PCT = 0.6;
 
 // ======================= 状态 =======================
@@ -52,17 +56,26 @@ interface OverlayState {
 let overlay: OverlayState | undefined;
 let widgetCtx: ExtensionContext | undefined;
 let widgetTui: TUI | undefined;
+/** widget 是否已注册（注册过就**不再注册**，否则会被挪到看板后面） */
+let widgetRegistered = false;
+let widgetTimer: ReturnType<typeof setInterval> | undefined;
 let unsub: (() => void) | undefined;
 
 /** 是否展开思考过程 */
 let detail = false;
 /** 用户是否手动关掉了（关了就别自动弹回来） */
 let suppressed = false;
-/** 用户指定了「用输入框上方那个」（/agents widget）—— 那就不再尝试浮层 */
-let preferWidget = false;
+/**
+ * 面板当前要不要显示。
+ * 为什么不靠「注册/注销」来控制：widget 一旦注销，下次注册就跑到看板后面去了。
+ * 所以关掉 = 只把 `visible` 置 false（内容画 0 行，占 0 行高），注册一直留着。
+ */
+let visible = false;
+/** 用户明确要求用浮层（/agents float）—— 那就不走 widget */
+let preferOverlay = false;
 
 export function isPanelOpen(): boolean {
-	return Boolean(overlay) || Boolean(widgetCtx);
+	return Boolean(overlay) || (widgetRegistered && visible);
 }
 
 export function isDetail(): boolean {
@@ -72,7 +85,7 @@ export function isDetail(): boolean {
 /** 面板当前用的是哪种形态（给 /agents 提示用） */
 export function panelMode(): "overlay" | "widget" | "closed" {
 	if (overlay) return "overlay";
-	if (widgetCtx) return "widget";
+	if (widgetRegistered && visible) return "widget";
 	return "closed";
 }
 
@@ -85,7 +98,7 @@ function subscribe(): void {
 }
 
 function unsubscribeIfIdle(): void {
-	if (overlay || widgetCtx || !unsub) return;
+	if (overlay || visible || !unsub) return;
 	unsub();
 	unsub = undefined;
 }
@@ -236,45 +249,127 @@ function openOverlay(ctx: ExtensionContext): boolean {
 	return true;
 }
 
-/** 退路：输入框上方的常驻面板（跟看板同一机制）。非 TUI 环境什么都不做。 */
-function openWidget(ctx: ExtensionContext, why?: string): void {
+/** 退路 / 默认：输入框上方的整宽 widget（跟看板同一机制，永不覆盖）。非 TUI 环境什么都不做。 */
+function openWidget(ctx: ExtensionContext): void {
 	if (!ctx.hasUI || ctx.mode !== "tui") return;
 	try {
 		widgetCtx = ctx;
+		visible = true;
+		if (widgetRegistered) {
+			// 已经挂着了 —— 只重绘，**绝不能**再 setWidget（否则被挪到看板后面）
+			widgetTui?.requestRender();
+			return;
+		}
 		ctx.ui.setWidget(
 			WIDGET_KEY,
-			(tui) => {
+			(tui, theme) => {
 				widgetTui = tui;
-				return new WidgetPanel(() => detail);
+				return new WidgetPanel(theme, () => detail);
 			},
 			{ placement: "aboveEditor" },
 		);
+		widgetRegistered = true;
 	} catch {
 		// 面板起不来不能连累派活
 		widgetCtx = undefined;
 		widgetTui = undefined;
-		return;
+		widgetRegistered = false;
 	}
-	if (why) ctx.ui.notify(`子代理面板退到输入框上方（浮层不可用：${why}）`, "warning");
 }
 
-/** widget 形态的组件：只画行，不管边框。 */
+/**
+ * 整宽 widget 形态：只画行，不画框。
+ * （pi **不会**给 widget 加框 —— 看板那个 `▛ 任务` 的观感是它自己画的，这里照样画一个 `▛ 子代理` 对齐。）
+ */
 class WidgetPanel implements Component {
-	constructor(private getDetail: () => boolean) {}
+	constructor(
+		private theme: Theme,
+		private getDetail: () => boolean,
+	) {}
 	invalidate(): void {}
 	render(width: number): string[] {
+		if (!visible) return [];
 		const jobs = liveJobs() as LiveJob[];
 		if (!jobs.length) return [];
+		const now = Date.now();
 		const inner = Math.max(16, width - 2);
-		const lines = plainLines(
-			renderJobs(jobs, { width: inner, now: Date.now(), detail: this.getDetail(), maxLines: 8 }),
-		);
-		const head = `🤖 子代理  ${jobs.filter((j) => j.status === "running").length} 个在跑`;
-		return [truncateToWidth(head, width), ...lines.map((l) => truncateToWidth(` ${l}`, width))];
+
+		// 窄屏 → 一行摘要，别硬塞
+		if (width < MIN_TERM_COLS) {
+			const body = paintLine(this.theme, renderCompact(jobs, inner, now));
+			return [truncateToWidth(`${this.theme.fg("accent", "🤖 子代理 ")}${body}`, width)];
+		}
+
+		const running = jobs.filter((j) => j.status === "running").length;
+		const head =
+			this.theme.fg("accent", this.theme.bold("▛ 子代理")) +
+			" " +
+			this.theme.fg("muted", running ? `${running} 个在跑` : `${jobs.length} 个已结束`);
+		const lines = renderJobs(jobs, {
+			width: inner,
+			now,
+			detail: this.getDetail(),
+			maxLines: MAX_WIDGET_ROWS - 1, // 留一行给标题
+		});
+		const out = [truncateToWidth(` ${head}`, width)];
+		for (const l of lines) out.push(truncateToWidth(` ${paintLine(this.theme, l)}`, width));
+		return out.slice(0, MAX_WIDGET_ROWS);
 	}
 }
 
-/** 打开面板（默认浮层，不行退 widget）。已经开着就什么都不做。 */
+/**
+ * 在 `session_start` 把面板挂上去（**只在这一刻注册**）。
+ *
+ * 为什么必须提前：看板在它自己的 session_start 里也会（重新）注册 widget，
+ * 而后面注册的排在下面 —— 所以只要我们在**它之前**注册一次，面板就稳定落在「看板正上方」。
+ * `index.ts` 里必须在 `setupBoard()` 之前调用本函数。
+ */
+export function setupPanel(api: ExtensionAPI): void {
+	api.on("session_start", async (_event, ctx) => {
+		try {
+			overlay?.comp.dispose();
+			overlay = undefined;
+			widgetTui = undefined;
+			widgetRegistered = false;
+			visible = false;
+			suppressed = false;
+			preferOverlay = false;
+			clearJobs(); // 上个会话的残留别带过来
+
+			if (!ctx.hasUI || ctx.mode !== "tui") return;
+			openWidget(ctx);
+			visible = false; // 挂上去但不显示（空闲时画 0 行，不占高度）
+
+			// 走表：长命令期间事件流是静的，秒表与「Ns 无动静」全靠它。
+			// 定时器里的异常**没人接**，会直接把进程干挂（实测踩过），所以自己吞。
+			if (widgetTimer) clearInterval(widgetTimer);
+			widgetTimer = setInterval(() => {
+				try {
+					if (!visible) return;
+					if (!liveJobs().some((j) => j.status === "running")) return;
+					widgetTui?.requestRender();
+				} catch {
+					/* 吞掉 */
+				}
+			}, 1000);
+		} catch {
+			// 面板挂不上不能连累别的
+		}
+	});
+
+	api.on("session_shutdown", async () => {
+		try {
+			overlay?.comp.dispose();
+		} catch {
+			/* 吞掉 */
+		}
+		overlay = undefined;
+		if (widgetTimer) clearInterval(widgetTimer);
+		widgetTimer = undefined;
+	});
+}
+
+/** 打开面板（默认走看板正上方的 widget；`preferOverlay` 时才用浮层）。已经开着就什么都不做。 */
 export function openAgentPanel(ctx: ExtensionContext, opts: { force?: boolean } = {}): void {
 	if (!ctx.hasUI) return;
 	try {
@@ -283,14 +378,18 @@ export function openAgentPanel(ctx: ExtensionContext, opts: { force?: boolean } 
 		} else if (suppressed) {
 			return;
 		}
-		if (isPanelOpen()) {
-			subscribe();
-			overlay?.comp.requestRender();
-			widgetTui?.requestRender();
-			return;
-		}
+
+		visible = true;
 		subscribe();
-		if (!preferWidget && openOverlay(ctx)) return;
+
+		if (preferOverlay) {
+			if (overlay) {
+				overlay.comp.requestRender();
+				return;
+			}
+			if (openOverlay(ctx)) return;
+			// 浮层起不来（不是 tui / custom 抛错）→ 静静落回 widget
+		}
 		openWidget(ctx);
 	} catch {
 		// 面板只是看的，报错不能连累派活
@@ -310,22 +409,18 @@ export function ensureAgentPanel(ctx: ExtensionContext): void {
  */
 export function closeAgentPanel(opts: { user?: boolean } = {}): void {
 	if (opts.user) suppressed = true;
+	// 只隐藏，**不注销** widget —— 注销了下次注册就会掉到看板后面去
+	visible = false;
 	try {
 		if (overlay) {
 			overlay.comp.dispose();
 			overlay.done();
 			overlay = undefined;
 		}
-		if (widgetCtx) {
-			widgetCtx.ui.setWidget(WIDGET_KEY, undefined);
-			widgetCtx = undefined;
-			widgetTui = undefined;
-		}
+		widgetTui?.requestRender();
 	} catch {
 		// 面板收不起来也不能连累派活
 		overlay = undefined;
-		widgetCtx = undefined;
-		widgetTui = undefined;
 	}
 	unsubscribeIfIdle();
 }
@@ -350,9 +445,9 @@ export function autoClosePanel(ctx: ExtensionContext, ms = 45_000): void {
 	}, ms);
 }
 
-/** 切换形态偏好：true = 只用输入框上方的 widget */
-export function setPreferWidget(v: boolean): void {
-	preferWidget = v;
+/** 切换形态偏好：true = 用右侧浮层（默认 false，走看板正上方的 widget） */
+export function setPreferOverlay(v: boolean): void {
+	preferOverlay = v;
 }
 /** 切换「展开思考」。 */
 export function toggleDetail(): boolean {
