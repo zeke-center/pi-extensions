@@ -39,6 +39,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
+import { addJob, beginRun, consume, markEnd, newJob, type EndStatus, type LiveJob } from "./live";
+import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferWidget, snapshotLines, toggleDetail } from "./panel";
 import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
@@ -486,6 +488,8 @@ interface Sink {
 	tools: string[];
 	final: string;
 	stderr: string;
+	/** 实时视图：每个事件同时喂给它，面板才看得到「它现在在干什么」 */
+	live?: LiveJob;
 }
 
 function clampTail(s: string, limit: number): string {
@@ -521,6 +525,8 @@ function handleLine(line: string, sink: Sink): void {
 	} catch {
 		return; // 不是 JSON（可能是 warning），忽略
 	}
+	// 实时视图：同一个事件同时喂给面板的状态机（它只认自己关心的字段）
+	if (sink.live) consume(sink.live, obj);
 	if (obj.type === "message_update") {
 		const ev = obj.assistantMessageEvent;
 		if (ev?.type === "text_delta" && typeof ev.delta === "string") {
@@ -612,6 +618,11 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 		return Promise.resolve(base("failed", null));
 	}
 
+	// 实时视图：从 spawn 起，子进程每个 JSON 事件都会同时喂给它（面板据此实时画）
+	const job = newJob({ key: tpl.key, name: tpl.name, task, sessionId: opt.names.id, startedAt: started });
+	sink.live = job;
+	addJob(job);
+
 	// -xt：助理不需要面板工具（影子目录下本来也没有 ai-configure，这里是双保险）
 	const args = [cli, "-p", "--mode", "json", "-xt", "delegate,progress"];
 	// -na：忽略项目级资源 → 掐掉 {cwd}/.pi/mcp.json。
@@ -646,6 +657,19 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 			clearTimeout(timer);
 			opt.signal.removeEventListener("abort", onAbort);
 			liveJobs.delete(child);
+			// 面板终态：写在这里而不是事件里 —— agent_end 不代表进程结束（可能还会重试/续跑）
+			const liveStatus: EndStatus = outcome === "timeout" ? "timeout" : outcome === "failed" ? "failed" : "done";
+			markEnd(
+				job,
+				liveStatus,
+				outcome === "timeout"
+					? "超时被停止（要接着做用 resume）"
+					: outcome === "empty"
+						? "跑了但没吐结论"
+						: exitCode && exitCode !== 0
+							? `子进程退出码 ${exitCode}`
+							: undefined,
+			);
 			done(base(outcome, exitCode));
 		};
 
@@ -1445,6 +1469,9 @@ export function setupDelegate(api: ExtensionAPI): void {
 			if (ctx.hasUI) {
 				ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", `📤 ${tpl.name} ${running}干活中…`));
 			}
+			// 清掉上一轮的旧账，面板上只留这一批
+			beginRun();
+			ensureAgentPanel(ctx);
 
 			let results: RunResult[];
 			try {
@@ -1464,6 +1491,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 				);
 			} finally {
 				if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+				// 跑完了不马上收面板：留一会儿让你看完，再自动收起（其间又派活会取消）
+				autoClosePanel(ctx);
 			}
 
 			const sep = `\n\n${"─".repeat(48)}\n\n`;
@@ -1502,5 +1531,48 @@ export function setupDelegate(api: ExtensionAPI): void {
 	api.registerCommand("resume-agent", {
 		description: "翻看助理的历次会话（它们不在 /resume 里）；可 /resume-agent db 只看某个助理",
 		handler: async (args: string, ctx) => resumeAgent(ctx, args ?? ""),
+	});
+
+	// ---------- /agents：右侧子代理实时面板 ----------
+	api.registerCommand("agents", {
+		description: "子代理实时面板：直接敲=开；off 关；detail 展开思考；widget 换成输入框上方；text 打印快照",
+		handler: async (args: string, ctx) => {
+			const sub = (args ?? "").trim().toLowerCase();
+
+			if (sub === "off" || sub === "close") {
+				closeAgentPanel({ user: true });
+				ctx.ui.notify("子代理面板已关闭（下次派活不再自动弹出；/agents 可手动叫回）", "info");
+				return;
+			}
+			if (sub === "detail") {
+				const on = toggleDetail();
+				ctx.ui.notify(on ? "思考过程：展开" : "思考过程：折叠", "info");
+				return;
+			}
+			if (sub === "text") {
+				const lines = snapshotLines();
+				ctx.ui.notify(lines.join("\n"), "info");
+				return;
+			}
+			if (sub === "widget") {
+				setPreferWidget(true);
+				closeAgentPanel({ user: false });
+				ensureAgentPanel(ctx);
+				ctx.ui.notify(`面板形态：${panelMode()}（widget 版在输入框上方）`, "info");
+				return;
+			}
+			if (sub === "overlay" || sub === "float") {
+				setPreferWidget(false);
+				closeAgentPanel({ user: false });
+				openAgentPanel(ctx, { force: true });
+				ctx.ui.notify(`面板形态：${panelMode()}`, "info");
+				return;
+			}
+
+			// 直接敲 /agents = 打开（并解开「用户关过」的封印）
+			setPreferWidget(false);
+			openAgentPanel(ctx, { force: true });
+			ctx.ui.notify(`子代理面板：${panelMode()}`, "info");
+		},
 	});
 }

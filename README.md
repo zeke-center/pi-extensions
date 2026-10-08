@@ -1,30 +1,34 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（里面 6 个模块）**，外加一份助理模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（里面 8 个模块）**，外加一份助理模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
 ```
 
-装完就能用 `/board`、`/ai`、`/assistants`、`/resume-agent`，以及一个能直接派的**通用助理**。
+装完就能用 `/board`、`/ai`、`/assistants`、`/resume-agent`、`/agents`，以及一个能直接派的**通用助理**。
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
-| `ai-configure/index.ts` | 入口：装配下面五个模块 + 注册 `/aihelp` | — |
+| `ai-configure/index.ts` | 入口：装配下面七个模块 + 注册 `/aihelp` | — |
 | `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
 | `ai-configure/board.ts` | **任务进度看板** | `/board` + `progress` 工具 |
 | `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` + `delegate` 工具 |
+| `ai-configure/live.ts` | 子代理实时状态机（把 JSON 事件流翻成可画的行） | — |
+| `ai-configure/panel.ts` | 右侧子代理实时面板（浮层，不行退 widget） | `/agents` |
 | `ai-configure/mcp-pool.ts` | MCP 候选池 + 影子目录（`mcp` 隔离的底层） | — |
 | `ai-configure/form.ts` | 弹窗面板（表单 + 多选，`new`/`edit` 共用） | — |
 | `ai-configure/help.ts` | 说明书文案（`/aihelp` 与 `/ai help` 共用一份）| — |
 
 ```text
 pi-extensions/
-├── ai-configure/        # 一个插件，6 个模块
-│   ├── index.ts         # 入口：装配下面五个 + 注册 /aihelp
+├── ai-configure/        # 一个插件，8 个模块
+│   ├── index.ts         # 入口：装配下面七个 + 注册 /aihelp
 │   ├── config.ts        # 连接台账 → MCP（/ai）
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
+│   ├── live.ts          # 子代理实时状态机（JSON 事件流 → 可画的行）
+│   ├── panel.ts         # 子代理实时面板（/agents，右侧浮层）
 │   ├── mcp-pool.ts      # MCP 候选池 + 影子 agentDir
 │   ├── form.ts          # 弹窗面板（表单 + 多选）
 │   └── help.ts          # /aihelp 的说明书文案
@@ -81,6 +85,11 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `open <key>` | 用系统默认程序打开那个 `.md` |
 | **`/resume-agent`** | — | 翻看助理的**历次会话**（它们**不在 `/resume` 里**），选中直接切过去看 |
 | | `<key>` | 只看某个助理的（例 `/resume-agent db`） |
+| **`/agents`** | （无参数） | 开**子代理实时面板**（派活时本来就会自动弹出；手动敲=重新叫回） |
+| | `off` | 关掉（下次派活也不再自动弹） |
+| | `detail` | 展开 / 折叠它的思考过程 |
+| | `widget` \| `overlay` | 换成输入框上方那个形态 / 换回右侧浮层 |
+| | `text` | 把当前状态打印成纯文本（RPC / 调试用） |
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
 
@@ -598,9 +607,9 @@ mcp: center-pg
 |---|---|
 | **主进程必须等**（并行但同步收） | pi 的工具调用是同步的 —— 模型必须拿到结果才能继续下一轮 |
 | **不做后台模式**（派完就走、回头再收） | 那需要往对话里注入消息，属于 durable 的领域 |
+| **结果必须同步收**（并行但同步） | pi 的工具调用是同步的 —— 模型必须拿到结果才能继续下一轮 |
 | **不走 RPC** | 临时工不需要「托管」，一次调用就够 |
 | **助理不能再派人**（自动加 `-xt delegate`） | 防止递归打转 |
-| **不做面板** | 会话名可读 + `/resume-agent` 够了 |
 | **超时到点就杀** | 宁可杀掉再靠 `resume` 续跑，也不留孤儿进程 |
 
 ### 已知限制
@@ -612,6 +621,73 @@ mcp: center-pg
 - 项目级模板和项目级 MCP 都**要求该目录被 pi 信任**（`trust.json`）。
 - 每个助理是**独立进程 + 独立模型调用**，会再多花一份钱。
 - 找 pi 的 CLI 入口的顺序：`$PI_CLI` → `$PI_PACKAGE_DIR/dist/bundle/cli.js` → `process.argv[1]`；找不到就报错。
+
+---
+
+## 模块 4 · live.ts + panel.ts（子代理实时面板）
+
+**解决的问题**：派活时子进程是**无窗口**的（stdio 被接管），界面原来只有一行 `📤 xxx 干活中…`。
+于是「它到底在干什么？是不是卡住了？要不要我介入？」全都答不上来。
+
+### 数据从哪来（关键）
+
+子进程是 `pi -p --mode json` 起的，**stdout 本身就是逐事件的 JSON 流**，而 `handleLine()`
+本来就在解析它（只是原来只留了最终卡片）。所以面板**不需要去 tail 会话文件**，
+把同一个事件同时喂给 `live.ts` 的状态机就行。
+
+用得到的事件（规范见 pi 自带 `docs/json.md`）：
+
+| 事件 | 拿它显示 |
+|---|---|
+| `tool_execution_start` | `⚙ bash  git pull --rebase` ← 「现在在干什么」（带**完整参数**） |
+| `tool_execution_update` | 执行中的输出（**bash 拿不到**，见下面「实测坑」） |
+| `tool_execution_end` | `↳ 240 行 · 12.1s · exit 0` |
+| `message_update` → `text_delta` / `thinking_delta` | 它的实时正文 / 思考（逐字） |
+| `message_update.usage` | token 数 |
+
+### 两个实测得出的坑（写代码时特别注意）
+
+1. **长命令期间事件流是静默的。** `tool_execution_update` 对 bash **不是**实时输出流 ——
+   只有「开始时一条空的」+「结束时一条完整的」（实测 3 条 `sleep 12`，全程 0 条有内容的更新）。
+   所以面板**必须自己每秒 tick** 去走「已跑 2:31 / 40s 无动静」，否则用户会以为死机。
+   `AgentPanel` 里的 `setInterval(…, 1000)` 就是干这个的。
+2. **定时器里绝不能用捕获的 `ctx`。** ct 会在 `/reload`、切会话、会话重载后变成 stale，
+   再访问 `ctx.hasUI` / `ctx.mode` 会触发 pi 的 `assertActive` 抛错；而**定时器里的异常没人接，
+   会直接把进程打挂**（实测踩过一次，退出码 1 + 一大串堆栈）。所以：
+   - `closeAgentPanel()` **不接 ctx**（45 秒后的自动收起也会调它）
+   - `autoClosePanel()` 的回调包 try/catch
+   - `AgentPanel` 的每秒 tick 包 try/catch
+   - 一切面板失败都不允许连累派活（`openAgentPanel` 整体 try/catch）
+
+### 面板长什么样
+
+```
+┌─ 主对话 ─────────────────────────┬─ 🤖 子代理 ────────┐
+│ 你 › 帮我把后端部署一下           │ ● 服务器助理 1:23   │
+│ pi › 派个人去干。                 │   ⚙ bash           │
+│      ⚙ delegate 服务器助理         │     git pull --rebase│
+│ （主对话不卡，可以继续打字）        │   ↳ Already up to date│
+│                                   │   ⚠ 42s无动静       │
+```
+
+实现要点（都是官方开关，不用自己造反制）：
+
+| 需求 | 怎么做的 |
+|---|---|
+| 贴右侧、像侧栏 | `overlayOptions: { anchor: "right-center", width: "42%", margin: { right: 0 } }` |
+| **不抢键盘焦点**（左边照常打字） | `nonCapturing: true` |
+| **窄屏自动隐藏** | `visible: (w) => w >= 100` |
+| 矮/窄面板只给一行摘要 | 内部 `COMPACT_COLS` / `COMPACT_ROWS` 阈值 |
+| 浮层起不来（非 TUI / `custom()` 抛错） | 自动退到 `setWidget(…, { placement: "aboveEditor" })` |
+| 跑完不一直占着屏幕 | 全部结束后停 45 秒自动收起（期间又派活则取消） |
+
+### 与 `ASSISTANT` 相关的事实
+
+- 面板只读 `live.ts` 的注册表，**不持有子进程句柄** —— 杀进程、超时、看门狗都不受影响。
+- 面板是「看」的，**不承载对话** —— 这是整个插件的既定设计。
+- 事件流節流：实测 40 秒 429 条 `message_update`（≈ 10 条/秒），所以重画通知做了
+  **100ms 合并**（`notifyLive()`），面板本来就是按秒刷的。
+- `/agents text` 能在无 TUI 环境（RPC / 调试）把当前状态打成纯文本。
 
 ---
 

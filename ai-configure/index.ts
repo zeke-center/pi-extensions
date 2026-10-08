@@ -10,6 +10,8 @@
  *   config.ts    从 Center 后端拉连接台账 → 注册成 MCP server（命令 /ai）
  *   board.ts     输入框上方的任务进度看板（命令 /board，工具 progress）
  *   delegate.ts  派活给临时助理（命令 /assistants，工具 delegate）
+ *   live.ts      子代理实时状态机（消费子进程的 JSON 事件流）
+ *   panel.ts     右侧子代理实时面板（命令 /agents）
  *   help.ts      /aihelp 与 /ai help 共用的文案
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";

@@ -31,6 +31,18 @@ export const HELP_TEXT = `AI configure · 全部功能
 
   （base / demo 的模板不能直接派；能派的会列在 delegate 工具描述里）
 
+/agents                   子代理实时面板（派活时右侧自动弹出）
+  直接敲                  开（并解开「你手动关过」的封印）
+  /agents off             关掉（下次派活也不再自动弹）
+  /agents detail          展开 / 折叠 它的思考过程
+  /agents widget          改成输入框上方那个形态（浮层不好用时用这个）
+  /agents overlay         改回右侧浮层
+  /agents text            把当前状态打印成纯文本（RPC / 调试用）
+
+  （面板显示：状态 · 已跑多久 · 当前在跑哪个工具及参数 · 结果 · token；
+    超过 25 秒没有新事件会提示「⚠ Ns无动静」—— 用来判断它是卡住还是在等；
+    跑完后停 45 秒再自动收起）
+
 ▍工具（你不用打，模型按需调用）
 progress(action, ...)     更新输入框上方那个面板
   action       plan｜step｜block｜clear       必填
