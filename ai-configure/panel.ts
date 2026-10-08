@@ -25,6 +25,7 @@ import {
 	plainLines,
 	renderCompact,
 	renderJobs,
+	renderJobsColumns,
 	type LiveJob,
 	type LiveLine,
 	type Tone,
@@ -301,15 +302,21 @@ class WidgetPanel implements Component {
 		}
 
 		const running = jobs.filter((j) => j.status === "running").length;
+		// 分栏轮播：超过 COLS 个时每 4 秒换一批（窗口起点用 now 算，渲染保持纯函数）
+		const COLS = 3;
+		const win = jobs.length > COLS ? Math.floor(now / 4000) % (jobs.length - COLS + 1) : 0;
+		const shown = jobs.slice(win, win + COLS);
+		const extra = jobs.length > COLS ? ` · 还有 ${jobs.length - COLS} 个（轮播中）` : "";
 		const head =
 			this.theme.fg("accent", this.theme.bold("▛ 子代理")) +
 			" " +
-			this.theme.fg("muted", running ? `${running} 个在跑` : `${jobs.length} 个已结束`);
-		const lines = renderJobs(jobs, {
+			this.theme.fg("muted", (running ? `${running} 个在跑` : `${jobs.length} 个已结束`) + extra);
+		const lines = renderJobsColumns(shown, {
 			width: inner,
 			now,
 			detail: this.getDetail(),
 			maxLines: MAX_WIDGET_ROWS - 1, // 留一行给标题
+			columns: COLS,
 		});
 		const out = [truncateToWidth(` ${head}`, width)];
 		for (const l of lines) out.push(truncateToWidth(` ${paintLine(this.theme, l)}`, width));

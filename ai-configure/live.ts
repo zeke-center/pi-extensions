@@ -602,6 +602,73 @@ export function renderJobs(jobs: LiveJob[], opts: RenderOpts): LiveLine[] {
 	return [...head, { segs: [{ text: "  …", tone: "muted" }] }, ...tail].slice(0, max);
 }
 
+/** 按显示宽度截一个 seg 的文本（保留颜色，尾部加 …）。 */
+function clipText(s: string, maxW: number): string {
+	if (widthOf(s) <= maxW) return s;
+	let out = "";
+	for (const ch of s) {
+		if (widthOf(out + ch) > maxW - 1) break;
+		out += ch;
+	}
+	return out + "…";
+}
+
+/** 按显示宽度截断一段 segs（保头、保留颜色），超出部分丢弃。 */
+function clipSegs(segs: Seg[], maxW: number): Seg[] {
+	const out: Seg[] = [];
+	let used = 0;
+	for (const s of segs) {
+		const w = widthOf(s.text);
+		if (used + w <= maxW) {
+			out.push(s);
+			used += w;
+			continue;
+		}
+		const room = maxW - used;
+		if (room > 1) out.push({ text: clipText(s.text, room), tone: s.tone });
+		break;
+	}
+	return out;
+}
+
+/**
+ * 分栏渲染：最多 columns 列（默认 3），每列一个 job，列间竖虚线「┆」分隔。
+ * 多助理同时跑时并排看，不再竖着堆、被省略号截断。短的列补空行对齐；
+ * 每列内容按列宽严格截断（renderJob 的标题行会带耗时/状态，可能溢出，这里统一剪）。
+ */
+export function renderJobsColumns(jobs: LiveJob[], opts: RenderOpts & { columns?: number }): LiveLine[] {
+	const cols = Math.max(1, opts.columns ?? 3);
+	const n = Math.min(jobs.length, cols);
+	if (n <= 1) return renderJobs(jobs, opts); // 单个 job 并排没意义，退化成竖排
+
+	const max = opts.maxLines ?? 8;
+	const sep = "┆";
+	// 每列内容宽：总宽减去 (n-1) 个分隔符（每个「 ┆ 」占 3 列）
+	const colW = Math.max(12, Math.floor((opts.width - (n - 1) * 3) / n));
+
+	// 每列渲染成行、按列宽剪、截到 max 行
+	const columns: LiveLine[][] = jobs
+		.slice(0, n)
+		.map((j) => renderJob(j, { ...opts, width: colW }).slice(0, max).map((l) => ({ segs: clipSegs(l.segs, colW) })));
+	const rows = Math.max(...columns.map((c) => c.length), 1);
+
+	// 短的列补空行对齐
+	const empty: LiveLine = { segs: [] };
+	const padded = columns.map((c) => (c.length < rows ? [...c, ...Array.from({ length: rows - c.length }, () => empty)] : c));
+
+	// 横向拼接：第 r 行 = col0[r] ┆ col1[r] ┆ col2[r]
+	const out: LiveLine[] = [];
+	for (let r = 0; r < rows; r++) {
+		const segs: Seg[] = [];
+		for (let c = 0; c < n; c++) {
+			if (c > 0) segs.push({ text: ` ${sep} `, tone: "muted" });
+			segs.push(...padded[c][r].segs);
+		}
+		out.push({ segs });
+	}
+	return out;
+}
+
 /** 一行摘要（窄屏降级用）。 */
 export function renderCompact(jobs: LiveJob[], width: number, now: number): LiveLine {
 	if (!jobs.length) return { segs: [{ text: "🤖 没有在跑的助理", tone: "muted" }] };
