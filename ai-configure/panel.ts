@@ -35,6 +35,12 @@ const MIN_TERM_COLS = 100;
 /** 面板自身列数比这窄、或高度不够，就只画一行摘要（浮层占 42%，所以对应约 95 列终端） */
 const COMPACT_COLS = 40;
 const COMPACT_ROWS = 12;
+/**
+ * 面板最多占屏幕高度的比例。
+ * 为什么不铺到底：实测被用户点出来了 —— 补空行铺满会把**任务看板与输入框**那几行遮住，
+ * 而那几行恰好是你一边看面板一边要用的。所以高度**按内容走**，再压一个上限保住底部。
+ */
+const MAX_ROWS_PCT = 0.6;
 
 // ======================= 状态 =======================
 
@@ -143,7 +149,9 @@ export class AgentPanel implements Component {
 
 	render(width: number): string[] {
 		const jobs = liveJobs() as LiveJob[];
-		const rows = Math.max(6, (this.tui.terminal?.rows ?? 24) - 1);
+		const rows = Math.max(6, this.tui.terminal?.rows ?? 24);
+		// 高度按内容走，**不补空行铺满**（否则会遮住看板和输入框）
+		const maxRows = Math.max(6, Math.floor(rows * MAX_ROWS_PCT));
 		const inner = Math.max(16, width - 2);
 
 		if (!jobs.length) {
@@ -165,16 +173,13 @@ export class AgentPanel implements Component {
 			width: inner,
 			now: Date.now(),
 			detail: this.getDetail(),
-			maxLines: rows - 3,
+			maxLines: maxRows - 2,
 		});
 
 		const out: string[] = [];
 		out.push(truncateToWidth(`${this.theme.fg("accent", title)} ${this.theme.fg("borderMuted", bar)}`, width));
 		for (const l of body) out.push(truncateToWidth(` ${paintLine(this.theme, l)}`, width));
-		// 补空行到底，看起来像一根侧栏
-		const guard = this.theme.fg("borderMuted", "│");
-		while (out.length < rows) out.push(guard);
-		return out.slice(0, rows);
+		return out.slice(0, maxRows);
 	}
 }
 
@@ -199,7 +204,7 @@ function openOverlay(ctx: ExtensionContext): boolean {
 					overlayOptions: {
 						anchor: "right-center",
 						width: "42%",
-						maxHeight: "100%",
+						maxHeight: "60%", // 保住屏幕底部（看板 + 输入框）
 						margin: { right: 0 },
 						nonCapturing: true, // 不抢键盘焦点：左边照常打字
 						visible: (w) => w >= MIN_TERM_COLS, // 窄屏由 pi 直接不渲染

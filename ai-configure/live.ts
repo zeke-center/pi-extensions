@@ -234,6 +234,15 @@ export function resultBrief(result: unknown, isError?: boolean): string {
 export function toolBrief(name: string, args: unknown): string {
 	const a = asRecord(args);
 	const str = (k: string): string => (typeof a[k] === "string" ? (a[k] as string) : "");
+	// MCP 工具名形如 mcp__<server>__<tool>：拆开来比整串好读，也省得把参数挤掉
+	if (name.startsWith("mcp__")) {
+		const parts = name.split("__");
+		const server = parts[1] ?? "";
+		const tool = parts.slice(2).join("__");
+		const keys = ["cmdString", "command", "cmd", "sql", "query", "path", "file_path", "url", "pattern"];
+		const k = keys.find((x) => typeof a[x] === "string");
+		return oneLine([`${server}/${tool}`, k ? String(a[k]) : ""].filter(Boolean).join("  "), 200);
+	}
 	switch (name) {
 		case "bash":
 		case "shell":
@@ -466,35 +475,59 @@ function statusIcon(job: LiveJob): { text: string; tone: Tone } {
 	}
 }
 
+/** 工具名太长会把参数挤掉，显示用短名（MCP 工具去掉 `mcp__<server>__` 前缀）。 */
+export function shortToolName(name: string): string {
+	if (!name.startsWith("mcp__")) return name;
+	const parts = name.split("__");
+	return parts.slice(2).join("__") || name;
+}
+
 function toolLine(t: ToolRun, width: number, now: number): LiveLine {
+	const shown = shortToolName(t.name);
 	if (t.phase === "preparing") {
 		return {
 			segs: [
 				{ text: "  ⋯ 准备调用 ", tone: "muted" },
-				{ text: t.name, tone: "default" },
+				{ text: shown, tone: "default" },
 			],
 		};
 	}
 	if (!t.endedAt) {
-		// 注意：「已跑 Xs」在行尾，如果按宽度算不准会被截掉 —— 而它恰恰是最重要的信息。
+		// 正在跑 —— 单独占一行，因为「已跑 Xs」要看得见、而且每秒在走。
+		// 注意它排在行尾，按宽度算不准会被截掉，而它恰恰是最重要的信息；
 		// 所以先把前后缀占的列数扣掉，剩下的才给参数摘要。
 		const tail = `  已跑 ${fmtDur(now - t.startedAt)}`;
-		const lead = `  ⚙ ${t.name}  `;
+		const lead = `  ⚙ ${shown}  `;
 		const room = Math.max(6, width - widthOf(lead) - widthOf(tail));
 		return {
 			segs: [
 				{ text: "  ⚙ ", tone: "accent" },
-				{ text: t.name, tone: "bold" },
+				{ text: shown, tone: "bold" },
 				{ text: t.brief ? `  ${oneLine(t.brief, room)}` : "", tone: "default" },
 				{ text: tail, tone: "muted" },
 			],
 		};
 	}
+
+	// 已结束的工具**压成一行**「干了什么 → 结果 + 耗时」。
+	// 为什么不也占两行：三个工具就六行，面板会胖得把对话挤没。
+	// 宽度按比例分：参数摘要 ~35%，结果 ~40%，剩下的给名字和分隔符。
+	const briefBudget = Math.max(8, Math.floor(width * 0.35));
+	const tailBudget = Math.max(10, Math.floor(width * 0.4));
+	const marker = t.isError ? "  ✗ " : "  ⚙ ";
+	const brief = t.brief ? oneLine(t.brief, briefBudget) : "";
+	const tailText = [
+		t.resultBrief ? oneLine(t.resultBrief, tailBudget) : "",
+		t.wallSec !== undefined ? `${t.wallSec}s` : "",
+	]
+		.filter(Boolean)
+		.join(" · ");
 	const segs: Seg[] = [
-		{ text: t.isError ? "  ✗ " : "  ↳ ", tone: t.isError ? "err" : "muted" },
-		{ text: t.resultBrief || (t.isError ? "报错" : "完成"), tone: t.isError ? "err" : "default" },
+		{ text: marker, tone: t.isError ? "err" : "muted" },
+		{ text: shown, tone: t.isError ? "err" : "muted" },
 	];
-	if (t.wallSec !== undefined) segs.push({ text: `  ${t.wallSec}s`, tone: "muted" });
+	if (brief) segs.push({ text: `  ${brief}`, tone: "muted" });
+	if (tailText) segs.push({ text: `  → ${tailText}`, tone: t.isError ? "err" : "default" });
 	return { segs };
 }
 
@@ -525,8 +558,8 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	// 任务原文（第二行，短）—— 多个任务并行时用来区分
 	if (job.taskBrief) out.push({ segs: [{ text: `  ${oneLine(job.taskBrief, width - 4)}`, tone: "muted" }] });
 
-	// 最近的动作：只画最后 3 个工具，最新的在最下
-	const tools = job.tools.slice(-3);
+	// 最近的动作：只画最后 4 个工具，最新的在最下（已结束的压成一行，所以 4 个也不胖）
+	const tools = job.tools.slice(-4);
 	for (const t of tools) out.push(toolLine(t, width, now));
 
 	// 执行中的输出（只在这个工具**还在跑**时显示；跑完的结果由上一条 ↳ 行代表，别重复）
