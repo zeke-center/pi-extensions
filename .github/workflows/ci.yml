@@ -16,8 +16,9 @@ jobs:
           node-version: "20"
 
       # pi 既提供宿主（类型/运行时），也自带 esbuild（unit.mjs 要用它打包）
-      - name: 安装 pi
-        run: npm i -g @earendil-works/pi-coding-agent
+      # esbuild 单列是为了保险：它不是 pi 的声明依赖，只是被传递装进来的，位置不可靠
+      - name: 安装 pi + esbuild
+        run: npm i -g @earendil-works/pi-coding-agent esbuild
 
       - name: 冒烟测试（真加载扩展、断言命令注册）
         run: node scripts/smoke.mjs

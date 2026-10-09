@@ -37,20 +37,55 @@ function findPiDir() {
 	return cands.find((c) => c && existsSync(c));
 }
 
+/** 找 esbuild。esbuild 不是 pi 的声明依赖（是被传递依赖顺带装进来的），位置不可预测：
+ *  可能是 <pi>/node_modules/esbuild、被 npm 提升到同级、或全局 node_modules。
+ *  所以用 require.resolve 从多个根去解析，并把试过的路径记下来（失败时好排查）。 */
 function findEsbuild(piDir) {
-	// 直接用 node 跑 esbuild 的 JS 入口：跨平台，避开 Windows 上 .cmd 不能 execFileSync 的坑
-	const js = join(piDir, "node_modules", "esbuild", "bin", "esbuild");
-	if (existsSync(js)) return { cmd: process.execPath, pre: [js] };
-	const bin = process.platform === "win32" ? "esbuild.cmd" : "esbuild";
-	const p = join(piDir, "node_modules", ".bin", bin);
-	if (existsSync(p)) return { cmd: p, pre: [], shell: process.platform === "win32" };
-	return undefined;
+	const tried = [];
+	const cands = [];
+	if (piDir) {
+		try {
+			cands.push(createRequire(join(piDir, "package.json")).resolve("esbuild/bin/esbuild"));
+		} catch {
+			/* ignore */
+		}
+	}
+	try {
+		cands.push(createRequire(import.meta.url).resolve("esbuild/bin/esbuild"));
+	} catch {
+		/* ignore */
+	}
+	if (piDir) {
+		const up = join(piDir, "..");
+		const up2 = join(piDir, "..", "..");
+		cands.push(join(piDir, "node_modules", "esbuild", "bin", "esbuild"));
+		cands.push(join(up, "esbuild", "bin", "esbuild"));
+		cands.push(join(up2, "esbuild", "bin", "esbuild"));
+		const bin = process.platform === "win32" ? "esbuild.cmd" : "esbuild";
+		cands.push(join(piDir, "node_modules", ".bin", bin));
+	}
+	try {
+		const g = execSync("npm root -g", { encoding: "utf8" }).trim();
+		cands.push(join(g, "esbuild", "bin", "esbuild"));
+	} catch {
+		/* ignore */
+	}
+	for (const p of cands) {
+		tried.push(p);
+		if (!p || !existsSync(p)) continue;
+		// 直接用 node 跑 esbuild 的 JS 入口：跨平台，避开 Windows 上 .cmd 不能 execFileSync 的坑
+		if (p.endsWith(".cmd") || p.endsWith(".bat")) return { cmd: p, pre: [], shell: true, tried };
+		return { cmd: process.execPath, pre: [p], tried };
+	}
+	return { tried };
 }
 
 const piDir = findPiDir();
-const esbuild = piDir && findEsbuild(piDir);
-if (!esbuild) {
-	console.error("❌ 找不到 esbuild（通常随 pi 一起装）。设 PI_PACKAGE_DIR 指向 pi 包目录，或先 npm i -g @earendil-works/pi-coding-agent");
+const esbuild = findEsbuild(piDir);
+if (!esbuild.cmd) {
+	console.error("❌ 找不到 esbuild。试过这些路径：");
+	for (const p of esbuild.tried) console.error("   " + p);
+	console.error("→ 修法：npm i -g esbuild（或设 PI_PACKAGE_DIR 指向装着 esbuild 的 pi 包）");
 	process.exit(2);
 }
 
