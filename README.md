@@ -162,6 +162,25 @@ git ls-remote https://github.com/zeke-center/pi-extensions refs/heads/main
 >
 > 只想抄一份模板、不想装插件：把 `assistants/general.md` 拷到 `~/.pi/agent/assistants/` 就行。
 
+### 方式 A₂：Gitee 镜像（国内无梯子）
+
+GitHub 访问不稳/慢的话，用同一个仓库的 Gitee 镜像 —— 内容一样、同步更新：
+
+```bash
+pi install git:gitee.com/zqk0815/pi-extensions
+```
+
+其余和方式 A 完全一样：`pi list` 确认、`pi update --extensions` 更新、`pi remove git:gitee.com/zqk0815/pi-extensions` 卸载。
+（Gitee 和 GitHub 是**镜像**关系，`main` 同步；装哪边都能用，但别两边各装一份。）
+
+> **维护方**：改完记得推两边，否则 Gitee 会落后：
+>
+> ```bash
+> git push origin main && git push gitee main
+> ```
+>
+> （`gitee` remote = `git@gitee.com:zqk0815/pi-extensions.git`）
+
 ### 方式 B：同步脚本（Windows —— 自己改代码时用）
 
 > 别跟方式 A 混用：一个走 `pi install`、一个手动拷到 `extensions/`，混用会**各加载一份、命令注册两遍**。
