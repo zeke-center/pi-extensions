@@ -805,6 +805,60 @@ export function setupBoard(api: ExtensionAPI): void {
 
 参考 pi 自带文档（装在 `@earendil-works/pi-coding-agent` 包里）：`docs/extensions.md`、`docs/mcp.md`、`docs/codemode.md`、`docs/settings.md`、`docs/tui.md`。
 
+## 故障排查
+
+### 启动报 `Tool "progress" conflicts with …`
+
+```
+Error: Failed to load extension "…\extensions\ai-configure\index.ts":
+  Tool "progress" conflicts with …
+```
+
+**成因**：同一个扩展被**两条通道**各装了一份，pi 同时加载，第二个注册 `progress` / `delegate` 时撞名 → 整个扩展加载失败。
+
+| 通道 | 落地路径 | 谁装的 |
+|---|---|---|
+| A：pi 包（推荐） | `~/.pi/agent/git/github.com/zeke-center/pi-extensions/ai-configure/index.ts` | `pi install git:github.com/zeke-center/pi-extensions` |
+| B：同步脚本 | `~/.pi/agent/extensions/ai-configure/index.ts` | 跑 `install.ps1` |
+
+**怎么判断自己是混装**：下面两条**同时**命中就是混装：
+
+```powershell
+Test-Path "$HOME\.pi\agent\extensions\ai-configure"   # 通道 B 在
+pi list                                                  # 通道 A 在（会列出 pi-extensions）
+```
+
+**修法（留一条、删另一条）**：
+
+```powershell
+# 留 A（推荐）：删掉脚本拷的那份
+Remove-Item -Recurse -Force "$HOME\.pi\agent\extensions\ai-configure"
+# 顺手看一眼有没有旧的单文件形态，有就一起删
+Get-ChildItem "$HOME\.pi\agent\extensions" -Filter *.ts
+
+# 留 B：解除包通道
+pi remove git:github.com/zeke-center/pi-extensions
+```
+
+删完重启 pi（或 `/reload`）。`install.ps1` 现在会**自动检测**包通道并拒绝重复同步扩展（红字提示），除非显式 `-ForceExtensions`。
+
+### 启动报 `Ignored settings` / MCP 字段不生效
+
+如果你装了 `pi-mcp-adapter`（并在 settings 里把它设成 MCP 提供方，如 `"extensions": ["-builtin:mcp"]`），那 `~/.pi/agent/mcp.json` **由 adapter 读取**。adapter 只翻译 pi 原生字段；它**自己的**字段要写 `~/.pi/agent/mcp-adapter.json`：
+
+| 你写在 `mcp.json` 里的 | adapter 认不认 |
+|---|---|
+| `timeout: 30`（**秒**） | ✅ 翻译成请求超时 30000ms |
+| `lifecycle` / `requestTimeoutMs` / `idleTimeout` | ❌ 忽略并启动告警 |
+
+adapter 专属设置挪到 `mcp-adapter.json`：
+
+```json
+{ "settings": { "idleTimeout": 10 } }
+```
+
+一句话：**能进 pi 原生 `mcp.json` 的只有官方字段（含 `timeout`，单位秒）**；adapter 专属的别往那儿塞。
+
 ## 许可
 
 私人自用，未附许可。

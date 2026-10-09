@@ -26,6 +26,9 @@
 .PARAMETER Force
   无条件覆盖，跳过哈希比对。
 
+.PARAMETER ForceExtensions
+  即使检测到「pi 包」通道已加载本扩展，也强制同步扩展（不推荐：会和包通道各装一份）。
+
 .EXAMPLE
   .\install.ps1
   同步全部扩展 + 全部助理模板。
@@ -44,7 +47,9 @@ param(
 
 	[switch]$List,
 
-	[switch]$Force
+	[switch]$Force,
+
+	[switch]$ForceExtensions
 )
 
 $ErrorActionPreference = 'Stop'
@@ -117,6 +122,41 @@ if ($Name -and $Name.Count -gt 0) {
 	$asstFiles = @($asstFiles | Where-Object { $wanted -contains $_.BaseName })
 }
 
+# ---------- 2b. 双通道护栅：别和「pi 包」通道各装一份 ----------
+# pi 从两个地方加载扩展：
+#   ① settings.json 的 packages（pi install 装的「包」）
+#   ② extensions\*.ts / extensions\<名字>\index.ts（本脚本同步的形态）
+# 两条通道都命中 = 同一个工具注册两遍 = 扩展整个加载失败（Tool "progress" conflicts）。
+# 检测到「包」通道时，本脚本对扩展退让（不写、也不清孤儿），只同步助理模板。
+$settingsPath = Join-Path $agentDir 'settings.json'
+$packageChannel = $null
+if (Test-Path -LiteralPath $settingsPath) {
+	try {
+		$pkgSettings = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+		$packageChannel = @($pkgSettings.packages | Where-Object { $_ -match 'pi-extensions' }) | Select-Object -First 1
+	} catch {
+		Write-Host "  （读 settings.json 失败，跳过双通道检查：$($_.Exception.Message)）" -ForegroundColor DarkGray
+	}
+}
+
+$skipExtensions = $false
+if ($packageChannel -and -not $ForceExtensions) {
+	$skipExtensions = $true
+	Write-Host ''
+	Write-Host '⚠ 检测到扩展已由「pi 包」通道加载：' -ForegroundColor Yellow
+	Write-Host ("    {0}" -f $packageChannel) -ForegroundColor Yellow
+	Write-Host '  两条通道各装一份会让同一个工具注册两遍（Tool "progress" conflicts），' -ForegroundColor Yellow
+	Write-Host '  扩展会整个加载失败。本次 **跳过扩展同步**（不写、也不清孤儿），只同步助理模板。' -ForegroundColor Yellow
+	Write-Host ''
+	Write-Host '  要让本脚本接管扩展，二选一：' -ForegroundColor DarkGray
+	Write-Host '    1) 先解除包通道：pi remove git:github.com/zeke-center/pi-extensions' -ForegroundColor DarkGray
+	Write-Host '       再删掉 extensions\ai-configure（若存在），重启 pi' -ForegroundColor DarkGray
+	Write-Host '    2) 或加 -ForceExtensions 强制同步（不推荐：会和包通道双份）' -ForegroundColor DarkGray
+	Write-Host ''
+	$extItems = @()
+	$pluginNames = @()
+}
+
 # ---------- 3. 比对并同步 ----------
 function Sync-Tree {
 	param(
@@ -181,13 +221,13 @@ function Sync-Tree {
 	return [pscustomobject]@{ Added = $added; Updated = $updated; Same = $same; Total = $Items.Count }
 }
 
-$extResult = Sync-Tree -Items $extItems -Dest $destDir
+$extResult = if ($skipExtensions) { $null } else { Sync-Tree -Items $extItems -Dest $destDir }
 
 # ---------- 3b. 清理孤儿 ----------
 # pi 同时加载 extensions\*.ts 和 extensions\<name>\index.ts。
 # 旧形态没删干净 = 新旧同时生效 = 同一个工具被注册两遍。
 # 删除范围严格限定：① 根级 .ts / .js  ② 含 index.ts / index.js 的子目录。
-if (-not $partial) {
+if (-not $partial -and -not $skipExtensions) {
 	$orphans = @()
 	if (Test-Path -LiteralPath $destDir) {
 		$keepRel = @($extItems.Rel)
@@ -229,9 +269,12 @@ if ($asstFiles.Count -gt 0) {
 
 # ---------- 4. 汇总 ----------
 Write-Host ''
-$changed = $extResult.Updated + $extResult.Added
-if ($extResult.Total -gt 0) {
+$changed = 0
+if ($extResult) { $changed = $extResult.Updated + $extResult.Added }
+if ($extResult -and $extResult.Total -gt 0) {
 	Write-Host ("扩展：{0} 个文件（{1} 更新, {2} 新增, {3} 未变）" -f $extResult.Total, $extResult.Updated, $extResult.Added, $extResult.Same)
+} elseif ($skipExtensions) {
+	Write-Host '扩展：已跳过（检测到「pi 包」通道，避免重复加载）' -ForegroundColor DarkGray
 }
 if ($asstResult -and $asstResult.Total -gt 0) {
 	$changed += $asstResult.Updated + $asstResult.Added
