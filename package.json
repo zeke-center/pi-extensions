@@ -8,7 +8,7 @@
   "license": "MIT",
   "pi": {
     "extensions": [
-      "./ai-configure/index.ts"
+      "./ai-configure/pi-extensions.ts"
     ]
   },
   "peerDependencies": {

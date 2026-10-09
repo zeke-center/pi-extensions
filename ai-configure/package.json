@@ -1,0 +1,9 @@
+{
+  "name": "pi-extensions-ai-configure",
+  "version": "1.0.0",
+  "private": true,
+  "description": "内层入口清单：pi 的目录发现默认只认 index.ts；本目录入口改名为 pi-extensions.ts 后，靠这里显式声明，避免显示名和别人撞成两个 index。",
+  "pi": {
+    "extensions": ["./pi-extensions.ts"]
+  }
+}

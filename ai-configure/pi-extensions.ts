@@ -5,6 +5,8 @@
  *   pi 原生支持目录式插件（`extensions/<name>/index.ts` 会被当成一个扩展加载，
  *   并且支持相对 import）。合并前是三个各 700~830 行的独立文件，挤进一个文件要
  *   处理 7 处顶层重名，且一处笔误带下水全部功能。分模块就没有这些问题。
+ *   入口不叫 index.ts（叫 pi-extensions.ts），本目录的 package.json 里用 pi.extensions 显式声明，
+ *   这样 pi 的显示名是 `pi-extensions`，不会和别的插件的 `index` 撞。
  *
  * 模块分工：
  *   config.ts    从 Center 后端拉连接台账 → 注册成 MCP server（命令 /ai）

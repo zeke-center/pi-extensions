@@ -10,7 +10,7 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
-| `ai-configure/index.ts` | 入口：装配下面七个模块 + 注册 `/aihelp` | — |
+| `ai-configure/pi-extensions.ts` | 入口：装配下面七个模块 + 注册 `/aihelp` | — |
 | `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
 | `ai-configure/board.ts` | **任务进度看板** | `/board` + `progress` 工具 |
 | `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` + `delegate` 工具 |
@@ -23,7 +23,8 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 ```text
 pi-extensions/
 ├── ai-configure/        # 一个插件，8 个模块
-│   ├── index.ts         # 入口：装配下面七个 + 注册 /aihelp
+│   ├── package.json     # 内层清单：显式声明入口（显示名 = pi-extensions，不叫 index）
+│   ├── pi-extensions.ts # 入口：装配下面七个 + 注册 /aihelp
 │   ├── config.ts        # 连接台账 → MCP（/ai）
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
@@ -41,7 +42,7 @@ pi-extensions/
 │   ├── db.md            # 示例：数据库助理（extends role-ops，demo，挂 center-pg）
 │   └── server.md        # 示例：服务器助理（extends role-ops，demo，挂 nas-ubuntu24）
 ├── install.ps1          # 同步脚本：源 → ~/.pi/agent/（Windows）
-├── package.json         # pi 包清单（pi.extensions 指到 ai-configure/index.ts）
+├── package.json         # pi 包清单（pi.extensions 指到 ai-configure/pi-extensions.ts）
 ├── LICENSE              # MIT
 ├── .gitignore
 └── README.md
@@ -122,7 +123,7 @@ pi install git:github.com/zeke-center/pi-extensions
 > `pi update --extensions` 只会「对齐到那个 ref」，**永远不会往前拉**。
 > 想能自动更新 → 装裸地址（跟踪默认分支 main）；想锁死版本 → 才用 `@<tag或commit>`。
 
-pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` 加载 `ai-configure/index.ts`。
+pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` 加载 `ai-configure/pi-extensions.ts`。
 仓库自带的 `assistants/*.md` 也会一起被找到 —— **装完就有一个能派的「通用助理」**，不用自己写。
 
 **怎么确认装好了**：
@@ -806,7 +807,7 @@ mcp: center-pg
 入口是默认导出的工厂函数；各模块导出 `setupXxx`：
 
 ```ts
-// ai-configure/index.ts —— 加新模块就在这里加一行
+// ai-configure/pi-extensions.ts —— 加新模块就在这里加一行
 import { setupConfig } from "./config";
 import { setupBoard } from "./board";
 import { setupDelegate } from "./delegate";
@@ -845,8 +846,8 @@ Error: Failed to load extension "…\extensions\ai-configure\index.ts":
 
 | 通道 | 落地路径 | 谁装的 |
 |---|---|---|
-| A：pi 包（推荐） | `~/.pi/agent/git/github.com/zeke-center/pi-extensions/ai-configure/index.ts` | `pi install git:github.com/zeke-center/pi-extensions` |
-| B：同步脚本 | `~/.pi/agent/extensions/ai-configure/index.ts` | 跑 `install.ps1` |
+| A：pi 包（推荐） | `~/.pi/agent/git/github.com/zeke-center/pi-extensions/ai-configure/pi-extensions.ts` | `pi install git:github.com/zeke-center/pi-extensions` |
+| B：同步脚本 | `~/.pi/agent/extensions/ai-configure/pi-extensions.ts` | 跑 `install.ps1` |
 
 **怎么判断自己是混装**：下面两条**同时**命中就是混装：
 

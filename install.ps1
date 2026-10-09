@@ -6,7 +6,7 @@
   源 1：本脚本所在目录下的扩展 → <agentDir>\extensions
         扩展有两种形态：
           ① 根级单文件    xxx.ts
-          ② 目录式插件    <名字>\index.ts（·整棵目录一起同步）
+          ② 目录式插件    <名字>\ （入口优先取该目录 package.json 的 pi.extensions，否则 index.ts/index.js；整棵目录一起同步）
   源 2：本脚本所在目录下 assistants\*.md → <agentDir>\assistants
   <agentDir> = $env:PI_CODING_AGENT_DIR，默认 ~\.pi\agent
 
@@ -87,10 +87,26 @@ foreach ($f in @(Get-ChildItem -Path (Join-Path $srcDir '*.ts') -File -ErrorActi
 	$extItems.Add([pscustomobject]@{ Rel = $f.Name; Src = $f.FullName; Key = $f.BaseName; Stamp = $f.LastWriteTime })
 }
 foreach ($d in @(Get-ChildItem -Path $srcDir -Directory -ErrorAction SilentlyContinue)) {
-	$entry = @('index.ts', 'index.js') |
-		ForEach-Object { Join-Path $d.FullName $_ } |
-		Where-Object { Test-Path -LiteralPath $_ } |
-		Select-Object -First 1
+	# 入口：优先读该目录 package.json 的 pi.extensions（入口可以不叫 index.ts），否则退回 index.ts / index.js。
+	# （pi 的目录发现就是这个规则；这里要跟它对齐，否则改名后的插件会被当成「已移除」误删。）
+	$entry = $null
+	$innerPkg = Join-Path $d.FullName 'package.json'
+	if (Test-Path -LiteralPath $innerPkg) {
+		try {
+			$innerManifest = Get-Content -LiteralPath $innerPkg -Raw -Encoding UTF8 | ConvertFrom-Json
+			$innerExts = @($innerManifest.pi.extensions)
+			if ($innerExts.Count -gt 0) {
+				$cand = Join-Path $d.FullName $innerExts[0]
+				if (Test-Path -LiteralPath $cand) { $entry = $cand }
+			}
+		} catch { }
+	}
+	if (-not $entry) {
+		$entry = @('index.ts', 'index.js') |
+			ForEach-Object { Join-Path $d.FullName $_ } |
+			Where-Object { Test-Path -LiteralPath $_ } |
+			Select-Object -First 1
+	}
 	if (-not $entry) { continue }
 	$pluginNames.Add($d.Name)
 	foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue)) {
@@ -226,7 +242,7 @@ $extResult = if ($skipExtensions) { $null } else { Sync-Tree -Items $extItems -D
 # ---------- 3b. 清理孤儿 ----------
 # pi 同时加载 extensions\*.ts 和 extensions\<name>\index.ts。
 # 旧形态没删干净 = 新旧同时生效 = 同一个工具被注册两遍。
-# 删除范围严格限定：① 根级 .ts / .js  ② 含 index.ts / index.js 的子目录。
+# 删除范围严格限定：① 根级 .ts / .js  ② 含 index.ts / index.js、或 package.json(pi.extensions) 的子目录。
 if (-not $partial -and -not $skipExtensions) {
 	$orphans = @()
 	if (Test-Path -LiteralPath $destDir) {
@@ -239,9 +255,17 @@ if (-not $partial -and -not $skipExtensions) {
 		$keepPlugins = @($pluginNames)
 		foreach ($d in @(Get-ChildItem -LiteralPath $destDir -Directory -ErrorAction SilentlyContinue)) {
 			if ($keepPlugins -contains $d.Name) { continue }
-			$looksLikePlugin = @('index.ts', 'index.js') |
+			$hasIndex = @('index.ts', 'index.js') |
 				Where-Object { Test-Path -LiteralPath (Join-Path $d.FullName $_) }
-			if (-not $looksLikePlugin) { continue }
+			$hasManifest = $false
+			$innerManifestPath = Join-Path $d.FullName 'package.json'
+			if (Test-Path -LiteralPath $innerManifestPath) {
+				try {
+					$innerManifest2 = Get-Content -LiteralPath $innerManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+					$hasManifest = @($innerManifest2.pi.extensions).Count -gt 0
+				} catch { }
+			}
+			if (-not ($hasIndex -or $hasManifest)) { continue }
 			$orphans += [pscustomobject]@{ Path = $d.FullName; Rel = "$($d.Name)\  （整个目录）"; IsDir = $true }
 		}
 	}
