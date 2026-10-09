@@ -37,6 +37,24 @@ function findPiDir() {
 	return cands.find((c) => c && existsSync(c));
 }
 
+/** esbuild 的 `bin/esbuild` 在不同平台是两种东西：
+ *   - Windows / 本仓库（npm 装出来）：JS 垫片（首行 `#!`）→ 必须用 node 跑
+ *   - Linux（npm 装 esbuild 时会用原生二进制把它覆盖掉）：ELF → 必须直接执行
+ * 拿 node 去跑 ELF 会报 “SyntaxError: Invalid or unexpected token”（CI 上就是这么挂的）。
+ * 所以先嗅探前几字节，再决定怎么执行。 */
+function esbuildRunner(p) {
+	let head = Buffer.alloc(0);
+	try {
+		head = readFileSync(p).subarray(0, 4);
+	} catch {
+		/* ignore */
+	}
+	const elf = head.length >= 4 && head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46;
+	const pe = head.length >= 2 && head[0] === 0x4d && head[1] === 0x5a;
+	if (elf || pe) return { cmd: p, pre: [] };
+	return { cmd: process.execPath, pre: [p] };
+}
+
 /** 找 esbuild。esbuild 不是 pi 的声明依赖（是被传递依赖顺带装进来的），位置不可预测：
  *  可能是 <pi>/node_modules/esbuild、被 npm 提升到同级、或全局 node_modules。
  *  所以用 require.resolve 从多个根去解析，并把试过的路径记下来（失败时好排查）。 */
@@ -73,9 +91,9 @@ function findEsbuild(piDir) {
 	for (const p of cands) {
 		tried.push(p);
 		if (!p || !existsSync(p)) continue;
-		// 直接用 node 跑 esbuild 的 JS 入口：跨平台，避开 Windows 上 .cmd 不能 execFileSync 的坑
+		// Windows 的 .cmd/.bat 垫片必须走 shell
 		if (p.endsWith(".cmd") || p.endsWith(".bat")) return { cmd: p, pre: [], shell: true, tried };
-		return { cmd: process.execPath, pre: [p], tried };
+		return { ...esbuildRunner(p), tried };
 	}
 	return { tried };
 }
