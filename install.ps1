@@ -12,7 +12,10 @@
 
   用哈希比对，所以能看出「哪个文件真的变了」，不会白写一遍。
 
-  还会「清理孤儿」：目标目录里已经不存在于源里的根级 .ts/.js 和插件目录会被删掉。
+  还会「清理孤儿」，但只删**本脚本装过的**：读上次的来源清单
+  （<agentDir>\.installed-by-pi-extensions.json），只删「清单里有、而现在源里没有」的；
+  再加上两个历史遗留单文件名（ai-config.ts / task-board.ts）做一次性迁移。
+  清单外的东西（别人手动放的插件）一律不动，只打印「保留」提示。
   这一步是必要的 —— pi 会同时加载 extensions\*.ts 和 extensions\<name>\index.ts，
   旧形态没删干净就会和新目录同时生效，同一个工具被注册两遍。
 
@@ -63,6 +66,10 @@ if ([string]::IsNullOrWhiteSpace($agentDir)) {
 }
 $destDir = Join-Path $agentDir 'extensions'
 $asstDestDir = Join-Path $agentDir 'assistants'
+# 记录「本脚本装过什么」。孤儿清理只删有据可查的 —— 不是本脚本装的一律不动。
+$statePath = Join-Path $agentDir '.installed-by-pi-extensions.json'
+# 历史遗留的根级单文件（后来并进了 ai-configure\ 目录），只做一次性迁移删除。
+$legacyRootExts = @('ai-config.ts', 'task-board.ts')
 
 $srcDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($srcDir)) { $srcDir = (Get-Location).Path }
@@ -239,18 +246,36 @@ function Sync-Tree {
 
 $extResult = if ($skipExtensions) { $null } else { Sync-Tree -Items $extItems -Dest $destDir }
 
-# ---------- 3b. 清理孤儿 ----------
+# ---------- 3b. 清理孤儿（只删「本脚本装过的」）----------
 # pi 同时加载 extensions\*.ts 和 extensions\<name>\index.ts。
 # 旧形态没删干净 = 新旧同时生效 = 同一个工具被注册两遍。
-# 删除范围严格限定：① 根级 .ts / .js  ② 含 index.ts / index.js、或 package.json(pi.extensions) 的子目录。
+#
+# 但「删掉不在源里的」= 有罪推定，会误删别人手动放的插件。
+# 改成：只删 ① 上次清单里记过的、② 历史遗留的固定文件名（一次性迁移）。
+# 其余一律不动，只打印「保留」提示（要删自己删）。
 if (-not $partial -and -not $skipExtensions) {
+	$prevFiles = @()
+	$prevPlugins = @()
+	if (Test-Path -LiteralPath $statePath) {
+		try {
+			$prevState = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+			$prevFiles = @($prevState.files)
+			$prevPlugins = @($prevState.plugins)
+		} catch { }
+	}
+
 	$orphans = @()
+	$untouched = @()
 	if (Test-Path -LiteralPath $destDir) {
 		$keepRel = @($extItems.Rel)
 		foreach ($f in @(Get-ChildItem -LiteralPath $destDir -File -ErrorAction SilentlyContinue)) {
 			if ($f.Extension -notin @('.ts', '.js')) { continue }
 			if ($keepRel -contains $f.Name) { continue }
-			$orphans += [pscustomobject]@{ Path = $f.FullName; Rel = $f.Name; IsDir = $false }
+			if (($prevFiles -contains $f.Name) -or ($legacyRootExts -contains $f.Name)) {
+				$orphans += [pscustomobject]@{ Path = $f.FullName; Rel = $f.Name; IsDir = $false }
+			} else {
+				$untouched += $f.Name
+			}
 		}
 		$keepPlugins = @($pluginNames)
 		foreach ($d in @(Get-ChildItem -LiteralPath $destDir -Directory -ErrorAction SilentlyContinue)) {
@@ -266,7 +291,11 @@ if (-not $partial -and -not $skipExtensions) {
 				} catch { }
 			}
 			if (-not ($hasIndex -or $hasManifest)) { continue }
-			$orphans += [pscustomobject]@{ Path = $d.FullName; Rel = "$($d.Name)\  （整个目录）"; IsDir = $true }
+			if ($prevPlugins -contains $d.Name) {
+				$orphans += [pscustomobject]@{ Path = $d.FullName; Rel = "$($d.Name)\  （整个目录）"; IsDir = $true }
+			} else {
+				$untouched += "$($d.Name)\"
+			}
 		}
 	}
 	if ($orphans.Count -gt 0) {
@@ -276,9 +305,25 @@ if (-not $partial -and -not $skipExtensions) {
 			Write-Host ("  [{0}] {1}" -f $tag, $o.Rel) -ForegroundColor Magenta
 			if (-not $List) { Remove-Item -LiteralPath $o.Path -Recurse -Force }
 		}
-	} elseif ($partial) {
-		Write-Host ''
-		Write-Host '  （指定了 -Name，跳过孤儿清理）' -ForegroundColor DarkGray
+	}
+	if ($untouched.Count -gt 0) {
+		Write-Host ("  [保留] {0}（不是本脚本装的，没动）" -f ($untouched -join ', ')) -ForegroundColor DarkGray
+	}
+}
+
+# 记下本次装了什么（下次清理只删有据可查的）
+if (-not $List -and -not $skipExtensions -and -not $partial) {
+	try {
+		$rootFiles = @($extItems | Where-Object { $_.Rel -notmatch '[\\/]' } | ForEach-Object { $_.Rel })
+		$newState = [pscustomobject]@{
+			version   = 1
+			updatedAt = (Get-Date).ToString('s')
+			files     = $rootFiles
+			plugins   = @($pluginNames)
+		}
+		($newState | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $statePath -Encoding UTF8
+	} catch {
+		Write-Host "  （记录来源清单失败：$($_.Exception.Message)）" -ForegroundColor DarkYellow
 	}
 }
 

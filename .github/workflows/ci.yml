@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # pi 既提供宿主（类型/运行时），也自带 esbuild（unit.mjs 要用它打包）
+      - name: 安装 pi
+        run: npm i -g @earendil-works/pi-coding-agent
+
+      - name: 冒烟测试（真加载扩展、断言命令注册）
+        run: node scripts/smoke.mjs
+
+      - name: 单元测试（会话锁 / 结果归属 / env 过滤 / 并发 / 影子目录）
+        run: node scripts/unit.mjs

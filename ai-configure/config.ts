@@ -90,15 +90,22 @@ const WRITE_PATTERNS: Record<string, string> = {
  * ⚠️ ssh-mcp-server 的白名单是**整串匹配**（要求 match[0] === 整条命令），
  *    所以每条末尾都要 `( .*)?$` 才能带参数。
  * ⚠️ 它内建已拒绝 `; & | ` < > $(` 与换行 —— 重定向/管道/串联天然被挡。
+ * ⚠️ 但「命令名对了」不等于安全：参数仍可能有副作用。所以这里刻意收窄：
+ *    git 去掉 branch/remote（`git branch -D` 删分支、`git remote set-url` 改远端）；
+ *    去掉裸 `ip`（`ip addr add` / `ip link set` 改网络）；去掉 `mount`（可 remount,rw）。
+ *    真正的权限边界还是在服务器侧用**受限账号**。
  */
 const SSH_ALLOW: string[] = [
 	"^(ls|ll|cat|head|tail|less|more|wc|grep|rg|stat|file|du|df|tree|readlink|realpath|basename|dirname)( .*)?$",
 	"^find(?! .*(-exec|-delete|-ok|-fprint|-fls))( .*)?$",
 	"^(pwd|whoami|id|groups|hostname|uname|date|uptime|free|ps|printenv|which|type)( .*)?$",
-	"^(ip|ss|netstat|ping|dig|nslookup|traceroute)( .*)?$",
+	"^(ss|netstat|ping|dig|nslookup|traceroute)( .*)?$",
+	"^ip (addr|a|route|r) show( .*)?$",
+	"^ip link show( .*)?$",
 	"^(systemctl (status|list-units|list-unit-files|show|is-active|is-enabled)|journalctl)( .*)?$",
 	"^(docker (ps|images|logs|inspect|stats|version|info))( .*)?$",
-	"^(lsblk|mount|lsof|blkid|nvidia-smi|git (status|log|diff|show|branch|remote))( .*)?$",
+	"^git (status|log|diff|show)( .*)?$",
+	"^(lsblk|lsof|blkid|nvidia-smi)( .*)?$",
 ];
 
 /**

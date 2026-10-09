@@ -18,7 +18,7 @@
  *   <agentDir>/mcp.json           用户级（所有会话都加载的那种）
  *   <cwd>/.pi/mcp.json            项目级（/ai 拉的线上连接会落到这里）
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -33,7 +33,8 @@ export interface McpPool {
 }
 
 /** 影子目录要复制过去的「小配置」 */
-const SHADOW_COPY = ["models.json", "auth.json", "settings.json", "models-store.json"];
+const SHADOW_COPY = ["models.json", "auth.json", "models-store.json"];
+// settings.json 单独处理：**不能整份复制** —— 里面的 packages 会让助理去重新克隆插件。
 
 export function localCatalogPath(): string {
 	return join(getAgentDir(), "mcp-catalog.json");
@@ -91,6 +92,8 @@ export interface ShadowResult {
 	names: string[];
 	/** 模板要了、但池子里找不到的名字 */
 	missing: string[];
+	/** 关键配置写失败的原因（非空 = 应该拒绝启动，别拿半截配置去跑） */
+	errors: string[];
 }
 
 /**
@@ -126,10 +129,13 @@ export function buildShadow(
 	key: string,
 	want: string[],
 	pool: McpPool,
-	opts: { agentsMd?: boolean; exposure?: string } = {},
+	opts: { agentsMd?: boolean; exposure?: string; runSuffix?: string } = {},
 ): ShadowResult {
 	const agentDir = getAgentDir();
-	const dir = join(agentDir, "shadow", safeName(key));
+	const errors: string[] = [];
+	// 目录名加「本次派发」后缀：同一个助理并发派发时不再互相覆盖 mcp.json
+	const suffix = opts.runSuffix ? `-${opts.runSuffix}` : "";
+	const dir = join(agentDir, "shadow", `${safeName(key)}${suffix}`);
 	mkdirSync(dir, { recursive: true });
 
 	for (const f of SHADOW_COPY) {
@@ -139,6 +145,21 @@ export function buildShadow(
 			copyFileSync(src, join(dir, f));
 		} catch {
 			/* 单个文件失败不致命 */
+		}
+	}
+	// settings.json：剔掉 packages 再写（否则助理会去重新克隆插件）
+	const settingsSrc = join(agentDir, "settings.json");
+	if (existsSync(settingsSrc)) {
+		try {
+			const raw = JSON.parse(readFileSync(settingsSrc, "utf8")) as Record<string, unknown>;
+			delete raw.packages;
+			writeFileSync(join(dir, "settings.json"), `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+		} catch {
+			try {
+				copyFileSync(settingsSrc, join(dir, "settings.json"));
+			} catch {
+				errors.push("settings.json 写入失败");
+			}
 		}
 	}
 
@@ -174,11 +195,12 @@ export function buildShadow(
 	}
 	try {
 		writeFileSync(join(dir, "mcp.json"), `${JSON.stringify({ mcpServers: chosen }, null, 2)}\n`, "utf8");
-	} catch {
-		/* ignore */
+	} catch (e) {
+		// 写不进去 = 助理会挂到错的 MCP（甚至一个都没有），宁可不起
+		errors.push(`mcp.json 写入失败：${e instanceof Error ? e.message : String(e)}`);
 	}
 
-	return { dir, names: Object.keys(chosen), missing };
+	return { dir, names: Object.keys(chosen), missing, errors };
 }
 
 /** 助理会话根目录：刻意**不在** sessions/ 下，这样 pi 自带的 /resume 看不见助理会话 */
@@ -189,4 +211,29 @@ export function assistantSessionRoot(): string {
 /** 影子目录的根（调试用） */
 export function shadowRoot(): string {
 	return join(getAgentDir(), "shadow");
+}
+
+/** 回收过期的影子目录（每次派发都会新建一个，session_start 时清超 24h 的） */
+export function reapStaleShadowDirs(maxAgeMs = 24 * 60 * 60 * 1000): number {
+	const root = shadowRoot();
+	let entries: string[] = [];
+	try {
+		entries = readdirSync(root);
+	} catch {
+		return 0;
+	}
+	const now = Date.now();
+	let removed = 0;
+	for (const name of entries) {
+		const p = join(root, name);
+		try {
+			if (now - statSync(p).mtimeMs > maxAgeMs) {
+				rmSync(p, { recursive: true, force: true });
+				removed++;
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+	return removed;
 }

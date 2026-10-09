@@ -41,12 +41,19 @@ pi-extensions/
 │   ├── backend.md       # 示例：后端助理（extends role-dev，demo）
 │   ├── db.md            # 示例：数据库助理（extends role-ops，demo，挂 center-pg）
 │   └── server.md        # 示例：服务器助理（extends role-ops，demo，挂 nas-ubuntu24）
-├── install.ps1          # 同步脚本：源 → ~/.pi/agent/（Windows）
+├── install.ps1          # 同步脚本：源 → ~/.pi/agent/（Windows，只删自己装过的）
+├── scripts/             # 无头测试（CI 也跑这两个）
+│   ├── smoke.mjs        #   让 pi 真加载扩展、断言命令都注册上
+│   ├── unit.mjs         #   用 pi 自带 esbuild 打包真实源码 → 调内部函数（锁/归属/env/并发/影子目录）
+│   └── stubs/           #   测试用的宿主桩（getAgentDir / pi-tui / typebox）
+├── .github/workflows/   # CI：装 pi → 跑上面两个脚本
 ├── package.json         # pi 包清单（pi.extensions 指到 ai-configure/pi-extensions.ts）
 ├── LICENSE              # MIT
 ├── .gitignore
 └── README.md
 ```
+
+本地跑测试（需已装 pi，它自带 esbuild）：`node scripts/smoke.mjs && node scripts/unit.mjs`
 
 ### 为什么是「目录插件」而不是一个大文件
 
@@ -244,7 +251,8 @@ pi 扩展同步
 ### 方式 A′：手动复制（macOS / Linux）
 
 ```bash
-cp pi-extensions/*.ts          ~/.pi/agent/extensions/
+mkdir -p ~/.pi/agent/extensions
+cp -R pi-extensions/ai-configure   ~/.pi/agent/extensions/
 mkdir -p ~/.pi/agent/assistants
 cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 ```
@@ -518,6 +526,10 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `base` | | `true` = **只给 extends 用，不能直接派**（拿来写公共规矩） |
 | `demo` | | `true` = **示例模板：能看 / 能 show / 能 extends，但绝对不能派** |
 | `enabled` | | `false` = 列表里不显示、也派不了 |
+| `tools` | | **工具白名单**（精确匹配，逗号分隔）。写了就**只给这些工具**。⚠️ MCP 工具名是 `mcp__<server>__<tool>`，用白名单时必须逐个列出，否则那台 MCP 的工具会不可用（派发时会硬拦并提示） |
+| `deny_tools` | | 额外禁用的工具，逗号分隔（追加到默认的 `delegate,progress` 黑名单） |
+| `isolate_env` | | `true` = **环境变量隔离**：子进程只拿一份白名单（系统必需变量 + `PI_*`/`NODE_*`/`npm_*`）。默认 `false`（继承全部）。⚠️ 模型 key 若只放在环境变量里，要用 `env_passthrough` 显式保留 |
+| `env_passthrough` | | `isolate_env: true` 时额外保留的环境变量名，逗号分隔（如 `ANTHROPIC_API_KEY`） |
 
 #### 配置面板（`/assistants new` · `/assistants edit <key>`）
 
@@ -607,7 +619,7 @@ mcp: center-pg
 
 两者都会被挡在三道门外：不列在 `delegate` 工具描述里（模型根本看不到）、`/assistants` 列表单独分组、真派了会被 `execute` 拒并告知原因。
 
-仓库里现在 6 个模板**全都是不能派的** —— 2 个 base + 4 个 demo。想要哪个能派，把它 frontmatter 里那行删了就行。
+仓库里 7 个模板：**只有 `general` 开箱能派**；其余 2 个是 base（`role-dev` / `role-ops`），4 个是 demo（`frontend` / `backend` / `db` / `server`）。想要哪个能派，把它 frontmatter 里的 `demo` / `base` 那行删了就行。
 
 #### 三个 MCP 来源
 
@@ -630,13 +642,16 @@ mcp: center-pg
 | **只写**挑好的那几个 MCP | 其余 MCP 的进程压根不启动 |
 | **不复制** `trust.json` | 项目不被信任 → `<cwd>/.pi/mcp.json` 不会 merge 回来 |
 | **自己生成** `mcp.json`（空也写） | 不会沿用上一轮的内容 |
-| **复制** `models.json` / `auth.json` / `settings.json` | 鉴权和模型照常 |
+| **复制** `models.json` / `auth.json` / `models-store.json` | 鉴权和模型照常 |
+| **过滤复制** `settings.json` | 剔掉 `packages`（否则助理会去重新克隆插件，线上踩过）；其余字段照常 |
+| 写失败 | **直接拒绝启动**（不再静默拿半截配置去跑） |
 | 副作用（是好事） | 子进程**不加载用户级扩展** → 自动防递归、少约 825 token/次 |
 
-影子目录名 = `<key 里的 ASCII 部分>-<6 位哈希>`，比如 `个人中心数据库助理` → `assistant-1cx6p4r`。
+影子目录名 = `<key 的 ASCII 部分>-<6 位哈希>-<本次派发随机后缀>`，比如 `个人中心数据库助理-1cx6p4r-a3f9k2`。
 
 为什么要那个哈希：中文名如果只做「非 ASCII 换成 `_`」，`个人中心数据库助理` 会被整串换成 `_________` ——
 **两个同字数的中文助理就撞同一个目录，并行派发时互相覆盖 `mcp.json`**。拼一段基于原名的哈希就没这事了。
+末尾再加「本次派发」的随机后缀：**同一个助理并发派发时也不会互相覆盖**。旧目录由 `session_start` 回收（超 24h 的删）。
 
 #### `mcp` 写错名字会怎样
 
@@ -672,9 +687,12 @@ mcp: center-pg
 
 ### 已知限制
 
-- ⚠️ **模板里的「只读」是提示词层面的自律，不是配置闸门。** 现在能用 `mcp` 决定它「连不连得上」，但连上之后能不能写，看的是那份 MCP 自己的权限（如 ai-config 台账的 `access`）。想真只读，就给它配一个 `access: read` 的连接。
+- ⚠️ **插件层面做不到「安全沙箱」。** 助理是**你本人身份下的普通 pi 进程**：能读你能读的文件（`env` 和工具是能收窄，但收不成沙箱）。真要硬隔离得靠 OS —— 容器 / 受限用户 / 只读挂载。
+- ⚠️ **「只读」不是权限边界，只是「少给犯错机会」。** 现在能做三件事：① 用 `tools` 白名单 / `deny_tools` 精确控制它能用哪些工具；② 用 `mcp` 决定它连不连得上某台 MCP；③ SSH 白名单已经**去掉了有副作用的子命令**（`git branch`/`git remote`、`mount`、裸 `ip`）。但**真解**是：数据库用只读账号、服务器用受限用户。
+- 环境变量默认**全部继承**。要收窄就在模板里写 `isolate_env: true`（配 `env_passthrough` 保留模型 key）。
+- ⚠️ 同时最多跑 **4 个助理**（`delegate.ts` 的 `MAX_CONCURRENT_RUNS`），超出的**排队** —— 防一次 `tasks` 派太多把机器 / 额度打爆。
+- **后台结果只回投派发它的那个主会话**（切走了就等回去才投）；同一子会话**运行中拒绝 `resume`**（返回「会话正忙」），不会起第二个进程交叉写文件。
 - ⚠️ `delegate` 工具里列的那份「可用助理清单」是**扩展加载时算的**。新加 / 改名助理后要 `/reload` 才会出现在清单里（派发本身不缓存，`/assistants` 看到的就是最新的）。
-- 没有 `tools` 白名单 —— 助理拿到它 cwd 里能用的全套内建工具。
 - ⚠️ **`mcp` 写了池子里没有的名字，如果面板里你选了「仍要保存」，派发时会被硬拦**（见上面的「`mcp` 写错名字会怎样」）。不会静默降级成一个没连上库的助理。
 - 项目级模板和项目级 MCP 都**要求该目录被 pi 信任**（`trust.json`）。
 - 每个助理是**独立进程 + 独立模型调用**，会再多花一份钱。
@@ -893,4 +911,4 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 
 ## 许可
 
-私人自用，未附许可。
+MIT —— 见仓库根目录的 `LICENSE`。

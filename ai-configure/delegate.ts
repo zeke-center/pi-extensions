@@ -41,7 +41,7 @@ import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
 import { addJob, beginRun, consume, markEnd, newJob, type EndStatus, type LiveJob } from "./live";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
-import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, type McpPool } from "./mcp-pool";
+import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -87,6 +87,14 @@ interface Template {
 	agentsMd?: boolean;
 	/** 覆盖所挂 MCP 的 exposure：codemode | direct | deferred */
 	mcpExposure?: string;
+	/** 工具白名单（frontmatter.tools）—— 写了就只给这些工具（精确匹配；MCP 工具名形如 mcp__<server>__<tool>） */
+	tools?: string[];
+	/** 额外禁用的工具（frontmatter.deny_tools）—— 追加到默认的 delegate/progress 黑名单 */
+	denyTools?: string[];
+	/** env 隔离（frontmatter.isolate_env）：true = 子进程只拿白名单环境变量（默认 false，继承全部） */
+	isolateEnv?: boolean;
+	/** env 隔离时额外保留的环境变量名（frontmatter.env_passthrough，逗号分隔） */
+	envPassthrough?: string[];
 	/** 额外环境变量（frontmatter.env，写成 K=V, K2=V2） */
 	env: Record<string, string>;
 	/** 系统提示词正文（extends 时 = 父正文 + 子正文） */
@@ -220,6 +228,10 @@ function parseTemplate(file: string, key: string): Template | null {
 		enabled: meta.enabled ? parseBool(meta.enabled, true) : undefined,
 		agentsMd: meta.agents_md ? parseBool(meta.agents_md, true) : undefined,
 		mcpExposure: meta.mcp_exposure || undefined,
+		tools: meta.tools ? splitList(meta.tools) : undefined,
+		denyTools: meta.deny_tools ? splitList(meta.deny_tools) : undefined,
+		isolateEnv: meta.isolate_env ? parseBool(meta.isolate_env, false) : undefined,
+		envPassthrough: meta.env_passthrough ? splitList(meta.env_passthrough) : undefined,
 		env: meta.env ? splitEnv(meta.env) : {},
 		body: body.trim(),
 		file,
@@ -253,6 +265,10 @@ function resolveTemplate(t: Template, byKey: Map<string, Template>, seen: Set<st
 		mcp: t.mcp.length ? t.mcp : p.mcp,
 		timeoutMs: t.timeoutMs ?? p.timeoutMs,
 		mcpExposure: t.mcpExposure ?? p.mcpExposure,
+		tools: t.tools?.length ? t.tools : p.tools,
+		denyTools: t.denyTools?.length ? t.denyTools : p.denyTools,
+		isolateEnv: t.isolateEnv ?? p.isolateEnv,
+		envPassthrough: t.envPassthrough?.length ? t.envPassthrough : p.envPassthrough,
 		env: { ...p.env, ...t.env },
 		body: [p.body, t.body].filter(Boolean).join("\n\n"),
 	};
@@ -431,12 +447,40 @@ child.on("close", function (code) { clearInterval(timer); process.exit(code === 
 child.on("error", function () { clearInterval(timer); process.exit(1); });
 `;
 
-function spawnWatched(argv: string[], cwd: string, extraEnv: Record<string, string> = {}): ChildProcess {
+/** env 隔离开时要保留的变量：系统不能少的那些 */
+const ENV_KEEP_EXACT = new Set([
+	"PATH", "Path", "PATHEXT", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "TMPDIR",
+	"LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "SHELL", "ComSpec", "SystemRoot", "SystemDrive",
+	"windir", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+	"OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "USERNAME", "USER",
+	"LOGNAME", "PWD", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "NO_COLOR", "FORCE_COLOR",
+]);
+/** env 隔离开时按前缀保留的变量（pi / node / npm 自己的） */
+const ENV_KEEP_PREFIX = ["PI_", "NODE_", "npm_"];
+
+/** 按白名单挑环境变量。注意：模型 key 若只放在环境变量里，需要模板用 env_passthrough 显式保留。 */
+function filteredEnv(passthrough: string[]): Record<string, string> {
+	const keep = new Set([...ENV_KEEP_EXACT, ...passthrough]);
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(process.env)) {
+		if (v === undefined) continue;
+		if (keep.has(k) || ENV_KEEP_PREFIX.some((p) => k.startsWith(p))) out[k] = v;
+	}
+	return out;
+}
+
+function spawnWatched(
+	argv: string[],
+	cwd: string,
+	extraEnv: Record<string, string> = {},
+	envMode: { isolate?: boolean; passthrough?: string[] } = {},
+): ChildProcess {
 	installExitHook();
+	const base = envMode.isolate ? filteredEnv(envMode.passthrough ?? []) : process.env;
 	const child = spawn(process.execPath, ["-e", WATCHDOG_SRC], {
 		cwd,
 		env: {
-			...process.env,
+			...base,
 			PI_SKIP_VERSION_CHECK: "1",
 			...extraEnv,
 			PI_DELEGATE_ARGV: JSON.stringify(argv),
@@ -598,7 +642,7 @@ function sessionFileFor(key: string, id: string): string | undefined {
 	}
 }
 
-function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<RunResult> {
+async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<RunResult> {
 	const started = Date.now();
 	const sink: Sink = { partial: "", tools: [], final: "", stderr: "" };
 	const base = (outcome: Outcome, exitCode: number | null): RunResult => ({
@@ -631,13 +675,23 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 		return Promise.resolve(base("failed", null));
 	}
 
+	// 并发上限：超出的先排队（防一次派太多打爆机器 / 额度）
+	await acquireRunSlot();
+
 	// 实时视图：从 spawn 起，子进程每个 JSON 事件都会同时喂给它（面板据此实时画）
 	const job = newJob({ key: tpl.key, name: tpl.name, task, sessionId: opt.names.id, startedAt: started });
 	sink.live = job;
 	addJob(job);
 
 	// -xt：助理不需要面板工具（影子目录下本来也没有 ai-configure，这里是双保险）
-	const args = [cli, "-p", "--mode", "json", "-xt", "delegate,progress"];
+	// 工具控制：
+	//   - 默认：黑名单只挡面板工具（助理不需要 delegate/progress）
+	//   - 模板写了 tools: → 白名单（-t），只给列出的工具（精确匹配）
+	//   - 模板写了 deny_tools: → 追加到黑名单
+	// ⚠️ MCP 工具名是 mcp__<server>__<tool>，用 -t 时必须逐个列出，否则 MCP 会不可用。
+	const denyTools = ["delegate", "progress", ...(tpl.denyTools ?? [])];
+	const args = [cli, "-p", "--mode", "json", "-xt", denyTools.join(",")];
+	if (tpl.tools?.length) args.push("-t", tpl.tools.join(","));
 	// -na：忽略项目级资源 → 掐掉 {cwd}/.pi/mcp.json。
 	//   否则项目的 MCP 会 merge 回影子配置里，「按需给」就白做了。
 	//   AGENTS.md 不受项目信任管，所以照常加载。
@@ -659,10 +713,27 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 		let settled = false;
 		const read = makeLineReader(sink);
 
-		const child = spawnWatched(args, tpl.cwd, {
-			PI_CODING_AGENT_DIR: opt.shadowDir,
-			...tpl.env,
-		});
+		let child: ChildProcess;
+		try {
+			child = spawnWatched(
+				args,
+				tpl.cwd,
+				{
+					PI_CODING_AGENT_DIR: opt.shadowDir,
+					...tpl.env,
+				},
+				{ isolate: tpl.isolateEnv === true, passthrough: tpl.envPassthrough ?? [] },
+			);
+		} catch (e) {
+			sink.stderr = clampTail(
+				`${sink.stderr}\n[spawn 失败] ${e instanceof Error ? e.message : String(e)}`,
+				STDERR_LIMIT,
+			);
+			releaseSessionLock(opt.names.id);
+			releaseRunSlot();
+			done(base("failed", null));
+			return;
+		}
 
 		const finish = (outcome: Outcome, exitCode: number | null): void => {
 			if (settled) return;
@@ -685,6 +756,7 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 			);
 			const r = base(outcome, exitCode);
 			releaseSessionLock(opt.names.id);
+			releaseRunSlot();
 			opt.onSettle?.(r);
 			done(r);
 		};
@@ -1702,6 +1774,32 @@ function reapStaleLocks(): void {
 	}
 }
 
+// ======================= 并发上限（信号量）=======================
+/** 同时最多跑几个助理（超出的排队）。防一次 tasks 派太多把机器/额度打爆。 */
+const MAX_CONCURRENT_RUNS = 4;
+let activeRuns = 0;
+const runSlotWaiters: Array<() => void> = [];
+
+/** 排队拿一个运行名额。拿到后必须调 releaseRunSlot()。 */
+async function acquireRunSlot(): Promise<void> {
+	if (activeRuns < MAX_CONCURRENT_RUNS) {
+		activeRuns++;
+		return;
+	}
+	await new Promise<void>((resolve) => {
+		runSlotWaiters.push(() => {
+			activeRuns++;
+			resolve();
+		});
+	});
+}
+
+function releaseRunSlot(): void {
+	activeRuns = Math.max(0, activeRuns - 1);
+	const next = runSlotWaiters.shift();
+	if (next) next();
+}
+
 // ======================= 注册 =======================
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
@@ -1712,6 +1810,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 		rememberCurrentSession(ctx); // 记下「我是哪个会话」，后台结果靠它认领
 		reapStaleBgTasks(); // 先清理上个会话留下的孤儿任务
 		reapStaleLocks(); // 再回收 pid 已死/超时的会话运行锁
+		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 24h 的删）
 		if (bgTimer) clearInterval(bgTimer);
 		bgTimer = setInterval(() => {
 			try {
@@ -1800,6 +1899,30 @@ export function setupDelegate(api: ExtensionAPI): void {
 				};
 			}
 
+			// 白名单 + 挂了 MCP，但没列 mcp__ 工具 → 直接拒绝（否则 MCP 会静默不可用）
+			if (tpl.tools?.length && tpl.mcp.length > 0) {
+				const hasMcpTool = tpl.tools.some((t) => t.startsWith("mcp__"));
+				const hasCodemode = tpl.tools.includes("codemode");
+				if (!hasMcpTool && !hasCodemode) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									`「${tpl.name}」用了工具白名单（tools:），又挂了 MCP（${tpl.mcp.join(", ")}），` +
+									`但白名单里没有任何 mcp__ 工具 —— 这样 MCP 工具会静默不可用：\n\n` +
+									`  tools: ${tpl.tools.join(", ")}\n\n` +
+									`修法二选一：\n` +
+									`  ① 把要用的 MCP 工具名（mcp__<server>__<tool>）也写进 tools；\n` +
+									`  ② 或者把 codemode 写进 tools（MCP 以 codemode 暴露时）。\n` +
+									`看某台 MCP 有哪些工具：pi 里敲 /mcp 选那个 server。`,
+							},
+						],
+						details: { ok: false, reason: "tools_allowlist_blocks_mcp" },
+					};
+				}
+			}
+
 			const resumeId = params.resume?.trim() || undefined;
 			let list = (params.tasks ?? (params.task ? [params.task] : []))
 				.map((s) => String(s).trim())
@@ -1824,7 +1947,24 @@ export function setupDelegate(api: ExtensionAPI): void {
 			const shadow = buildShadow(tpl.key, tpl.mcp, pool, {
 				agentsMd: tpl.agentsMd !== false,
 				exposure: tpl.mcpExposure,
+				// 每次派发一个独立影子目录：同一个助理并发派发不再互相覆盖 mcp.json
+				runSuffix: Math.random().toString(36).slice(2, 8),
 			});
+			// 关键配置没写成功 → 直接拒绝启动（否则可能挂着错的 MCP 还假装在干活）
+			if (shadow.errors.length) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`「${tpl.name}」的隔离配置没建成功，已拒绝启动：\n  ${shadow.errors.join("\n  ")}\n\n` +
+								`影子目录：${shadow.dir}\n` +
+								`检查那个目录能不能写（磁盘满 / 权限 / 杀软占用）。`,
+						},
+					],
+					details: { ok: false, reason: "shadow_build_failed", errors: shadow.errors },
+				};
+			}
 			// 要的 MCP 一个都找不到 → 直接拒绝。
 			// 为什么不只 warn：一个连不上库的「数据库助理」会假装在干活、给你编结果，
 			// 这比直接失败更吓人。此处还没进 Promise.all(runAssistant)，子进程一个都不会起。

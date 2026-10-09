@@ -725,6 +725,21 @@ export function setupBoard(api: ExtensionAPI): void {
 			}
 		}
 
+		// 面板空 → 只给一句短提示（省 token：完整规则每轮都进上下文，很重）
+		if (steps.length === 0) {
+			return {
+				message: {
+					customType: "task-board-hint",
+					content:
+						"[任务进度看板] 输入框上方有进度看板，当前为空。\n" +
+						'多步骤任务（>=3 步）开始前：先在对话给详细计划表，再 progress(action="plan", title, steps) 声明步骤（每条 <=20 字）；' +
+						'每步 progress(action="step", index, status="doing"/"done")；卡点 progress(action="block", text)；全部完成 progress(action="clear")。' +
+						"单步任务 / 纯问答不用。",
+					display: false,
+				},
+			};
+		}
+
 		return {
 			message: {
 				customType: "task-board-hint",
