@@ -89,27 +89,45 @@ if (!esbuild.cmd) {
 	process.exit(2);
 }
 
+// 先自报家门：失败时能从日志一眼看出用的是哪个 esbuild
+console.log(`pi 目录: ${piDir}`);
+console.log(`esbuild: ${esbuild.pre.join(" ") || esbuild.cmd}`);
+try {
+	const v = execFileSync(esbuild.cmd, [...esbuild.pre, "--version"], { encoding: "utf8" }).trim();
+	console.log(`esbuild 版本: ${v}`);
+} catch (e) {
+	console.error("⚠️ esbuild --version 就失败了（多半是平台原生二进制没装对）：");
+	console.error(String(e.stderr || e.stdout || e.message).slice(0, 1500));
+}
+
 const tmp = mkdtempSync(join(tmpdir(), "pi-ext-unit-"));
 const stubs = join(root, "scripts", "stubs");
 
 function bundle(entryName, outName) {
-	execFileSync(
-		esbuild.cmd,
-		[
-			...esbuild.pre,
-			join(ext, entryName),
-			"--bundle",
-			"--format=esm",
-			"--platform=node",
-			"--external:node:*",
-			`--alias:@earendil-works/pi-coding-agent=${join(stubs, "pi-coding-agent.ts")}`,
-			`--alias:@earendil-works/pi-tui=${join(stubs, "pi-tui.ts")}`,
-			`--alias:typebox=${join(stubs, "typebox.ts")}`,
-			`--outfile=${join(tmp, outName)}`,
-			"--log-level=error",
-		],
-		{ cwd: root, stdio: "inherit", shell: esbuild.shell === true },
-	);
+	const args = [
+		...esbuild.pre,
+		join(ext, entryName),
+		"--bundle",
+		"--format=esm",
+		"--platform=node",
+		"--external:node:*",
+		`--alias:@earendil-works/pi-coding-agent=${join(stubs, "pi-coding-agent.ts")}`,
+		`--alias:@earendil-works/pi-tui=${join(stubs, "pi-tui.ts")}`,
+		`--alias:typebox=${join(stubs, "typebox.ts")}`,
+		`--outfile=${join(tmp, outName)}`,
+		"--log-level=error",
+	];
+	try {
+		// 不要 stdio:"inherit" —— 自己接住输出，失败时才能把它打印出来
+		execFileSync(esbuild.cmd, args, { cwd: root, encoding: "utf8", shell: esbuild.shell === true });
+	} catch (e) {
+		console.error(`❌ esbuild 打包失败：${entryName}`);
+		console.error(`命令：${esbuild.cmd} ${args.join(" ")}`);
+		if (e.stdout) console.error(`--- esbuild stdout ---\n${e.stdout}`);
+		if (e.stderr) console.error(`--- esbuild stderr ---\n${e.stderr}`);
+		if (!e.stdout && !e.stderr) console.error(`--- 无输出 ---\n${e.message}`);
+		process.exit(3);
+	}
 }
 
 /** 把断言代码追加到 bundle 尾部并执行；返回 true = 全过 */

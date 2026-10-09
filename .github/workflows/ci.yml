@@ -37,10 +37,12 @@ jobs:
               echo "unit.mjs 失败（exit $code）"
               echo "PASS 数: $(grep -c '^PASS' "$RUNNER_TEMP/unit.log")"
               grep '^FAIL' "$RUNNER_TEMP/unit.log"
+              echo "-- 头部 20 行 --"
+              head -n 20 "$RUNNER_TEMP/unit.log"
               echo "-- 尾部 25 行 --"
               tail -n 25 "$RUNNER_TEMP/unit.log"
             )
-            one=$(printf '%s' "$msg" | tr '\n' '|' | cut -c1-3500)
+            one=$(printf '%s' "$msg" | tr '\n' '|' | cut -c1-8000)
             echo "::error title=unit.mjs::$one"
             exit "$code"
           fi
