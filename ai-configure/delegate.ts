@@ -33,7 +33,7 @@
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -102,7 +102,7 @@ interface Names {
 	id: string;
 }
 
-type Outcome = "done" | "timeout" | "failed" | "empty";
+type Outcome = "done" | "timeout" | "failed" | "empty" | "busy";
 
 interface RunResult {
 	outcome: Outcome;
@@ -615,8 +615,18 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 		resumed: opt.resumed,
 	});
 
+	// 同会话互斥：该会话正在别处跑（另一次 resume / 另一个 pi 实例）→ 直接拒绝，绝不起第二个进程。
+	// 两个进程写同一份会话文件会交叉覆盖 —— 这是线上实踩到的坑。
+	const lock = acquireSessionLock(opt.names.id, opt.names.display);
+	if (!lock.ok) {
+		const r = base("busy", null);
+		r.stderrTail = `会话 ${opt.names.id} 正在运行：${lock.holder}`;
+		return Promise.resolve(r);
+	}
+
 	const cli = resolveCli();
 	if (!cli) {
+		releaseSessionLock(opt.names.id);
 		sink.stderr = "找不到 pi 的 CLI 入口。请设置环境变量 PI_CLI 指向 pi 的 cli.js。";
 		return Promise.resolve(base("failed", null));
 	}
@@ -674,6 +684,7 @@ function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<Run
 							: undefined,
 			);
 			const r = base(outcome, exitCode);
+			releaseSessionLock(opt.names.id);
 			opt.onSettle?.(r);
 			done(r);
 		};
@@ -734,6 +745,7 @@ const HEADS: Record<Outcome, (name: string, secs: number, extra: string) => stri
 	timeout: (n, s) => `【${n}】超时被停止（${s}s）`,
 	failed: (n, s, e) => `【${n}】失败（${s}s${e}）`,
 	empty: (n, s) => `【${n}】跑了但没输出（${s}s）`,
+	busy: (n, s) => `【${n}】没启动：会话正忙（${s}s）`,
 };
 
 function renderCard(r: RunResult): string {
@@ -771,6 +783,17 @@ function renderCard(r: RunResult): string {
 				"",
 				tools ? `它调用过：${tools}` : "",
 				`它的会话还在，可以 resume: "${r.names.id}" 接着查。`,
+			]
+				.filter((x) => x !== "")
+				.join("\n");
+			break;
+		case "busy":
+			head = HEADS.busy(name, secs);
+			body = [
+				"状态: 没启动 —— 这个会话正在运行，已拒绝并发（否则两个进程会交叉写同一份会话/文件）。",
+				"",
+				r.stderrTail || "",
+				`要它接着做：等它跑完再 resume: "${r.names.id}"；或换一个新会话重新派。`,
 			]
 				.filter((x) => x !== "")
 				.join("\n");
@@ -882,6 +905,12 @@ interface BgTaskFile {
 	resultText?: string;
 	finishedAt?: number;
 	delivered?: boolean;
+	/** 派发它的「主会话」文件路径 —— 结果只投回这个会话，别的会话扫到也不投（防串台） */
+	ownerSessionFile?: string;
+	/** 派发它的主会话 ID（file 拿不到时的退路，也方便排查） */
+	ownerSessionId?: string;
+	/** 投递失败重试次数（发送异常不再一丢了之） */
+	attempts?: number;
 }
 
 function bgRoot(): string {
@@ -931,6 +960,7 @@ function outcomeToStatus(o: Outcome): BgTaskFile["status"] {
 		case "done": return "done";
 		case "timeout": return "timeout";
 		case "empty": return "empty";
+		case "busy": return "failed";
 		default: return "failed";
 	}
 }
@@ -1486,20 +1516,68 @@ async function backToMain(ctx: ExtensionCommandContext): Promise<void> {
 let apiRef: ExtensionAPI | undefined;
 let bgTimer: ReturnType<typeof setInterval> | undefined;
 
-/** 每秒扫一遍后台任务：终态且没回投过的 → 回投主会话（followUp 不打断，排到当前轮后面） */
+/** 本实例当前所在的主会话身份（session_start 与每次派活时刷新）。
+ *  后台结果只投给「派发它的那个会话」，所以要能认出「我是谁」。 */
+let currentSessionFile: string | undefined;
+let currentSessionId: string | undefined;
+
+/** 刷新当前主会话身份。切会话（/resume、/new）也会触发 session_start，所以两头都刷。 */
+function rememberCurrentSession(ctx: ExtensionContext): void {
+	try {
+		currentSessionFile = ctx.sessionManager?.getSessionFile?.() ?? currentSessionFile;
+		currentSessionId = ctx.sessionManager?.getSessionId?.() ?? currentSessionId;
+	} catch {
+		/* 拿不到就算了 */
+	}
+}
+
+/** 这条后台结果是不是本会话派发的？
+ *  老记录（升级前留下的、没有 owner 字段）→ 按老行为投给当前会话，避免结果永远收不到。 */
+function isOwnBgTask(t: BgTaskFile): boolean {
+	if (!t.ownerSessionFile && !t.ownerSessionId) return true;
+	if (t.ownerSessionFile && currentSessionFile) return t.ownerSessionFile === currentSessionFile;
+	if (t.ownerSessionId && currentSessionId) return t.ownerSessionId === currentSessionId;
+	return false; // 有 owner 但本会话身份还没认出来 → 先不投，等认出来再投
+}
+
+/** 每秒扫一遍后台任务：终态、没回投过、且**属于本会话**的 → 回投（followUp 不打断，排到当前轮后面） */
+/** 投递最多重试几次（超过就放弃，不再每个 tick 重试） */
+const MAX_DELIVER_ATTEMPTS = 5;
+
 function pollBgTasks(): void {
 	if (!apiRef) return;
 	for (const t of listBgTasks()) {
 		if (t.status === "running" || t.delivered) continue;
-		// 先标记再回投：避免回投异常导致下个 tick 重复投、主 agent 反复处理同一条
-		writeBgTask({ ...t, delivered: true });
+		// 归属校验：只投给派发它的那个主会话；别的会话/实例扫到也不投，避免串台
+		if (!isOwnBgTask(t)) continue;
+		if ((t.attempts ?? 0) >= MAX_DELIVER_ATTEMPTS) continue; // 投不动了，别再刷
+		// 原子认领：同一会话开在多个实例上时，也只有一个能投（wx 创建失败=别人在投）
+		const claim = bgFile(t.id) + ".claim";
+		try {
+			writeFileSync(claim, String(process.pid), { flag: "wx" });
+		} catch {
+			continue; // 别人正在投
+		}
 		try {
 			apiRef.sendUserMessage(
 				`子Agent「${t.name}」回来了（后台任务）\n${t.resultText || "（没有结果文本）"}\n\n会话ID：${t.sessionId}（要翻看：/resume-agent）`,
 				{ deliverAs: "followUp" },
 			);
+			// 发送成功才标 delivered（之前是先标后发，发失败就永久丢了）
+			writeBgTask({ ...t, delivered: true, attempts: (t.attempts ?? 0) + 1 });
+			try {
+				rmSync(claim, { force: true });
+			} catch {
+				/* ignore */
+			}
 		} catch {
-			/* 吞掉：不刷屏 */
+			// 发送失败：放回认领，记一次尝试，下个 tick 重试
+			writeBgTask({ ...t, delivered: false, attempts: (t.attempts ?? 0) + 1 });
+			try {
+				rmSync(claim, { force: true });
+			} catch {
+				/* ignore */
+			}
 		}
 	}
 }
@@ -1520,14 +1598,120 @@ function reapStaleBgTasks(): void {
 	}
 }
 
+// ======================= 会话运行锁（防同会话并发运行）=======================
+// 为什么用文件锁：并发可能来自**不同进程**（另一次 resume、另一个 pi 实例），内存变量管不着。
+// 锁 = assistant-sessions/.locks/<会话ID>.lock，用 wx 原子创建抢；pid 死了或太旧算死锁，可接管。
+function lockRoot(): string {
+	const d = join(assistantSessionRoot(), ".locks");
+	try {
+		mkdirSync(d, { recursive: true });
+	} catch {
+		/* ignore */
+	}
+	return d;
+}
+function lockFile(sessionId: string): string {
+	return join(lockRoot(), `${sessionId.replace(/[^A-Za-z0-9._-]/g, "_")}.lock`);
+}
+/** 超过这个时长一律视为死锁（正常 timeout 最多 5 分钟，给足余量） */
+const STALE_LOCK_MS = 15 * 60 * 1000;
+
+interface LockInfo {
+	pid: number;
+	sessionId: string;
+	label: string;
+	startedAt: number;
+}
+
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function lockIsStale(info: Partial<LockInfo>): boolean {
+	return (
+		typeof info.pid !== "number" ||
+		!pidAlive(info.pid) ||
+		!info.startedAt ||
+		Date.now() - info.startedAt > STALE_LOCK_MS
+	);
+}
+
+/** 抢会话锁。ok=true 才能起进程；ok=false 说明该会话正被别处运行。 */
+function acquireSessionLock(sessionId: string, label: string): { ok: true } | { ok: false; holder: string } {
+	const f = lockFile(sessionId);
+	const payload = JSON.stringify({ pid: process.pid, sessionId, label, startedAt: Date.now() });
+	try {
+		writeFileSync(f, payload, { flag: "wx" }); // 原子：已存在就抛
+		return { ok: true };
+	} catch {
+		/* 已存在 → 看是不是死锁 */
+	}
+	try {
+		const info = JSON.parse(readFileSync(f, "utf8")) as Partial<LockInfo>;
+		if (lockIsStale(info)) {
+			writeFileSync(f, payload, "utf8"); // 接管死锁
+			return { ok: true };
+		}
+		const since = info.startedAt ? fmtClock(info.startedAt) : "?";
+		return { ok: false, holder: `${info.label || "另一个运行"}（pid ${info.pid}，${since} 起）` };
+	} catch {
+		/* 锁文件坏了 → 覆盖 */
+		try {
+			writeFileSync(f, payload, "utf8");
+			return { ok: true };
+		} catch {
+			return { ok: false, holder: "未知（锁文件不可读写）" };
+		}
+	}
+}
+
+function releaseSessionLock(sessionId: string): void {
+	try {
+		rmSync(lockFile(sessionId), { force: true });
+	} catch {
+		/* ignore */
+	}
+}
+
+/** 回收死锁（session_start 时跑一遍）：pid 已死或超时的锁文件删掉 */
+function reapStaleLocks(): void {
+	const root = lockRoot();
+	let files: string[] = [];
+	try {
+		files = readdirSync(root).filter((f) => f.endsWith(".lock"));
+	} catch {
+		return;
+	}
+	for (const f of files) {
+		const p = join(root, f);
+		try {
+			const info = JSON.parse(readFileSync(p, "utf8")) as Partial<LockInfo>;
+			if (lockIsStale(info)) rmSync(p, { force: true });
+		} catch {
+			try {
+				rmSync(p, { force: true });
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+}
+
 // ======================= 注册 =======================
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
 	apiRef = api; // 供后台轮询回投用
 
 	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
-	api.on("session_start", async () => {
+	api.on("session_start", async (_event, ctx) => {
+		rememberCurrentSession(ctx); // 记下「我是哪个会话」，后台结果靠它认领
 		reapStaleBgTasks(); // 先清理上个会话留下的孤儿任务
+		reapStaleLocks(); // 再回收 pid 已死/超时的会话运行锁
 		if (bgTimer) clearInterval(bgTimer);
 		bgTimer = setInterval(() => {
 			try {
@@ -1632,6 +1816,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 				params.timeoutMs && params.timeoutMs > 0 ? params.timeoutMs : (tpl.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 			const total = Math.min(Math.max(raw, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
 			const main = mainName(ctx);
+			rememberCurrentSession(ctx); // 刷新本会话身份（异步回投靠它认领）
 			const running = `${list.length > 1 ? `×${list.length} ` : ""}`;
 
 			// 建影子 agentDir：只放进本模板声明的那些 MCP（真正的「按需给」）
@@ -1706,6 +1891,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 					writeBgTask({
 						id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
 						startedAt: Date.now(), status: "running",
+						ownerSessionFile: currentSessionFile,
+						ownerSessionId: currentSessionId,
 					});
 					void runAssistant(tpl, task, {
 						timeoutMs: total,
@@ -1718,6 +1905,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 							const prev = readBgTask(bgId) ?? {
 								id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
 								startedAt: Date.now(), status: "running" as const,
+								ownerSessionFile: currentSessionFile,
+								ownerSessionId: currentSessionId,
 							};
 							writeBgTask({
 								...prev,
