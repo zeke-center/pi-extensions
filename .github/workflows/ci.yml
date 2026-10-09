@@ -23,5 +23,24 @@ jobs:
       - name: 冒烟测试（真加载扩展、断言命令注册）
         run: node scripts/smoke.mjs
 
+      # 说明：Actions 日志要登录才能看，而 annotation 未登录也能通过 API 读到。
+      # 所以失败时把要紧的几行做成 ::error:: 注解，方便（包括外部工具）直接看出原因。
       - name: 单元测试（会话锁 / 结果归属 / env 过滤 / 并发 / 影子目录）
-        run: node scripts/unit.mjs
+        shell: bash
+        run: |
+          set +e
+          node scripts/unit.mjs > "$RUNNER_TEMP/unit.log" 2>&1
+          code=$?
+          cat "$RUNNER_TEMP/unit.log"
+          if [ "$code" -ne 0 ]; then
+            msg=$(
+              echo "unit.mjs 失败（exit $code）"
+              echo "PASS 数: $(grep -c '^PASS' "$RUNNER_TEMP/unit.log")"
+              grep '^FAIL' "$RUNNER_TEMP/unit.log"
+              echo "-- 尾部 25 行 --"
+              tail -n 25 "$RUNNER_TEMP/unit.log"
+            )
+            one=$(printf '%s' "$msg" | tr '\n' '|' | cut -c1-3500)
+            echo "::error title=unit.mjs::$one"
+            exit "$code"
+          fi
