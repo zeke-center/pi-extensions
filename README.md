@@ -171,15 +171,23 @@ pi install git:gitee.com/zqk0815/pi-extensions
 ```
 
 其余和方式 A 完全一样：`pi list` 确认、`pi update --extensions` 更新、`pi remove git:gitee.com/zqk0815/pi-extensions` 卸载。
-（Gitee 和 GitHub 是**镜像**关系，`main` 同步；装哪边都能用，但别两边各装一份。）
 
-> **维护方**：改完记得推两边，否则 Gitee 会落后：
+**从 GitHub 换到 Gitee**（已经装过 `git:github.com/…` 的人）：
+
+```bash
+pi remove  git:github.com/zeke-center/pi-extensions   # 先删旧的
+pi install git:gitee.com/zqk0815/pi-extensions         # 再从 Gitee 装
+```
+
+> ⚠️ 顺序不能反、也不要**两个源都装**：GitHub 版和 Gitee 版是**同一份扩展**，两个都装会各加载一份、同名工具冲突（`Tool "progress" conflicts`）。换源要「先删后装」。换完 `pi list` 里应该只剩 Gitee 那条。
+
+> **维护方（本机开发）**：`origin` 已配成**一次推两边**（GitHub + Gitee），改完直接敲：
 >
 > ```bash
-> git push origin main && git push gitee main
+> git push
 > ```
 >
-> （`gitee` remote = `git@gitee.com:zqk0815/pi-extensions.git`）
+> （`origin` 的 push URL = `git@github.com:zeke-center/pi-extensions.git` **+** `git@gitee.com:zqk0815/pi-extensions.git`。GitHub 那半需要能连上 GitHub，没梯子时它那半会报错、Gitee 那半照常——想彻底免梯子，可在 Gitee 仓库「管理 → 仓库镜像管理 → 推送」里让 Gitee 帮你同步 GitHub。）
 
 ### 方式 B：同步脚本（Windows —— 自己改代码时用）
 
