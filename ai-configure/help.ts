@@ -38,6 +38,8 @@ export const HELP_TEXT = `AI configure · 全部功能
   /agents widget          改回看板正上方那个整宽面板（默认形态）
   /agents float           改成右侧浮层（会盖住一块，只在你想让它飘着时用）
   /agents text            把当前状态打印成纯文本（RPC / 调试用）
+  /agents bg              看后台任务状态（跑完却没投回主会话的、失败原因）
+  /agents bg redeliver    把没投回主会话的立刻重投（主对话卡住时的救急口）
 
 /resume-agent             翻看助理的历次会话（它们不在 /resume 里），选中切过去看
   /resume-agent <key>     只看某个助理的

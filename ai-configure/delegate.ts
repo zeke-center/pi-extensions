@@ -981,8 +981,16 @@ interface BgTaskFile {
 	ownerSessionFile?: string;
 	/** 派发它的主会话 ID（file 拿不到时的退路，也方便排查） */
 	ownerSessionId?: string;
-	/** 投递失败重试次数（发送异常不再一丢了之） */
+	/** 投递失败重试次数 */
 	attempts?: number;
+	/** 上次尝试投递的时间（算退避用） */
+	lastAttemptAt?: number;
+	/** 第一次投递失败的时间（算“多久还没发出去”用） */
+	firstFailAt?: number;
+	/** 最后一次投递失败的原因（排查用） */
+	lastError?: string;
+	/** 自动重试已放弃（超时），等 /agents bg redeliver 手动投 */
+	undelivered?: boolean;
 }
 
 function bgRoot(): string {
@@ -1612,17 +1620,47 @@ function isOwnBgTask(t: BgTaskFile): boolean {
 	return false; // 有 owner 但本会话身份还没认出来 → 先不投，等认出来再投
 }
 
-/** 每秒扫一遍后台任务：终态、没回投过、且**属于本会话**的 → 回投（followUp 不打断，排到当前轮后面） */
-/** 投递最多重试几次（超过就放弃，不再每个 tick 重试） */
-const MAX_DELIVER_ATTEMPTS = 5;
+/** 退避上限：每次失败后隔多久再试（2^n 秒，封顶 30s） */
+const DELIVER_BACKOFF_MAX_MS = 30 * 1000;
+/** 超过这个时长还是发不出去 → 标 undelivered（不静默丢，但也不无限刷） */
+const DELIVER_GIVEUP_MS = 10 * 60 * 1000;
 
-function pollBgTasks(): void {
+function deliverBackoffMs(attempts: number): number {
+	return Math.min(DELIVER_BACKOFF_MAX_MS, 1000 * 2 ** Math.min(attempts, 5));
+}
+
+/** 要投给主会话的文本 */
+function bgDeliveryText(t: BgTaskFile): string {
+	return (
+		`子Agent「${t.name}」回来了（后台任务）\n${t.resultText || "（没有结果文本）"}\n\n` +
+		`会话ID：${t.sessionId}（要翻看：/resume-agent）`
+	);
+}
+
+/**
+ * 把一条已完成的后台任务投给主会话。
+ *
+ * ⚠️ 必须 await：sendUserMessage 返回 Promise，它 reject 时不会被同步 try/catch 接住
+ *    （之前就是这么“假成功”的：异常没接住，却照旧写了 delivered:true → 结果永久丢）。
+ */
+async function deliverBgTask(t: BgTaskFile): Promise<void> {
+	if (!apiRef) throw new Error("apiRef 未就绪");
+	// 主会话空闲时：prompt() 会直接起一轮（唤醒）；正在跑：排队（followUp，本轮结束接着跑）
+	await apiRef.sendUserMessage(bgDeliveryText(t), { deliverAs: "followUp" });
+}
+
+/** 每秒扫一遍后台任务：终态、没回投过、且**属于本会话**的 → 回投 */
+async function pollBgTasks(): Promise<void> {
 	if (!apiRef) return;
+	const now = Date.now();
 	for (const t of listBgTasks()) {
 		if (t.status === "running" || t.delivered) continue;
 		// 归属校验：只投给派发它的那个主会话；别的会话/实例扫到也不投，避免串台
 		if (!isOwnBgTask(t)) continue;
-		if ((t.attempts ?? 0) >= MAX_DELIVER_ATTEMPTS) continue; // 投不动了，别再刷
+		if (t.undelivered) continue; // 自动重试已放弃，等手动
+		const attempts = t.attempts ?? 0;
+		// 退避：别每秒硬撞
+		if (t.lastAttemptAt && now - t.lastAttemptAt < deliverBackoffMs(attempts)) continue;
 		// 原子认领：同一会话开在多个实例上时，也只有一个能投（wx 创建失败=别人在投）
 		const claim = bgFile(t.id) + ".claim";
 		try {
@@ -1631,26 +1669,38 @@ function pollBgTasks(): void {
 			continue; // 别人正在投
 		}
 		try {
-			apiRef.sendUserMessage(
-				`子Agent「${t.name}」回来了（后台任务）\n${t.resultText || "（没有结果文本）"}\n\n会话ID：${t.sessionId}（要翻看：/resume-agent）`,
-				{ deliverAs: "followUp" },
-			);
-			// 发送成功才标 delivered（之前是先标后发，发失败就永久丢了）
-			writeBgTask({ ...t, delivered: true, attempts: (t.attempts ?? 0) + 1 });
-			try {
-				rmSync(claim, { force: true });
-			} catch {
-				/* ignore */
-			}
-		} catch {
-			// 发送失败：放回认领，记一次尝试，下个 tick 重试
-			writeBgTask({ ...t, delivered: false, attempts: (t.attempts ?? 0) + 1 });
+			await deliverBgTask(t);
+			// 只有真发出去才标 delivered
+			writeBgTask({ ...t, delivered: true, attempts: attempts + 1, lastAttemptAt: now, lastError: undefined });
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			const firstFailAt = t.firstFailAt ?? now;
+			const giveUp = now - firstFailAt > DELIVER_GIVEUP_MS;
+			writeBgTask({
+				...t,
+				delivered: false,
+				attempts: attempts + 1,
+				lastAttemptAt: now,
+				firstFailAt,
+				lastError: msg,
+				undelivered: giveUp, // 超时→不再自动重试，但也不静默丢（面板 + /agents bg 能看到）
+			});
+		} finally {
 			try {
 				rmSync(claim, { force: true });
 			} catch {
 				/* ignore */
 			}
 		}
+	}
+}
+
+/** 未投递出去的条数（面板提示用） */
+export function undeliveredBgCount(): number {
+	try {
+		return listBgTasks().filter((t) => t.status !== "running" && !t.delivered).length;
+	} catch {
+		return 0;
 	}
 }
 
@@ -1813,16 +1863,26 @@ export function setupDelegate(api: ExtensionAPI): void {
 		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 24h 的删）
 		if (bgTimer) clearInterval(bgTimer);
 		bgTimer = setInterval(() => {
-			try {
-				pollBgTasks();
-			} catch {
-				/* 吞掉，别把进程干挂 */
-			}
+			// 注意：pollBgTasks 是 async，rejection 只能这样接
+			void pollBgTasks().catch(() => {
+				/* 单轮出错别把进程干挂 */
+			});
 		}, 1000);
 	});
 	api.on("session_shutdown", async () => {
 		if (bgTimer) clearInterval(bgTimer);
 		bgTimer = undefined;
+	});
+	// 兑底：agent 一变空闲就查一次。
+	// 为什么需要：1 秒定时器是 session_start 挂的，如果 /reload 之后 session_start 没触发，
+	// 定时器就不在 —— 光靠它会出现“助理回来了但没人去投”。agent_settled 每个 turn 结束都会来。
+	api.on("agent_settled", async () => {
+		// 稍微延后：避开 settle 事件自身的重入窗口（这一刻直接 prompt 可能被拒）
+		setTimeout(() => {
+			void pollBgTasks().catch(() => {
+				/* ignore */
+			});
+		}, 300);
 	});
 	// 助理清单在加载时算一次，拼进工具参数描述（零额外开销）
 	const params = makeDelegateParams(assistantHint(process.cwd()));
@@ -1831,10 +1891,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 		name: "delegate",
 		label: "Delegate",
 		description:
-			"把任务派给**临时助理**（另起独立 pi 进程），只把卡片（状态/结论/证据）带回来。" +
-			"适合过程很脏、只要结论的活；不适合你想看过程的活。" +
-			"多件互不依赖的活用 tasks 并行派；超时/失败过的活用 resume 续跑。" +
-			"助理不能互相派活；每次都会回报会话名和会话 ID，要翻看用 /resume-agent。",
+			"把任务派给**临时助理**（另起独立 pi 进程），只把卡片（状态/结论/证据）带回来。\n" +
+			"【自己做，别派】1~2 次工具调用就能完事 / 要跟用户来回确认 / 要用当前对话的上下文 / 要改**当前仓库**（改完你还得复核）。这类派出去只会更慢更贵。\n" +
+			"【该派】过程长而脏（大量探查、批量扫描、跑测试、翻几十个文件）而你**只要结论** / 几件互不依赖的活并行(tasks) / 要在**另一个项目目录**干活。\n" +
+			"【成本】每个助理 = 一个独立进程 + 一次完整模型上下文。派之前先自问：这件事我自己两步能做完吗？能，就自己做。\n" +
+			"多件互不依赖用 tasks 并行派；超时/失败过的用 resume 续跑；助理不能互相派活；会话名/ID 会回报，要翻看用 /resume-agent。",
 		parameters: params,
 
 		async execute(
@@ -2135,7 +2196,10 @@ export function setupDelegate(api: ExtensionAPI): void {
 
 	// ---------- /agents：子代理实时面板 ----------
 	api.registerCommand("agents", {
-		description: "子代理实时面板：直接敲=开；off 关；detail 展开思考；text 打印快照；float 改成右侧浮层，widget 改回看板上方",
+		description:
+			"子代理实时面板：直接敲=开；off 关；detail 展开思考；text 打印快照；" +
+			"float 改成右侧浮层，widget 改回看板上方；" +
+			"bg 看后台任务状态（失败原因），bg redeliver 把没投回主会话的立刻重投",
 		handler: async (args: string, ctx) => {
 			const sub = (args ?? "").trim().toLowerCase();
 
@@ -2166,6 +2230,49 @@ export function setupDelegate(api: ExtensionAPI): void {
 				closeAgentPanel({ user: false });
 				openAgentPanel(ctx, { force: true });
 				ctx.ui.notify(`面板形态：${panelMode()}（右侧浮层，会盖住一块）`, "info");
+				return;
+			}
+
+			// --- 后台任务：看状态 / 手动重投（卡住时的救急口）---
+			if (sub === "bg" || sub.startsWith("bg ")) {
+				const action = sub.slice(2).trim();
+				const all = listBgTasks().sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+				if (!all.length) {
+					ctx.ui.notify("没有后台任务记录。", "info");
+					return;
+				}
+				if (action === "redeliver" || action === "retry") {
+					let n = 0;
+					for (const t of all) {
+						if (t.status === "running" || t.delivered) continue;
+						if (!isOwnBgTask(t)) continue;
+						// 清掉「已放弃」和退避计时，立即重试
+						writeBgTask({ ...t, undelivered: false, firstFailAt: undefined, attempts: 0, lastAttemptAt: undefined });
+						n++;
+					}
+					await pollBgTasks();
+					ctx.ui.notify(
+						n ? `已重投 ${n} 条 —— 看主对话有没有冒出新消息` : "没有可重投的（都投过了，或不属于本会话）",
+						"info",
+					);
+					return;
+				}
+				const lines = all.slice(0, 20).map((t) => {
+					const mine = isOwnBgTask(t) ? "" : "  ⚠别的会话";
+					const st = t.delivered
+						? "已投"
+						: t.undelivered
+							? "未投(已放弃)"
+							: t.status === "running"
+								? "跑着"
+								: "待投";
+						const err = t.lastError ? `  失败:${shortText(t.lastError, 36)}` : "";
+						return `${fmtClock(t.startedAt)} ${t.key} · ${st} · 试${t.attempts ?? 0}次${mine}${err}`;
+				});
+				ctx.ui.notify(
+					`后台任务 ${all.length} 条（最多列 20）：\n${lines.join("\n")}\n\n重投未投递的：/agents bg redeliver`,
+					"info",
+				);
 				return;
 			}
 

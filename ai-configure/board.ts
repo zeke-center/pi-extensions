@@ -20,7 +20,7 @@ import { type Focusable, truncateToWidth, visibleWidth } from "@earendil-works/p
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
-import { loadTemplates } from "./delegate";
+import { loadTemplates, undeliveredBgCount } from "./delegate";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -239,6 +239,11 @@ function assistantLines(theme: Theme, w: number = RIGHT_WIDTH): string[] {
 	}
 	if (cachedAssistants.blocked > 0) {
 		out.push(` ${t.fg("dim", `○ ${cachedAssistants.blocked} 个不可派`)}`);
+	}
+	// 有助理已经跑完、结果却没投回主会话 → 必须看得见（否则你只能干等）
+	const undelivered = undeliveredBgCount();
+	if (undelivered > 0) {
+		out.push(` ${t.fg("warning", `⚠ ${undelivered} 条没回投`)}`);
 	}
 	return out;
 }
