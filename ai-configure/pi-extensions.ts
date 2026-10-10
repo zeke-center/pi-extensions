@@ -14,12 +14,17 @@
  *   delegate.ts  派活给临时助理（命令 /assistants，工具 delegate）
  *   live.ts      子代理实时状态机（消费子进程的 JSON 事件流）
  *   panel.ts     看板正上方的子代理实时面板（命令 /agents）
+ *   health.ts    模块健康度登记（入口失败上报，供 doctor / 状态栏读）
+ *   doctor.ts    /ai doctor 自检报告
  *   help.ts      /aihelp 与 /ai help 共用的文案
+ *
+ * 提示词模板（prompts/）怎么被发现：
+ *   包通道（pi install）→ 靠外层 package.json 的 pi.prompts 清单
+ *   拷贝通道（install.ps1）→ 靠 pi 的约定目录 <agentDir>/prompts
+ *   两条路各管一边，所以**不再**用 resources_discover 声明一次
+ *   （那会和清单重复注册同一文件，触发 `name "/ai-delegate" collision`）。
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { setupConfig } from "./config";
 import { setupBoard } from "./board";
 import { setupPanel } from "./panel";
@@ -27,9 +32,6 @@ import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
 import { showHelp } from "./help";
 import { healthLine, markFail, markOk } from "./health";
-
-/** 本包根目录（= ai-configure/ 的上一层），用来定位随包分发的 prompts/ 与 skills/ */
-const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 export default function (api: ExtensionAPI): void {
 	// ⚠️ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
@@ -62,17 +64,6 @@ export default function (api: ExtensionAPI): void {
 		} catch {
 			/* 状态栏失败不影响功能 */
 		}
-	});
-
-	// 声明随包分发的 prompts/ 与 skills/（目录不存在就不声明，免得指向空目录）
-	// 这样不论用哪种方式加载本扩展，/ai-delegate 这类模板命令都能被发现。
-	api.on("resources_discover", () => {
-		const out: { promptPaths?: string[]; skillPaths?: string[] } = {};
-		const prompts = join(PKG_ROOT, "prompts");
-		if (existsSync(prompts)) out.promptPaths = [prompts];
-		const skills = join(PKG_ROOT, "skills");
-		if (existsSync(skills)) out.skillPaths = [skills];
-		return out;
 	});
 
 	// ---------- /aihelp（/ai help 的快捷别名）----------
