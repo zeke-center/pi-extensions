@@ -376,14 +376,36 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 长这样（总宽 100 → 4 栏）：
 
 ```text
-▛ 任务 看板拆成四栏 · 1/5   │ MCP 7                 │ 插件 3                │ 助理 3
+▛ 任务 看板拆成四栏 · 1/5   │ MCP 7 ●5             │ 插件 3                │ 助理 3
   ✓ 1 拆右栏为三个独立栏    │ ● 全局 my-db          │ ● ai-configure        │ ● 业务数据库助理
   ⠋ 2 渲染改成多栏          │ ● 项目 my-server      │ ● pi-mcp-adapter      │ ● 业务服务器助理
-     ▸ 读取文件 board.ts    │ ○ 全局 some-server…   │ ● some-plugin         │ ● 通用助理
+     ▸ 读取文件 board.ts    │ ◌ 全局 some-server…   │ ● some-plugin         │ ● 通用助理
   ○ 3 无头预览各宽度        │ ● 会话 dev-radius     │                       │ ○ 6 个不可派
 ```
 
 > 面板**曾**有「模型 / token 用量 / git 分支」一行，已删 —— 一是你不想看，二是它每 2.4s 要跑一次 `git branch` 子进程。想看 token 用量和成本，用内置的 **`/session`**。
+
+#### 「MCP」一栏
+
+```
+ MCP 7 ●2
+ ● 全局 my-db
+ ◌ 全局 other-server
+ ● 项目 my-server
+```
+
+| 标记 | 意思 |
+|---|---|
+| `●` | **已经见到它的工具** —— 真的连上了（有证据） |
+| `◌` | **还没见到它的工具** —— 还没连上 / 还没调用过。**不是「挂了」** |
+
+表头 ` MCP 7 ●2` = 一共配了 7 个、其中 2 个已连上（全部连上时就不显示后面那段）。
+
+**为什么不能直接查「连了没」**：pi 没把这个状态暴露给扩展 —— 内置 MCP 扩展内部的 `connection.state` 拿不到；`getMcpServers()` 只报「拓展自己 `registerMcpServer()` 注册的」，跟 `mcp.json` 里的服务器无关（实测就是空的）。所以只能从**工具名**反推。
+
+而 MCP 是**后台连**的：实测从会话开始到工具出现要 **~10 秒**（工具数 12 → 19）。因为信号来得慢，面板就**多刷**：空闲时全量刷（2.4s）、**有步骤在跑时也刷 MCP 那一栏（1.5s）**、每轮开头刷一次、以及**跑完任何一个 `mcp__*` 工具立刻刷**。所以那个「慢」不会让你看到假的 `◌`。
+
+> ⚠️ 想要**权威**的实时状态（看清 `connected` / `failed` / `needs-auth`、能手动 reconnect），敲 pi 内置的 **`/mcp`** —— 面板那栏只是个「一眼扫」的近似。
 
 #### 「助理」一栏
 
@@ -396,7 +418,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 只列**能派的**（名字就是你传给 `delegate` 的 `assistant`）。
 `base`（底座）和 `demo`（样板）派了会被拒，所以只数个数、不列名 —— 否则白白占两行。
-数据来自 `delegate.ts` 导出的 `loadTemplates(cwd)`，跟 MCP / 插件一起在同一个低频刷新点更新（**不是每帧扫盘**）。
+数据来自 `delegate.ts` 导出的 `loadTemplates(cwd)`，跟插件一起在同一个低频刷新点更新（**不是每帧扫盘**）；MCP 那栏刷得更勤，见上。
 
 > 代价：新增/改名助理后最多 **2.4s** 才出现在「助理」栏；派发本身不缓存，随时改随时生效。
 

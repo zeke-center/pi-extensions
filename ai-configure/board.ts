@@ -189,16 +189,37 @@ function leftLines(theme: Theme): string[] {
 // 现在拆成三个独立栏，渲染时并排 —— 高度降下来，代价是任务栏变窄。
 
 /** MCP 服务（区分 会话 / 项目 / 全局 三级）。w = 本栏实际宽度（用于截断名字） */
+/**
+ * MCP 栏表头：` MCP 7`；没全部连上时补一段 ` ●2`（= 7 个里 2 个已连上）。
+ *
+ * 为什么要显示个数：只写 `MCP 7` 会让人以为 7 个都连上了。MCP 是后台连的，
+ * 刚开始就是会有一批没连上 —— 把「几个连上了」摆出来才不会误读。
+ * 返回两段是为了分开上色（第二段用灰）。
+ */
+function mcpHeaderParts(total: number, verified: number): [string, string] {
+	return [` MCP ${total}`, total > verified ? ` ●${verified}` : ""];
+}
+
+/**
+ * 单个 MCP 的连接标记。
+ * ● = 见过它的工具（真连上了）｜ ◌ = 还没见到工具（**未知**，可能还在连，不是挂了）
+ */
+function mcpMark(connected: boolean): string {
+	return connected ? "●" : "◌";
+}
+
 function mcpLines(theme: Theme, w: number = RIGHT_WIDTH): string[] {
 	const t = theme;
 	const out: string[] = [];
-	out.push(t.fg("accent", t.bold(` MCP ${cachedMcp.length}`)));
+	const verified = cachedMcp.filter((s) => s.connected).length;
+	const [headMain, headExtra] = mcpHeaderParts(cachedMcp.length, verified);
+	out.push(t.fg("accent", t.bold(headMain)) + (headExtra ? t.fg("dim", headExtra) : ""));
 	if (cachedMcp.length === 0) {
 		out.push(` ${t.fg("dim", "（无）")}`);
 	} else {
 		for (const s of cachedMcp.slice(0, MAX_LISTED)) {
 			out.push(
-				` ${s.connected ? t.fg("success", "●") : t.fg("dim", "○")} ${t.fg("dim", LEVEL_TAG[s.level])} ${t.fg(s.connected ? "muted" : "dim", shortText(s.name, Math.max(6, w - 8)))}`,
+				` ${t.fg(s.connected ? "success" : "dim", mcpMark(s.connected))} ${t.fg("dim", LEVEL_TAG[s.level])} ${t.fg(s.connected ? "muted" : "dim", shortText(s.name, Math.max(6, w - 8)))}`,
 			);
 		}
 		if (cachedMcp.length > MAX_LISTED) out.push(` ${t.fg("dim", `+${cachedMcp.length - MAX_LISTED}`)}`);
@@ -289,17 +310,21 @@ function computeMcp(cwd: string, trusted: boolean): McpEntry[] {
 			const idx = rest.indexOf("__");
 			if (idx < 0) continue;
 			const derived = rest.slice(0, idx);
-			// 工具名把非字母数字下划线都换成了 _，需要跟配置名对上
-			let hit: string | undefined;
+			// 工具名把非字母数字下划线都换成了 _，需要跟配置名对上。
+			// 别 break：`my-db` 和 `my.db` 都会归一化成 `my_db`，只认第一个会张冠李戴。
+			// 撞车时两个都标上 —— 确实分不出这个工具属于谁，但至少不会指错人。
+			let hit = false;
 			for (const n of levels.keys()) {
 				if (n.replace(/[^A-Za-z0-9_]/g, "_") === derived) {
-					hit = n;
-					break;
+					hit = true;
+					connected.add(n);
 				}
 			}
-			const name = hit ?? derived;
-			if (!levels.has(name)) levels.set(name, "session");
-			connected.add(name);
+			if (!hit) {
+				// 配置里没这个 server（比如运行时才注册的），按会话级补一条
+				if (!levels.has(derived)) levels.set(derived, "session");
+				connected.add(derived);
+			}
 		}
 	} catch {
 		/* 忽略 */
@@ -344,13 +369,25 @@ function computePlugins(): string[] {
 	return [...byPath.values()].sort();
 }
 
-function refreshData(ctx: ExtensionContext): void {
+/**
+ * 只重算 MCP 那一栏（读 2 个 mcp.json + 扫一遍工具名，很便宜）。
+ *
+ * 为什么要单独拆出来：MCP 是**后台连**的 —— 实测从会话开始到工具出现要 ~10 秒
+ * （工具数 12 → 19）。以前只在本空闲时全量刷，一旦面板上有步骤在 `doing`（busy），
+ * 刷新就被跳过 → 面板永远冻在 ○。busy 时只跑这个便宜的就行。
+ */
+function refreshMcp(ctx: ExtensionContext): void {
 	lastCtx = ctx;
 	try {
 		cachedMcp = computeMcp(ctx.cwd, ctx.isProjectTrusted());
 	} catch {
 		cachedMcp = [];
 	}
+}
+
+function refreshData(ctx: ExtensionContext): void {
+	lastCtx = ctx;
+	refreshMcp(ctx);
 	try {
 		cachedPlugins = computePlugins();
 	} catch {
@@ -483,6 +520,10 @@ function startTimer(): void {
 		const busy = steps.some((s) => s.status === "doing") || !!activity;
 		if (busy) {
 			spinnerIdx++;
+			// 以前这里直接 return（只重画不刷新）—— 只要有个步骤卡在 doing，
+			// MCP 那栏就冻在会话开始那一刻（那时它还没连上）。所以 busy 时也刷，
+			// 只是走便宜的 refreshMcp（~1.5s 一次）。
+			if (tickCount % 5 === 0 && lastCtx) refreshMcp(lastCtx);
 			renderWidget();
 			return;
 		}
@@ -717,6 +758,9 @@ export function setupBoard(api: ExtensionAPI): void {
 		turnStart = Date.now();
 		turnCalls = 0;
 		sessionTurns++;
+		// 每轮开头也重算一次：保证「一轮里至少刷一次」
+		refreshMcp(ctx);
+		renderWidget();
 	});
 
 	api.on("turn_end", async (_event, ctx) => {
@@ -741,6 +785,14 @@ export function setupBoard(api: ExtensionAPI): void {
 	api.on("mcp_servers_change", async (_event, ctx) => {
 		lastCtx = ctx;
 		refreshData(ctx);
+		renderWidget();
+	});
+
+	// 工具跑完就刷 —— 刚跑完一个 mcp__ 工具 = 「这个 server 确实连上了」的最强证据
+	api.on("tool_execution_end", async (event, ctx) => {
+		lastCtx = ctx;
+		if (!String(event.toolName ?? "").startsWith("mcp__")) return;
+		refreshMcp(ctx);
 		renderWidget();
 	});
 

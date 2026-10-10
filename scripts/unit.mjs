@@ -212,6 +212,43 @@ writeFileSync(
 
 let allOk = true;
 
+// ---------- 套件 3：board（MCP 栏的表头 / 三态标记） ----------
+bundle("board.ts", "board.mjs");
+allOk =
+	runSuite("board：MCP 栏表头与连接标记", join(tmp, "board.mjs"), [
+		'ok("表头：没全连上时补 ●n", JSON.stringify(mcpHeaderParts(7, 2)) === JSON.stringify([" MCP 7", " ●2"]));',
+		'ok("表头：全连上就不补", JSON.stringify(mcpHeaderParts(3, 3)) === JSON.stringify([" MCP 3", ""]));',
+		'ok("表头：0 个也不补", JSON.stringify(mcpHeaderParts(0, 0)) === JSON.stringify([" MCP 0", ""]));',
+		'ok("表头：一个都没连上 → ●0", JSON.stringify(mcpHeaderParts(4, 0)) === JSON.stringify([" MCP 4", " ●0"]));',
+		'ok("标记：连上 = ●", mcpMark(true) === "●");',
+		'ok("标记：没见到工具 = ◌（不是 ○，避免读成挂了）", mcpMark(false) === "◌");',
+		'ok("标记：两个不一样", mcpMark(true) !== mcpMark(false));',
+		'// ---- computeMcp：“已连上”到底怎么判的 ----',
+		'const bdir = getAgentDir();',
+		'mkdirSync(bdir, { recursive: true });',
+		'writeFileSync(join(bdir, "mcp.json"), JSON.stringify({ mcpServers: { "my-db": { command: "x" }, "some-server": { command: "y" }, "my.db": { command: "z" } } }), "utf8");',
+		'const bproj = join(bdir, "proj");',
+		'mkdirSync(join(bproj, ".pi"), { recursive: true });',
+		'writeFileSync(join(bproj, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "proj-srv": { command: "p" } } }), "utf8");',
+		'// 只有 my-db 和 my.db 的工具出现了（= 这两个连上了）',
+		'pi = { getAllTools: () => [{ name: "read" }, { name: "mcp__my-db__query" }, { name: "mcp__my_db__exec" }], getMcpServers: () => [] };',
+		'const e1 = computeMcp(bproj, false);',
+		'const byName = (n) => e1.find((x) => x.name === n);',
+		'ok("computeMcp：用户级算「全局」", byName("my-db").level === "global");',
+		'ok("computeMcp：见到工具 = 已连上", byName("my-db").connected === true);',
+		'ok("computeMcp：没见到工具 = 未连（不是挂了）", byName("some-server").connected === false);',
+		'ok("computeMcp：工具名归一化后能对上（my.db → mcp__my_db__*）", byName("my.db").connected === true);',
+		'ok("computeMcp：归一化撞车时两个都标（不张冠李戴）", byName("my-db").connected === true && byName("my.db").connected === true);',
+		'ok("computeMcp：未信任 → 不读项目级", byName("proj-srv") === undefined);',
+		'const e2 = computeMcp(bproj, true);',
+		'ok("computeMcp：信任后读项目级", e2.find((x) => x.name === "proj-srv").level === "project");',
+		'ok("computeMcp：已连上的排前面", e2[0].connected === true);',
+		'pi = { getAllTools: () => [], getMcpServers: () => [{ name: "sess-srv" }] };',
+		'const e3 = computeMcp(bproj, false);',
+		'ok("computeMcp：getMcpServers 算「会话级」", e3.find((x) => x.name === "sess-srv").level === "session");',
+		'ok("computeMcp：总数变了 → 表头也跟着变", mcpHeaderParts(e3.length, 0)[1] === ` ●0`);',
+	], { PI_CODING_AGENT_DIR: join(tmp, "agent-board") }) && allOk;
+
 // ---------- 套件 1：delegate（锁 / 归属 / env / 信号量 / 模板） ----------
 bundle("delegate.ts", "delegate.mjs");
 allOk =
