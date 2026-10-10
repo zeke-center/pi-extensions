@@ -3,14 +3,15 @@
  *
  * 一个 pi 扩展：在编辑器上方常驻一个"左大右小"的双栏面板。
  *   左栏：任务进度（AI 通过 progress 工具打点；自动跟踪当前动作）
- *   右栏：会话信息（MCP 服务 / 插件 / 助理）
+ *   中栏：运行状态（现在 / 本轮 / 会话；够宽才出现）
+ *   右区：MCP / 插件 / 助理 **各自一栏**（窄屏自动叠回一栏）
  *
  * 命令:
  *   /board                 显示/隐藏整个面板
  *   /board on|off          显式开关
  *   /board clear           清空任务
  *   /board above|below     面板位置（输入框上方 / 下方）
- *   /board right           显示/隐藏右栏
+ *   /board right           显示/隐藏右区（MCP / 插件 / 助理）
  *
  * 注意: pi 的 widget 只支持 above/below 两个位置，"左右分栏"是本组件自己画出来的。
  */
@@ -24,8 +25,12 @@ import { loadTemplates } from "./delegate";
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_VISIBLE_STEPS = 8;
-const RIGHT_WIDTH = 26;
+const RIGHT_WIDTH = 26; // 右区（MCP/插件/助理）每栏宽度上限
+const RIGHT_MIN = 9; // 右区每栏宽度下限（再窄就没法看了）
+const LEFT_MIN = 28; // 左栏（任务进度）保底宽度
 const MID_WIDTH = 24;
+const MID_MIN_COLS = 110; // 面板总宽 ≥ 此值才显示中栏（运行状态）
+const NARROW_COLS = 88; // 总宽 < 此值：右区三栏退回「三段叠一栏」
 const MAX_LISTED = 6;
 
 type StepStatus = "pending" | "doing" | "done" | "blocked";
@@ -79,7 +84,7 @@ let mounted = false;
 
 let cachedMcp: McpEntry[] = [];
 let cachedPlugins: string[] = [];
-/** 右栏「助理」栏：能派的名字 + 不能派的个数 */
+/** 「助理」栏：能派的名字 + 不能派的个数 */
 let cachedAssistants: { usable: string[]; blocked: number } = { usable: [], blocked: 0 };
 
 // ======================= 小工具 =======================
@@ -179,44 +184,54 @@ function leftLines(theme: Theme): string[] {
 	return out;
 }
 
-// ======================= 右栏：MCP + 插件 =======================
-function rightLines(theme: Theme): string[] {
+// ======================= 右区三栏：MCP / 插件 / 助理 =======================
+// 以前这三段是叠在**同一个 26 宽的栏**里（最高能到 20 行，很挤）。
+// 现在拆成三个独立栏，渲染时并排 —— 高度降下来，代价是任务栏变窄。
+
+/** MCP 服务（区分 会话 / 项目 / 全局 三级）。w = 本栏实际宽度（用于截断名字） */
+function mcpLines(theme: Theme, w: number = RIGHT_WIDTH): string[] {
 	const t = theme;
 	const out: string[] = [];
-	const H = (s: string) => t.fg("accent", t.bold(s));
-
-	// --- MCP 服务 ---
-	out.push(H(`MCP ${cachedMcp.length}`));
+	out.push(t.fg("accent", t.bold(` MCP ${cachedMcp.length}`)));
 	if (cachedMcp.length === 0) {
 		out.push(` ${t.fg("dim", "（无）")}`);
 	} else {
 		for (const s of cachedMcp.slice(0, MAX_LISTED)) {
 			out.push(
-				` ${s.connected ? t.fg("success", "●") : t.fg("dim", "○")} ${t.fg("dim", LEVEL_TAG[s.level])} ${t.fg(s.connected ? "muted" : "dim", shortText(s.name, RIGHT_WIDTH - 8))}`,
+				` ${s.connected ? t.fg("success", "●") : t.fg("dim", "○")} ${t.fg("dim", LEVEL_TAG[s.level])} ${t.fg(s.connected ? "muted" : "dim", shortText(s.name, Math.max(6, w - 8)))}`,
 			);
 		}
 		if (cachedMcp.length > MAX_LISTED) out.push(` ${t.fg("dim", `+${cachedMcp.length - MAX_LISTED}`)}`);
 	}
+	return out;
+}
 
-	// --- 插件 ---
-	out.push(H(`插件 ${cachedPlugins.length}`));
+/** 已加载的 pi 插件 */
+function pluginLines(theme: Theme, w: number = RIGHT_WIDTH): string[] {
+	const t = theme;
+	const out: string[] = [];
+	out.push(t.fg("accent", t.bold(` 插件 ${cachedPlugins.length}`)));
 	if (cachedPlugins.length === 0) {
 		out.push(` ${t.fg("dim", "（无）")}`);
 	} else {
 		for (const n of cachedPlugins.slice(0, MAX_LISTED)) {
-			out.push(` ${t.fg("success", "●")} ${t.fg("muted", shortText(n, RIGHT_WIDTH - 4))}`);
+			out.push(` ${t.fg("success", "●")} ${t.fg("muted", shortText(n, Math.max(4, w - 4)))}`);
 		}
 		if (cachedPlugins.length > MAX_LISTED) out.push(` ${t.fg("dim", `+${cachedPlugins.length - MAX_LISTED}`)}`);
 	}
+	return out;
+}
 
-	// --- 助理（delegate 能派谁）---
-	// 只列可派发的：base 是底座、demo 是样板，派了会被拒，列出来只会干扰
-	out.push(H(`助理 ${cachedAssistants.usable.length}`));
+/** 助理（delegate 现在能派谁）：只列可派的，base/demo 只数个数 */
+function assistantLines(theme: Theme, w: number = RIGHT_WIDTH): string[] {
+	const t = theme;
+	const out: string[] = [];
+	out.push(t.fg("accent", t.bold(` 助理 ${cachedAssistants.usable.length}`)));
 	if (cachedAssistants.usable.length === 0) {
 		out.push(` ${t.fg("dim", "（无）")}`);
 	} else {
 		for (const n of cachedAssistants.usable.slice(0, MAX_LISTED)) {
-			out.push(` ${t.fg("success", "●")} ${t.fg("muted", shortText(n, RIGHT_WIDTH - 4))}`);
+			out.push(` ${t.fg("success", "●")} ${t.fg("muted", shortText(n, Math.max(4, w - 4)))}`);
 		}
 		if (cachedAssistants.usable.length > MAX_LISTED) {
 			out.push(` ${t.fg("dim", `+${cachedAssistants.usable.length - MAX_LISTED}`)}`);
@@ -225,7 +240,6 @@ function rightLines(theme: Theme): string[] {
 	if (cachedAssistants.blocked > 0) {
 		out.push(` ${t.fg("dim", `○ ${cachedAssistants.blocked} 个不可派`)}`);
 	}
-
 	return out;
 }
 
@@ -354,25 +368,47 @@ class BoardComponent implements Focusable {
 		private theme: Theme,
 		private getLeft: () => string[],
 		private getMid: () => string[],
-		private getRight: () => string[],
+		private getMcp: (w: number) => string[],
+		private getPlugins: (w: number) => string[],
+		private getAssistants: (w: number) => string[],
 	) {}
 
 	render(width: number): string[] {
 		const t = this.theme;
-		const left = this.getLeft();
-		const right = this.getRight();
-		const rw = showRight ? Math.min(RIGHT_WIDTH, Math.max(10, Math.floor(width * 0.32))) : 0;
-		// 窄屏自动降级：放不下三栏就不显示中栏
-		const mw = showMid && width >= 110 ? MID_WIDTH : 0;
-		const mid = mw ? this.getMid() : [];
-		const lw = Math.max(8, width - rw - mw - (mw ? 1 : 0) - (rw ? 1 : 0));
-		const n = Math.max(left.length, right.length, mid.length);
-		const out: string[] = [];
+		const sep = t.fg("borderMuted", "│");
 
+		// 中栏（运行状态）：只在够宽时出现
+		const mw = showMid && width >= MID_MIN_COLS ? MID_WIDTH : 0;
+		const mid = mw ? this.getMid() : [];
+
+		// 右区：先定栏数（每栏宽度要拿去截名字），再取内容
+		// 太窄就退回「三段叠一栏」
+		const nRight = showRight ? (width < NARROW_COLS ? 1 : 3) : 0;
+		const nCols = 1 + (mw ? 1 : 0) + nRight;
+		const seps = Math.max(0, nCols - 1);
+		// 列宽：左栏保底 LEFT_MIN，右区各栏平分剩下的（上限 RIGHT_WIDTH、下限 RIGHT_MIN）
+		const spaceForRight = width - seps - mw - LEFT_MIN;
+		let rw = 0;
+		if (nRight) {
+			rw = Math.min(RIGHT_WIDTH, Math.max(RIGHT_MIN, Math.floor(spaceForRight / nRight)));
+		}
+		const lw = Math.max(8, width - seps - mw - nRight * rw);
+
+		let rcols: string[][] = [];
+		if (nRight === 1) {
+			rcols = [[...this.getMcp(rw), ...this.getPlugins(rw), ...this.getAssistants(rw)]];
+		} else if (nRight === 3) {
+			rcols = [this.getMcp(rw), this.getPlugins(rw), this.getAssistants(rw)];
+		}
+
+		const left = this.getLeft();
+
+		const n = Math.max(left.length, mid.length, ...rcols.map((c) => c.length));
+		const out: string[] = [];
 		for (let i = 0; i < n; i++) {
 			let line = fit(left[i] ?? "", lw);
-			if (mw) line += t.fg("borderMuted", "│") + fit(mid[i] ?? "", mw);
-			if (rw) line += t.fg("borderMuted", "│") + fit(right[i] ?? "", rw);
+			if (mw) line += sep + fit(mid[i] ?? "", mw);
+			for (const col of rcols) line += sep + fit(col[i] ?? "", rw);
 			out.push(line);
 		}
 		return out;
@@ -411,8 +447,9 @@ function renderWidget(force = false): void {
 				theme,
 				() => leftLines(theme),
 				() => midLines(theme),
-				() => rightLines(theme),
-			);
+				(w) => mcpLines(theme, w),
+				(w) => pluginLines(theme, w),
+				(w) => assistantLines(theme, w),			);
 		},
 		{ placement },
 	);
@@ -744,7 +781,7 @@ export function setupBoard(api: ExtensionAPI): void {
 			message: {
 				customType: "task-board-hint",
 				content: `[任务进度看板]
-用户有一个常驻在输入框上方的进度看板（左栏任务进度，右栏会话信息）。
+用户有一个常驻在输入框上方的进度看板（左栏任务进度，右侧几栏会话信息）。
 
 ${planLine}
 
@@ -800,7 +837,7 @@ ${planLine}
 			if (a === "right") {
 				showRight = !showRight;
 				refresh();
-				ctx.ui.notify(showRight ? "右栏：显示" : "右栏：隐藏", "info");
+				ctx.ui.notify(showRight ? "右区（MCP/插件/助理）：显示" : "右区（MCP/插件/助理）：隐藏", "info");
 				return;
 			}
 
