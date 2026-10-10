@@ -795,7 +795,7 @@ mcp: my-db
    在 VM 上修好服务的依赖安装，能修好就一路把环境准备跑完
    ✗ execute_command  cd ~/my-service && pip install…  → Validation failed…
    ⚙ bash  git pull --rebase  已跑 5s
- ▛ 任务 记忆中心上 VM 并接入中心 · 8/8
+ ▛ 任务 部署服务到 VM · 8/8
  ✓ 1 修 VM 依赖安装      │ ⚙ 运行     │ 会话信息
 > 输入框（照常可用，面板在它上面、不盖住它）
 ```
