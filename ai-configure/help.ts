@@ -11,6 +11,7 @@ export const HELP_TEXT = `AI configure · 全部功能
 ▍命令
 /ai                       从 AI 配置中心拉连接（打开选择器）
   /ai status              看状态：密钥 / 会话级 / 项目级
+  /ai doctor              自检：模块健康度 / 台账 / MCP 连接 / 助理 / 看板（= /aidoctor）
   /ai token               设置 API 密钥
   /ai off                 关掉本会话拉进来的连接
   /ai project off         关掉项目级连接

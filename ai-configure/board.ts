@@ -43,7 +43,7 @@ interface Step {
 
 type McpLevel = "session" | "project" | "global";
 
-interface McpEntry {
+export interface McpEntry {
 	name: string;
 	connected: boolean;
 	/** session=扩展注册（/ai 拉进来的） · project=项目 .pi/mcp.json · global=用户级 mcp.json */
@@ -283,7 +283,7 @@ function readMcpNames(file: string): string[] {
 	}
 }
 
-function computeMcp(cwd: string, trusted: boolean): McpEntry[] {
+export function computeMcp(cwd: string, trusted: boolean): McpEntry[] {
 	const levels = new Map<string, McpLevel>();
 	const note = (name: string, lv: McpLevel) => {
 		const cur = levels.get(name);
@@ -592,6 +592,16 @@ const ProgressParams = Type.Object({
 });
 
 // ======================= 扩展入口 =======================
+/** doctor 用：看板只读快照 */
+export function boardSnapshot(): {
+	title: string;
+	steps: { text: string; status: StepStatus }[];
+	blocker?: string;
+	activity?: string;
+} {
+	return { title, steps: steps.map((s) => ({ ...s })), blocker, activity };
+}
+
 export function setupBoard(api: ExtensionAPI): void {
 	pi = api;
 
@@ -603,6 +613,12 @@ export function setupBoard(api: ExtensionAPI): void {
 			"更新用户的常驻任务进度看板。多步骤任务（>=3 步）开始时必须先用 action=plan 声明步骤，用户会看到并确认；" +
 			"每开始一步用 action=step status=doing，完成用 done；遇到卡点用 action=block；全部完成用 action=clear。" +
 			"步骤文案要简短（<=20 字），描述『做什么』而不是『怎么做』。",
+		promptSnippet: "更新任务看板（>=3 步先 plan 声明，再逐步 doing/done）",
+		promptGuidelines: [
+			"多步骤任务（>=3 步）开头先用 action=plan 声明步骤，等用户确认后再动手。",
+			"每开始一步就 action=step status=doing，完成立刻 status=done；别等到最后批量标。",
+			"遇到卡点用 action=block 说明；全部完成后 action=clear。",
+		],
 		parameters: ProgressParams,
 
 		async execute(

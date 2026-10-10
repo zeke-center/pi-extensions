@@ -17,19 +17,63 @@
  *   help.ts      /aihelp 与 /ai help 共用的文案
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setupConfig } from "./config";
 import { setupBoard } from "./board";
 import { setupPanel } from "./panel";
 import { setupDelegate } from "./delegate";
+import { setupDoctor } from "./doctor";
 import { showHelp } from "./help";
+import { healthLine, markFail, markOk } from "./health";
+
+/** 本包根目录（= ai-configure/ 的上一层），用来定位随包分发的 prompts/ 与 skills/ */
+const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 export default function (api: ExtensionAPI): void {
-	setupConfig(api);
-	// ⚠️ 必须在 setupBoard 之前：widget 按注册顺序从上往下排，
-	// 抢在看板前面注册，面板才稳定落在「看板正上方」
-	setupPanel(api);
-	setupBoard(api);
-	setupDelegate(api);
+	// ⚠️ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
+	// 顺序也重要：panel 必须在 board 之前（widget 按注册顺序从上往下排）。
+	const parts: Array<[string, (a: ExtensionAPI) => void]> = [
+		["config", setupConfig],
+		["panel", setupPanel],
+		["board", setupBoard],
+		["delegate", setupDelegate],
+		["doctor", setupDoctor],
+	];
+	for (const [name, setup] of parts) {
+		try {
+			setup(api);
+			markOk(name);
+		} catch (e) {
+			markFail(name, e);
+			console.error(`[ai-configure] 模块 ${name} 加载失败：`, e);
+		}
+	}
+
+	// 状态栏露出健康度：全好就不占地方，坏了几块一眼看见
+	api.on("session_start", (_event, ctx) => {
+		try {
+			const bad = healthLine();
+			ctx.ui.setStatus(
+				"ai-configure-health",
+				bad === "ok" ? undefined : ctx.ui.theme.fg("error", `⚠ ai-configure ${bad}`),
+			);
+		} catch {
+			/* 状态栏失败不影响功能 */
+		}
+	});
+
+	// 声明随包分发的 prompts/ 与 skills/（目录不存在就不声明，免得指向空目录）
+	// 这样不论用哪种方式加载本扩展，/ai-delegate 这类模板命令都能被发现。
+	api.on("resources_discover", () => {
+		const out: { promptPaths?: string[]; skillPaths?: string[] } = {};
+		const prompts = join(PKG_ROOT, "prompts");
+		if (existsSync(prompts)) out.promptPaths = [prompts];
+		const skills = join(PKG_ROOT, "skills");
+		if (existsSync(skills)) out.skillPaths = [skills];
+		return out;
+	});
 
 	// ---------- /aihelp（/ai help 的快捷别名）----------
 	api.registerCommand("aihelp", {

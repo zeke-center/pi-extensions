@@ -9,6 +9,9 @@
   "pi": {
     "extensions": [
       "./ai-configure/pi-extensions.ts"
+    ],
+    "prompts": [
+      "./prompts/*.md"
     ]
   },
   "peerDependencies": {

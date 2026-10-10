@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { showHelp } from "./help";
+import { showDoctor } from "./doctor";
 
 // 没有默认值：没设就报错提示，而不是偷偷指向某个人的服务器
 const API = (process.env.CENTER_API ?? "").replace(/\/+$/, "");
@@ -383,6 +384,12 @@ export function setupConfig(api: ExtensionAPI): void {
 			}
 
 			// ---------- /ai status ----------
+			// ---------- /ai doctor ----------
+			if (a === "doctor" || a === "diag") {
+				showDoctor(ctx);
+				return;
+			}
+
 			if (a === "status") {
 				const s = sessionNames.length ? sessionNames.join(", ") : "（无）";
 				const p = projectNames.length ? projectNames.join(", ") : "（无）";
