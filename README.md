@@ -1,16 +1,16 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（里面 8 个模块）**，外加一份助理模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（里面 10 个模块）**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
 ```
 
-装完就能用 `/board`、`/ai`、`/assistants`、`/resume-agent`、`/agent-resume-back`、`/agents`，以及一个能直接派的**通用助理**。
+装完就能用 `/board`、`/ai`（含 `/ai doctor` 自检）、`/assistants`、`/resume-agent`、`/agent-resume-back`、`/agents`、`/ai-delegate`，以及一个能直接派的**通用助理**。
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
-| `ai-configure/pi-extensions.ts` | 入口：装配下面七个模块 + 注册 `/aihelp` | — |
+| `ai-configure/pi-extensions.ts` | 入口：装配下面九个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
 | `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
 | `ai-configure/board.ts` | **任务进度看板** | `/board` + `progress` 工具 |
 | `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` + `delegate` 工具 |
@@ -19,12 +19,14 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 | `ai-configure/mcp-pool.ts` | MCP 候选池 + 影子目录（`mcp` 隔离的底层） | — |
 | `ai-configure/form.ts` | 弹窗面板（表单 + 多选，`new`/`edit` 共用） | — |
 | `ai-configure/help.ts` | 说明书文案（`/aihelp` 与 `/ai help` 共用一份）| — |
+| `ai-configure/health.ts` | 模块健康度登记（入口失败上报，doctor/状态栏读它） | — |
+| `ai-configure/doctor.ts` | **自检报告**（健康度 / 配置中心 / MCP 连接判定 / 助理 / 看板） | `/ai doctor` = `/aidoctor` |
 
 ```text
 pi-extensions/
-├── ai-configure/        # 一个插件，8 个模块
+├── ai-configure/        # 一个插件，10 个模块
 │   ├── package.json     # 内层清单：显式声明入口（显示名 = pi-extensions，不叫 index）
-│   ├── pi-extensions.ts # 入口：装配下面七个 + 注册 /aihelp
+│   ├── pi-extensions.ts # 入口：装配下面九个 + 注册 /aihelp；各模块独立 try/catch
 │   ├── config.ts        # 连接台账 → MCP（/ai）
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
@@ -32,7 +34,11 @@ pi-extensions/
 │   ├── panel.ts         # 子代理实时面板（/agents，看板正上方整宽）
 │   ├── mcp-pool.ts      # MCP 候选池 + 影子 agentDir
 │   ├── form.ts          # 弹窗面板（表单 + 多选）
+│   ├── health.ts        # 模块健康度登记（入口失败上报）
+│   ├── doctor.ts        # /ai doctor 自检
 │   └── help.ts          # /aihelp 的说明书文案
+├── prompts/             # 提示词模板（= /命令，按需展开）
+│   └── ai-delegate.md   #   派活纪律（配合 delegate 工具）
 ├── assistants/          # 助理模板（每个 .md 一个助理）
 │   ├── general.md       # ✅ 可派：通用助理（装完就能用它）
 │   ├── role-dev.md      # 底座：开发类公共规矩（base，不能直接派）
@@ -212,7 +218,7 @@ pi install git:gitee.com/zqk0815/pi-extensions         # 再从 Gitee 装
 > 别跟方式 A 混用：一个走 `pi install`、一个手动拷到 `extensions/`，混用会**各加载一份、命令注册两遍**。
 > 自己开发用 B，装给别人用 A。
 
-pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把扩展和助理模板同步过去：
+pi 默认从 `~/.pi/agent/extensions/` 加载扩展，从 `~/.pi/agent/prompts/` 自动发现提示词模板。用脚本把**扩展、助理模板、提示词模板**同步过去：
 
 ```powershell
 .\install.ps1
@@ -238,8 +244,11 @@ pi 扩展同步
   [最新] backend.md
   [最新] db.md
 
+  [新增] ai-delegate.md       ← prompts\
+
 扩展：5 个文件（1 更新, 2 新增, 2 未变）
 2 个助理模板：0 更新, 0 新增, 2 未变
+1 个提示词模板：1 新增, 0 更新, 0 未变
 → 在 pi 里执行 /reload 生效
 ```
 

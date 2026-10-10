@@ -16,6 +16,7 @@ const entry = join(root, "ai-configure", "pi-extensions.ts");
 const EXPECT = [
 	"ai",
 	"aihelp",
+	"aidoctor",
 	"board",
 	"assistants",
 	"agents",

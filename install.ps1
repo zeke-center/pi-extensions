@@ -8,6 +8,7 @@
           ① 根级单文件    xxx.ts
           ② 目录式插件    <名字>\ （入口优先取该目录 package.json 的 pi.extensions，否则 index.ts/index.js；整棵目录一起同步）
   源 2：本脚本所在目录下 assistants\*.md → <agentDir>\assistants
+  源 3：本脚本所在目录下 prompts\*.md → <agentDir>\prompts（pi 的约定提示词目录，自动发现；只增改、不删）
   <agentDir> = $env:PI_CODING_AGENT_DIR，默认 ~\.pi\agent
 
   用哈希比对，所以能看出「哪个文件真的变了」，不会白写一遍。
@@ -66,6 +67,7 @@ if ([string]::IsNullOrWhiteSpace($agentDir)) {
 }
 $destDir = Join-Path $agentDir 'extensions'
 $asstDestDir = Join-Path $agentDir 'assistants'
+$promptDestDir = Join-Path $agentDir 'prompts'
 # 记录「本脚本装过什么」。孤儿清理只删有据可查的 —— 不是本脚本装的一律不动。
 $statePath = Join-Path $agentDir '.installed-by-pi-extensions.json'
 # 历史遗留的根级单文件（后来并进了 ai-configure\ 目录），只做一次性迁移删除。
@@ -74,6 +76,7 @@ $legacyRootExts = @('ai-config.ts', 'task-board.ts')
 $srcDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($srcDir)) { $srcDir = (Get-Location).Path }
 $asstSrcDir = Join-Path $srcDir 'assistants'
+$promptSrcDir = Join-Path $srcDir 'prompts'
 
 Write-Host ''
 Write-Host 'pi 扩展同步' -ForegroundColor Cyan
@@ -123,9 +126,10 @@ foreach ($d in @(Get-ChildItem -Path $srcDir -Directory -ErrorAction SilentlyCon
 }
 
 $asstFiles = @(Get-ChildItem -Path (Join-Path $asstSrcDir '*.md') -File -ErrorAction SilentlyContinue)
+$promptFiles = @(Get-ChildItem -Path (Join-Path $promptSrcDir '*.md') -File -ErrorAction SilentlyContinue)
 
-if ($extItems.Count -eq 0 -and $asstFiles.Count -eq 0) {
-	Write-Host "错误：在 $srcDir 里没找到任何扩展（.ts 或含 index.ts 的目录），也没有 assistants\*.md。" -ForegroundColor Red
+if ($extItems.Count -eq 0 -and $asstFiles.Count -eq 0 -and $promptFiles.Count -eq 0) {
+	Write-Host "错误：在 $srcDir 里没找到任何扩展（.ts 或含 index.ts 的目录），也没有 assistants\*.md / prompts\*.md。" -ForegroundColor Red
 	exit 1
 }
 
@@ -133,7 +137,7 @@ $partial = $false
 if ($Name -and $Name.Count -gt 0) {
 	$partial = $true
 	$wanted = @($Name | ForEach-Object { $_.Trim() -replace '\.(ts|md)$', '' } | Where-Object { $_ })
-	$allKeys = @($extItems.Key | Sort-Object -Unique) + @($asstFiles.BaseName)
+	$allKeys = @($extItems.Key | Sort-Object -Unique) + @($asstFiles.BaseName) + @($promptFiles.BaseName)
 	$missing = @($wanted | Where-Object { $allKeys -notcontains $_ })
 	if ($missing.Count -gt 0) {
 		Write-Host ("错误：找不到这些名字：{0}" -f ($missing -join ', ')) -ForegroundColor Red
@@ -143,6 +147,7 @@ if ($Name -and $Name.Count -gt 0) {
 	$extItems = @($extItems | Where-Object { $wanted -contains $_.Key })
 	$pluginNames = @($pluginNames | Where-Object { $wanted -contains $_ })
 	$asstFiles = @($asstFiles | Where-Object { $wanted -contains $_.BaseName })
+	$promptFiles = @($promptFiles | Where-Object { $wanted -contains $_.BaseName })
 }
 
 # ---------- 2b. 双通道护栅：别和「pi 包」通道各装一份 ----------
@@ -336,6 +341,15 @@ if ($asstFiles.Count -gt 0) {
 	$asstResult = Sync-Tree -Items $asstItems -Dest $asstDestDir
 }
 
+$promptResult = $null
+if ($promptFiles.Count -gt 0) {
+	Write-Host ''
+	$promptItems = @($promptFiles | ForEach-Object {
+		[pscustomobject]@{ Rel = $_.Name; Src = $_.FullName; Key = $_.BaseName; Stamp = $_.LastWriteTime }
+	})
+	$promptResult = Sync-Tree -Items $promptItems -Dest $promptDestDir
+}
+
 # ---------- 4. 汇总 ----------
 Write-Host ''
 $changed = 0
@@ -348,6 +362,10 @@ if ($extResult -and $extResult.Total -gt 0) {
 if ($asstResult -and $asstResult.Total -gt 0) {
 	$changed += $asstResult.Updated + $asstResult.Added
 	Write-Host ("{0} 个助理模板：{1} 更新, {2} 新增, {3} 未变" -f $asstResult.Total, $asstResult.Updated, $asstResult.Added, $asstResult.Same)
+}
+if ($promptResult -and $promptResult.Total -gt 0) {
+	$changed += $promptResult.Updated + $promptResult.Added
+	Write-Host ("{0} 个提示词模板：{1} 更新, {2} 新增, {3} 未变" -f $promptResult.Total, $promptResult.Updated, $promptResult.Added, $promptResult.Same)
 }
 
 if ($List) {
