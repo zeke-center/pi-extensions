@@ -23,13 +23,15 @@ export const HELP_TEXT = `AI configure · 全部功能
   /board right | mid      显示 / 隐藏 右栏 / 中栏
 /assistants               助理模板
   /assistants show <名>   展开全部字段 + 继承链 + 提示词正文
-  /assistants edit <名>   弹面板改：MCP / 超时 / AGENTS.md / 存哪儿 / 正文
+  /assistants edit <名>   弹面板改：底座 / MCP / 超时 / AGENTS.md / 存哪儿 / 正文
   /assistants mcp  <名>   同上，只是光标直接落在 MCP 那行
-  /assistants new  <名>   弹同一个面板新建
+  /assistants new  <名> [底座]   弹同一个面板新建；给了底座就自动 extends 它
   /assistants open <名>   用系统默认程序打开那个 .md
   （面板：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消）
 
-  （base / demo 的模板不能直接派；能派的会列在 delegate 工具描述里）
+  （底座（base）**只读 + 只能被 extends + 不能直接派** —— 要定制就
+    /assistants new <你的名字> <底座key> ；demo 的样板不能派，只当字段写法参考；
+    能派的会列在 delegate 工具描述里）
 
 /agents                   子代理实时面板（派活时自动出现，就在任务看板正上方）
   直接敲                  开（并解开「你手动关过」的封印）

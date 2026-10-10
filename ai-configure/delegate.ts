@@ -1134,6 +1134,23 @@ function mcpItems(pool: McpPool, current: string[]): PickItem[] {
 }
 
 /** 面板上的行 —— new 和 edit 共用同一套 */
+/** 「基础模板」下拉里的「不选」项 */
+const BASE_NONE = "（不用）";
+
+/** 可当「基础模板」的底座：base:true 的模板 */
+function availableBases(cwd: string): Template[] {
+	try {
+		return loadTemplates(cwd).filter((t) => t.base === true);
+	} catch {
+		return [];
+	}
+}
+
+/** 「开发助理（底座）」→「开发助理」；只用于下拉里的提示 */
+function shortBaseName(name: string): string {
+	return name.replace(/[（(]\s*底座\s*[)）]\s*$/, "").replace(/底座\s*$/, "").trim() || name;
+}
+
 function buildFields(o: {
 	key: string;
 	name: string;
@@ -1147,7 +1164,18 @@ function buildFields(o: {
 	scope: string;
 	bodyChars: number;
 	keyEditable: boolean;
+	/** 当前挂的底座 key（"" = 没挂） */
+	extendsKey: string;
+	/** 能选的底座 */
+	bases: { key: string; name: string }[];
 }): FormField[] {
+	const baseKeys = o.bases.map((b) => b.key);
+	// 手写的非底座 extends 也留在选项里，不然一编辑就被悄悄改掉
+	const extendsOptions = [
+		BASE_NONE,
+		...(o.extendsKey && !baseKeys.includes(o.extendsKey) ? [o.extendsKey] : []),
+		...baseKeys,
+	];
 	return [
 		{
 			key: "key",
@@ -1164,6 +1192,16 @@ function buildFields(o: {
 			value: o.desc,
 			kind: "text",
 			hint: "(写「什么时候用我」，主 pi 靠它决定派谁)",
+		},
+		{
+			key: "extends",
+			label: "基础模板",
+			value: o.extendsKey || BASE_NONE,
+			kind: "enum",
+			options: extendsOptions,
+			hint: o.bases.length
+				? `(底座只读；选了就继承它的提示词和默认值) ${o.bases.map((b) => `${b.key}＝${shortBaseName(b.name)}`).join(" · ")}`
+				: "(这个包里没有底座，只能从空白开始)",
 		},
 		{
 			key: "cwd",
@@ -1219,6 +1257,14 @@ async function commitForm(
 		ctx.ui.notify("「文件名」不能是空的，什么都没存。", "warning");
 		return;
 	}
+	// 兜底：底座只读（正常路径已被 /assistants edit 拦住，这里防绕过）
+	if (o.original?.base === true) {
+		ctx.ui.notify(
+			`「${o.original.key}」是底座（只读），不能保存。\n定制：/assistants new <你的名字> ${o.original.key}`,
+			"warning",
+		);
+		return;
+	}
 	const timeout = (v.timeout ?? "").trim();
 	if (timeout && !parseDuration(timeout)) {
 		ctx.ui.notify(`看不懂的超时「${timeout}」（写成 10m / 90s / 1.5h），什么都没存。`, "warning");
@@ -1251,6 +1297,7 @@ async function commitForm(
 		agents_md: (v.agents_md ?? "是") === "是" ? undefined : "false",
 		mcp: (v.mcp ?? "").trim(),
 		demo: (v.dispatchable ?? "是") === "是" ? undefined : "true",
+		extends: (v.extends ?? "").trim() && (v.extends ?? "").trim() !== BASE_NONE ? (v.extends ?? "").trim() : undefined,
 	};
 
 	// MCP 名字在三个来源里都找不到 → 问一声。
@@ -1310,10 +1357,17 @@ function listAssistants(ctx: ExtensionContext, cwd: string): void {
 		`    ${t.desc}\n` +
 		`    cwd: ${t.cwd}　mcp: ${t.mcp.length ? t.mcp.join(", ") : "—"}　timeout: ${t.timeoutMs ? `${Math.round(t.timeoutMs / 60000)}m` : "默认"}` +
 		(t.extends ? `\n    extends: ${t.extends}` : "");
+	const fmtBase = (t: Template): string =>
+		fmt(t) +
+		`\n    → 基于它建：/assistants new <你的名字> ${t.key}　看原文：/assistants show ${t.key}`;
 	const out = usable.length ? [`可派发的助理（${usable.length}）`, ...usable.map(fmt)] : ["可派发的助理（0）—— 现在没有能派的"];
-	if (bases.length) out.push("", `基础模板（${bases.length}，只给 extends 用，不能直接派）`, ...bases.map(fmt));
+	if (bases.length) out.push("", `基础模板 / 底座（${bases.length}，只读 + 只能 extends，不能直接派）`, ...bases.map(fmtBase));
 	if (demos.length) out.push("", `示例模板（${demos.length}，给你看字段怎么写法的，不能派）`, ...demos.map(fmt));
-	out.push("", "细节：/assistants show <key>　配置：/assistants edit <key>　新建：/assistants new <key>");
+	out.push(
+		"",
+		"细节：/assistants show <key>　配置：/assistants edit <key>　新建：/assistants new <key>　" +
+			"从底座建：/assistants new <key> <底座key>",
+	);
 	ctx.ui.notify(out.join("\n"), "info");
 }
 
@@ -1339,6 +1393,17 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, focusKey?: string): Promise<void> {
 	const tpl = findTemplate(cwd, what);
 	if (!tpl) return notFound(ctx, cwd, what);
+	// 底座是「公共父类」：被多个助理 extends，改坏 = 一起坏，而且很难发现。所以只读。
+	if (tpl.base === true) {
+		ctx.ui.notify(
+			`「${tpl.key}」是底座（只读），不能改。\n\n` +
+				`它由扩展提供，升级/重装会被还原 —— 改了也白改。\n` +
+				`想定制：/assistants new <你的名字> ${tpl.key}   ← 会自动 extends 它\n` +
+				`只想看它写了什么：/assistants show ${tpl.key}`,
+			"warning",
+		);
+		return;
+	}
 	if (!ctx.hasUI) {
 		ctx.ui.notify("这个命令需要交互界面（TUI）。", "warning");
 		return;
@@ -1358,6 +1423,8 @@ async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, f
 		scope: isProjectFile(tpl.file, cwd) ? SCOPE_PROJECT : SCOPE_GLOBAL,
 		bodyChars: tpl.body.length,
 		keyEditable: false,
+		extendsKey: tpl.extends ?? "",
+		bases: availableBases(cwd).map((b) => ({ key: b.key, name: b.name })),
 	});
 	const r = await showForm(ctx, `${tpl.name} · 配置`, fields, mcpItems(pool, tpl.mcp), focusKey);
 	if (!r) {
@@ -1367,7 +1434,7 @@ async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, f
 	await commitForm(ctx, { form: r, cwd, original: tpl });
 }
 
-async function newAssistant(ctx: ExtensionContext, cwd: string, key: string): Promise<void> {
+async function newAssistant(ctx: ExtensionContext, cwd: string, key: string, baseKey?: string): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("这个命令需要交互界面（TUI）。", "warning");
 		return;
@@ -1376,6 +1443,11 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string): Pr
 		ctx.ui.notify(`已经有个全局模板叫「${key}」了。\n想改它：/assistants edit ${key}`, "warning");
 		return;
 	}
+	const bases = availableBases(cwd);
+	// 底座只认存在的；写错了就当没写（表单里也能看到有哪些）
+	const wantBase = (baseKey ?? "").trim();
+	const extendsKey = wantBase && bases.some((b) => b.key === wantBase) ? wantBase : "";
+	const baseTpl = extendsKey ? bases.find((b) => b.key === extendsKey) : undefined;
 	const pool = loadMcpPool(cwd);
 	const fields = buildFields({
 		key,
@@ -1389,8 +1461,16 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string): Pr
 		scope: SCOPE_GLOBAL,
 		bodyChars: 0,
 		keyEditable: true,
+		extendsKey,
+		bases: bases.map((b) => ({ key: b.key, name: b.name })),
 	});
-	const r = await showForm(ctx, "助理模板 · 新建", fields, mcpItems(pool, []), "key");
+	const r = await showForm(
+		ctx,
+		extendsKey ? `助理模板 · 新建（基于 ${extendsKey}）` : "助理模板 · 新建",
+		fields,
+		mcpItems(pool, baseTpl?.mcp ?? []),
+		"key",
+	);
 	if (!r) {
 		ctx.ui.notify("已取消，什么都没建。", "info");
 		return;
@@ -1400,6 +1480,14 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string): Pr
 function openAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 	const tpl = findTemplate(cwd, what);
 	if (!tpl) return notFound(ctx, cwd, what);
+	// 底座放行（有时你就想看看原文），但先说清楚它是只读的
+	if (tpl.base === true) {
+		ctx.ui.notify(
+			`「${tpl.key}」是底座（只读）：当参考看就行，改了下次同步会被还原。\n` +
+				`要定制请：/assistants new <你的名字> ${tpl.key}`,
+			"info",
+		);
+	}
 	try {
 		const opt = { detached: true, stdio: "ignore" as const, windowsHide: true };
 		if (process.platform === "win32") spawn("cmd", ["/c", "start", "", tpl.file], opt).unref();
@@ -2160,7 +2248,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 			if (sub === "show") return showAssistant(ctx, cwd, rest);
 			if (sub === "edit") return editAssistant(ctx, cwd, rest);
 			if (sub === "mcp") return editAssistant(ctx, cwd, rest, "mcp");
-			if (sub === "new") return newAssistant(ctx, cwd, rest);
+			if (sub === "new") return newAssistant(ctx, cwd, parts[1] ?? "", parts[2]);
 			if (sub === "open") return openAssistant(ctx, cwd, rest);
 			return listAssistants(ctx, cwd);
 		},

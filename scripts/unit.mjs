@@ -198,6 +198,17 @@ writeFileSync(
 	"utf8",
 );
 writeFileSync(join(asstDir, "plain.md"), ["---", "name: 普通", "desc: x", "---", "body", ""].join("\n"), "utf8");
+// 底座 + 基于它派生的子模板（测 extends 继承 + 底座只读）
+writeFileSync(
+	join(asstDir, "role-ops.md"),
+	["---", "name: 查询运维助理（底座）", "desc: 只读底座", "base: true", "timeout: 5m", "---", "只读。给证据。", ""].join("\n"),
+	"utf8",
+);
+writeFileSync(
+	join(asstDir, "kid.md"),
+	["---", "name: 小子", "extends: role-ops", "---", "我是子模板。", ""].join("\n"),
+	"utf8",
+);
 
 let allOk = true;
 
@@ -269,6 +280,31 @@ allOk =
 			'ok("模板：解析 isolate_env", ch.isolateEnv === true);',
 			'ok("模板：解析 env_passthrough", JSON.stringify(ch.envPassthrough) === JSON.stringify(["ANTHROPIC_API_KEY"]));',
 			'ok("模板：没写 tools 的模板是 undefined", tpls.find((t) => t.key === "plain").tools === undefined);',
+			'// ---- 底座（base）：只读 + 不可派 + 能从它派生 ----',
+			'const __zb = tpls.find((t) => t.key === "role-ops");',
+			'ok("底座：base 标记为 true", __zb.base === true);',
+			'ok("底座：不在可派清单里", tpls.filter((t) => t.base !== true && t.demo !== true).every((t) => t.key !== "role-ops"));',
+			'const __zb0 = availableBases(process.env.TPROJ);',
+			'ok("底座：availableBases 只返回 base:true", __zb0.length === 1 && __zb0[0].key === "role-ops");',
+			'ok("底座：shortBaseName 去掉（底座）", shortBaseName("查询运维助理（底座）") === "查询运维助理");',
+			'const __zkid = tpls.find((t) => t.key === "kid");',
+			'ok("子模板：extends 保留 key", __zkid.extends === "role-ops");',
+			'ok("子模板：继承底座正文", __zkid.body.includes("只读。给证据。"));',
+			'ok("子模板：继承底座 timeout", __zkid.timeoutMs === 5 * 60 * 1000);',
+			'const __zargs = { key: "k", name: "n", desc: "", cwd: process.env.TPROJ, model: "", timeout: "", agentsMd: true, dispatchable: true, scope: SCOPE_GLOBAL, bodyChars: 0, keyEditable: true, bases: __zb0.map((b) => ({ key: b.key, name: b.name })) };',
+			'const __zef = buildFields({ ...__zargs, extendsKey: "" }).find((f) => f.key === "extends");',
+			'ok("表单：有「基础模板」字段且是 enum", !!__zef && __zef.kind === "enum");',
+			'ok("表单：选项含底座 + 不用", __zef.options.includes("role-ops") && __zef.options.includes(BASE_NONE));',
+			'ok("表单：hint 列出底座", __zef.hint.includes("role-ops"));',
+			'const __zef2 = buildFields({ ...__zargs, extendsKey: "role-ops" }).find((f) => f.key === "extends");',
+			'ok("表单：已挂底座时回填 key", __zef2.value === "role-ops");',
+			'const __zef3 = buildFields({ ...__zargs, extendsKey: "hand-written" }).find((f) => f.key === "extends");',
+			'ok("表单：手写的非底座 extends 不被吃掉", __zef3.options.includes("hand-written") && __zef3.value === "hand-written");',
+			'// 底座只读：commitForm 必须拒（防绕过 /assistants edit）',
+			'const __znotes = [];',
+			'await commitForm({ ui: { notify: (m) => __znotes.push(String(m)) } }, { form: { values: { key: "hacked" } }, cwd: process.env.TPROJ, original: { base: true, key: "role-ops" } });',
+			'ok("底座：commitForm 拒绝保存", __znotes.length === 1 && __znotes[0].includes("底座"));',
+			'ok("底座：没写出文件", !existsSync(join(globalAssistantDir(), "hacked.md")));',
 			'// ---- 后台回投：发失败不能假成功、退避、成功才标 delivered ----',
 			'const bgt = { id: "dtest-1", key: "k", name: "n", task: "t", sessionId: "s", startedAt: Date.now(), status: "done", resultText: "R", delivered: false };',
 			"writeBgTask(bgt);",
