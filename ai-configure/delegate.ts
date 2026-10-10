@@ -63,7 +63,7 @@ interface Template {
 	 * 可以由 extends 从父模板继承；最终必须非空。
 	 */
 	cwd: string;
-	/** 模型（frontmatter.model），空则不指定、继承默认 */
+	/** 模型（frontmatter.model）；空 = 继承主会话当前模型 */
 	model?: string;
 	/**
 	 * 要挂的 MCP 名字（逗号分隔）。**与 cwd 无关** —— 这是 v2 的核心改动。
@@ -612,6 +612,8 @@ interface RunOptions {
 	signal?: AbortSignal;
 	names: Names;
 	resumed: boolean;
+	/** 主会话当前模型（`provider/id`）。模板没写 `model` 时用它 —— 「默认继承主会话」 */
+	mainModel?: string;
 	/** 影子 agentDir（只含本助理该有的 mcp.json） */
 	shadowDir: string;
 	/** 助理专属会话目录（不在 sessions/ 下，/resume 看不见） */
@@ -702,7 +704,10 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	} else {
 		args.push("--session-id", opt.names.id, "--name", opt.names.display);
 	}
-	if (tpl.model) args.push("--model", tpl.model);
+	// 模型：模板写了就用模板的；没写 → 继承主会话当前模型（provider/id）。
+	// 不继承的话 pi 会走自己的默认解析（settings.defaultModel → 内置默认 → models.json 第一个），未必是你在用的。
+	const modelArg = tpl.model || opt.mainModel;
+	if (modelArg) args.push("--model", modelArg);
 	const body = [tpl.body, deadlineRule(Math.round(opt.timeoutMs / 1000), opt.resumed)]
 		.filter(Boolean)
 		.join("\n\n");
@@ -1210,7 +1215,7 @@ function buildFields(o: {
 			kind: "text",
 			hint: "(在哪儿干活：文件读写 / 项目 AGENTS.md)",
 		},
-		{ key: "model", label: "模型", value: o.model, kind: "text", hint: "(留空 = 继承默认)" },
+		{ key: "model", label: "模型", value: o.model, kind: "text", hint: "(留空 = 继承主会话)" },
 		{ key: "timeout", label: "超时", value: o.timeout, kind: "text", hint: "(10m / 90s / 1.5h，留空 = 5 分钟)" },
 		{
 			key: "agents_md",
@@ -1380,7 +1385,7 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 		`描述    ${tpl.desc}`,
 		`目录    ${tpl.cwd}`,
 		`MCP     ${tpl.mcp.length ? tpl.mcp.join(", ") : "(不连)"}${tpl.mcpExposure ? `　exposure: ${tpl.mcpExposure}` : ""}`,
-		`模型    ${tpl.model ?? "(继承默认)"}`,
+		`模型    ${tpl.model ?? "(继承主会话)"}`,
 		`超时    ${tpl.timeoutMs ? `${tpl.timeoutMs} ms` : "(默认 5 分钟)"}`,
 		`AGENTS  ${tpl.agentsMd === false ? "不带全局 AGENTS.md" : "带"}`,
 		`继承    ${tpl.extends ?? "(无)"}`,
@@ -2152,6 +2157,9 @@ export function setupDelegate(api: ExtensionAPI): void {
 			beginRun();
 			ensureAgentPanel(ctx);
 
+			// 主会话当前模型：给助理做「默认继承」（模板里的 model 仍优先）
+			const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+
 			let results: RunResult[];
 			if (wait) {
 				try {
@@ -2164,6 +2172,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 								signal,
 								names,
 								resumed: Boolean(resumeId),
+								mainModel,
 								shadowDir: shadow.dir,
 								sessionDir: ensureAssistantSessionDir(tpl.key),
 							});
@@ -2195,6 +2204,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 						// 不传 signal：不随本轮 turn 结束被 abort
 						names,
 						resumed: Boolean(resumeId),
+						mainModel,
 						shadowDir: shadow.dir,
 						sessionDir: ensureAssistantSessionDir(tpl.key),
 						onSettle: (r) => {
