@@ -2094,10 +2094,15 @@ async function pollBgTasks(): Promise<void> {
 	}
 }
 
-/** 未投递出去的条数（面板提示用） */
+/** 未投递出去的条数（面板提示用）。
+ *
+ * ⚠️ 只算**本对话**的：别的会话遗留的小票不该在你这儿刷警告 ——
+ * 而且 /agents bg redeliver 本来就只投自己会话的，口径必须一致，
+ * 否则会出现「提示有 1 条没回投，点了却说没有可重投的」。
+ */
 export function undeliveredBgCount(): number {
 	try {
-		return listBgTasks().filter((t) => t.status !== "running" && !t.delivered).length;
+		return listBgTasks().filter((t) => t.status !== "running" && !t.delivered && isOwnBgTask(t)).length;
 	} catch {
 		return 0;
 	}
@@ -2141,6 +2146,37 @@ function reapStaleBgTasks(): void {
 			delivered: false,
 		});
 	}
+}
+
+/** 投递成功的记账小票保留多久（超过就回收）。没投成功的一律不碰 —— 你还能 /agents bg redeliver。 */
+const BG_KEEP_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 回收「已投递成功 + 超过 24 小时」的记账小票。
+ *
+ * 为什么需要：投递成功后没人删这些 .bg/*.json，派得多了会堆几百个小文件。
+ *
+ * ⚠️ 只删 `.bg/<id>.json`（投递记账，内容就是任务摘要 + 已经投进主对话的卡片文字），
+ * **绝不碰 `assistant-sessions/<助理>/*.jsonl`（助理会话）** —— 那是完整历史，/resume-agent 和 resume 续跑都靠它。
+ * 所以这里连路径都只用 `bgFile()` 拼，不去动 assistant-sessions 下的任何会话目录。
+ *
+ * @returns 删掉几个
+ */
+export function reapDeliveredBgTasks(now: number = Date.now()): number {
+	let n = 0;
+	for (const t of listBgTasks()) {
+		if (t.delivered !== true) continue; // 没投成功的留着（还能重投）
+		const done = t.finishedAt ?? t.startedAt;
+		if (now - done < BG_KEEP_MS) continue; // 还没到期
+		try {
+			rmSync(bgFile(t.id), { force: true });
+			rmSync(`${bgFile(t.id)}.claim`, { force: true }); // 顺手清可能残留的「认领」锁
+			n++;
+		} catch {
+			/* 删不掉就算了，下次启动再试 */
+		}
+	}
+	return n;
 }
 
 // ======================= 会话运行锁（防同会话并发运行）=======================
@@ -2316,6 +2352,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 	api.on("session_start", async (_event, ctx) => {
 		rememberCurrentSession(ctx); // 记下「我是哪个会话」，后台结果靠它认领
 		reapStaleBgTasks(); // 先清理上个会话留下的孤儿任务
+		reapDeliveredBgTasks(); // 再回收「已投递成功且超 24h」的记账小票（不碰会话文件）
 		reapStaleLocks(); // 再回收 pid 已死/超时的会话运行锁
 		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 24h 的删）
 		if (bgTimer) clearInterval(bgTimer);
@@ -2671,7 +2708,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 		description:
 			"子代理实时面板：直接敲=开；off 关；detail 展开思考；text 打印快照；" +
 			"float 改成右侧浮层，widget 改回看板上方；" +
-			"bg 看后台任务状态（失败原因），bg redeliver 把没投回主会话的立刻重投；" +
+			"bg 看后台任务状态（只列本对话，加 all 看全部），bg redeliver 把没投回主会话的立刻重投；" +
 			"linger <时长> 改跑完的子代理在面板上呆多久（默认 45s，0=立刻消失）",
 		handler: async (args: string, ctx) => {
 			const sub = (args ?? "").trim().toLowerCase();
@@ -2730,9 +2767,19 @@ export function setupDelegate(api: ExtensionAPI): void {
 			}
 			if (sub === "bg" || sub.startsWith("bg ")) {
 				const action = sub.slice(2).trim();
-				const all = listBgTasks().sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+				const every = listBgTasks().sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+				const mine = every.filter((t) => isOwnBgTask(t));
+				// 默认只列**本对话**的：别的会话的历史小票跟你没关系，不该在这里刷存在感。
+				// /agents bg all 才看全部（那些仍标「⚠别的会话」）。
+				const showAll = action === "all";
+				const all = showAll ? every : mine;
 				if (!all.length) {
-					ctx.ui.notify("没有后台任务记录。", "info");
+					ctx.ui.notify(
+						!showAll && every.length > 0
+							? `本对话没有后台任务记录。（别处还有 ${every.length} 条历史记录，要看就 /agents bg all）`
+							: "本对话没有后台任务记录。",
+						"info",
+					);
 					return;
 				}
 				if (action === "redeliver" || action === "retry") {
@@ -2764,7 +2811,9 @@ export function setupDelegate(api: ExtensionAPI): void {
 						return `${fmtClock(t.startedAt)} ${t.key} · ${st} · 试${t.attempts ?? 0}次${mine}${err}`;
 				});
 				ctx.ui.notify(
-					`后台任务 ${all.length} 条（最多列 20）：\n${lines.join("\n")}\n\n重投未投递的：/agents bg redeliver`,
+					`后台任务 ${all.length} 条${showAll ? "（全部，含别的会话）" : "（本对话）"}（最多列 20）：\n${lines.join("\n")}\n\n` +
+						(showAll ? "只看本对话：/agents bg" : "看全部： /agents bg all") +
+						"　重投未投递的：/agents bg redeliver",
 					"info",
 				);
 				return;
