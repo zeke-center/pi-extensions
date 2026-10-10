@@ -222,10 +222,10 @@ pi 默认从 `~/.pi/agent/extensions/` 加载扩展。用脚本把扩展和助�
 
 ```text
 pi 扩展同步
-  源    F:\AI\My_Center\pi-extensions
-  目标  C:\Users\zeke\.pi\agent
+  源    D:\code\pi-extensions
+  目标  C:\Users\you\.pi\agent
 
-  [新增] ai-configure\index.ts
+  [新增] ai-configure\pi-extensions.ts
   [新增] ai-configure\config.ts
   [更新] ai-configure\board.ts  （2026-10-03 20:04 → 2026-10-03 20:17）
   [最新] ai-configure\delegate.ts
@@ -271,7 +271,7 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 ```json
 {
-  "extensions": ["F:/AI/My_Center/pi-extensions"]
+  "extensions": ["D:/code/pi-extensions"]
 }
 ```
 
@@ -491,10 +491,10 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 会话名  修复登录bug-数据库助理1
 会话ID  db-20261003-195122-1
 代理    数据库助理（db · deepseek-v4-flash）
-目录    F:/AI/My_Center
+目录    D:/code/my-project
 任务    查 records 表有多少行
 耗时    6s
-找回    /resume-agent 里挑，或 pi --session "C:\...\assistant-sessions\db\<时间戳>_db-20261003-195122-1.jsonl"
+找回    /resume-agent 里挑，或 pi --session "<agentDir>\assistant-sessions\db\<时间戳>_db-20261003-195122-1.jsonl"
 ```
 
 ### 超时与续期
@@ -566,7 +566,7 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 │ ▸ 文件名           db                 (去掉 .md —— 派它时就用这个名字)   │
 │   显示名           数据库助理          (中文也行)                         │
 │   描述             连数据库查数据…     (写「什么时候用我」，主 pi 靠它决定派谁) │
-│   工作目录         F:/AI/My_Center     (在哪儿干活：文件读写 / 项目 AGENTS.md) │
+│   工作目录         D:/code/my-project  (在哪儿干活：文件读写 / 项目 AGENTS.md) │
 │   模型             (空)               (留空 = 继承默认)                    │
 │   超时             5m                 (10m / 90s / 1.5h，留空 = 5 分钟)  │
 │   带 AGENTS.md     是                 (关掉每次省约 1500 token)           │
