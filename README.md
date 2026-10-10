@@ -41,8 +41,8 @@ pi-extensions/
 │   ├── role-review.md   # 底座：审查/复核类公共规矩（base，不能直接派）
 │   ├── frontend.md      # 示例：前端助理（extends role-dev，demo）
 │   ├── backend.md       # 示例：后端助理（extends role-dev，demo）
-│   ├── db.md            # 示例：数据库助理（extends role-ops，demo，挂 center-pg）
-│   └── server.md        # 示例：服务器助理（extends role-ops，demo，挂 nas-ubuntu24）
+│   ├── db.md            # 示例：数据库助理（extends role-ops，demo，挂 my-db）
+│   └── server.md        # 示例：服务器助理（extends role-ops，demo，挂 my-server）
 ├── install.ps1          # 同步脚本：源 → ~/.pi/agent/（Windows，只删自己装过的）
 ├── scripts/             # 无头测试（CI 也跑这两个）
 │   ├── smoke.mjs        #   让 pi 真加载扩展、断言命令都注册上
@@ -377,9 +377,9 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 ```text
 ▛ 任务 看板拆成四栏 · 1/5   │ MCP 7                 │ 插件 3                │ 助理 3
-  ✓ 1 拆右栏为三个独立栏    │ ● 全局 center-pg      │ ● ai-configure        │ ● 个人中心数据库助理
-  ⠋ 2 渲染改成多栏          │ ● 项目 nas-ubuntu24   │ ● pi-mcp-adapter      │ ● 个人中心服务器助理
-     ▸ 读取文件 board.ts    │ ○ 全局 memory-center… │ ● memory-center       │ ● 通用助理
+  ✓ 1 拆右栏为三个独立栏    │ ● 全局 my-db          │ ● ai-configure        │ ● 业务数据库助理
+  ⠋ 2 渲染改成多栏          │ ● 项目 my-server      │ ● pi-mcp-adapter      │ ● 业务服务器助理
+     ▸ 读取文件 board.ts    │ ○ 全局 some-server…   │ ● some-plugin         │ ● 通用助理
   ○ 3 无头预览各宽度        │ ● 会话 dev-radius     │                       │ ○ 6 个不可派
 ```
 
@@ -389,8 +389,8 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 ```
 助理 2
- ● 个人中心数据库助理
- ● 个人中心服务器助理
+ ● 业务数据库助理
+ ● 业务服务器助理
  ○ 6 个不可派
 ```
 
@@ -540,7 +540,7 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `cwd` | | **在哪儿干活**。文件读写、相对路径、项目 `AGENTS.md` 都看它。**省略 = 跟随主进程当前所在的项目目录**（所以模板能跨机器复用，别在里面写死绝对路径） |
 | `name` | | 显示名（中文也行）。省掉用文件名 |
 | `desc` | | **什么时候该叫我**。不只是给人看的 —— 主 pi 就是靠这句话决定派谁，所以写「什么时候用我」，别写「我是谁」 |
-| `mcp` | | 要挂的 MCP 名字，逗号分隔（`mcp: center-pg, nas-ubuntu24`）。**留空 = 一个都不挂** |
+| `mcp` | | 要挂的 MCP 名字，逗号分隔（`mcp: my-db, my-server`）。**留空 = 一个都不挂** |
 | `timeout` | | 默认超时，如 `10m` / `90s` / `1.5h`。省掉 = 5 分钟 |
 | `model` | | 省掉继承默认 |
 | `mcp_exposure` | | `codemode`（默认）/ `direct`（专职助理更省事）/ `deferred` |
@@ -570,7 +570,7 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 │   模型             (空)               (留空 = 继承默认)                    │
 │   超时             5m                 (10m / 90s / 1.5h，留空 = 5 分钟)  │
 │   带 AGENTS.md     是                 (关掉每次省约 1500 token)           │
-│   MCP              1 个：center-pg    (回车勾选能连什么 —— 跟工作目录无关) │
+│   MCP              1 个：my-db       (回车勾选能连什么 —— 跟工作目录无关) │
 │   可派发           是                 (关掉 = 写 demo: true：能看能改，但派不了) │
 │   保存到           全局（所有项目都能用）                                  │
 │   提示词正文       (357 字)           回车 = 保存并打开编辑器              │
@@ -619,9 +619,9 @@ timeout: 10m
 name: 数据库助理
 desc: 连数据库查数据、验证数据、探表结构时用我。默认只读
 extends: role-ops
-mcp: center-pg
+mcp: my-db
 ---
-只碰 center 库；表名字段名拿不准先探结构；报数要写清口径。
+只碰业务库；表名字段名拿不准先探结构；报数要写清口径。
 ```
 
 #### 底座（`base`）：只读，而且能一键派生
@@ -655,7 +655,7 @@ mcp: center-pg
 - `cwd` 管**文件 + 上下文**（相对路径、项目 `AGENTS.md`）
 - `mcp` 管**能连什么**
 
-以前只有 `cwd`，等于「在哪儿干活」和「能连什么」绑死了。现在解耦：想让某个助理只连数据库，`mcp: center-pg` 就行，不必专门给它造一个目录。
+以前只有 `cwd`，等于「在哪儿干活」和「能连什么」绑死了。现在解耦：想让某个助理只连数据库，`mcp: my-db` 就行，不必专门给它造一个目录。
 
 **它是真隔离，不是过滤**：没选中的 MCP **进程根本不会启动**，凭据也不会进那个子进程。
 
@@ -696,9 +696,9 @@ mcp: center-pg
 | 写失败 | **直接拒绝启动**（不再静默拿半截配置去跑） |
 | 副作用（是好事） | 子进程**不加载用户级扩展** → 自动防递归、少约 825 token/次 |
 
-影子目录名 = `<key 的 ASCII 部分>-<6 位哈希>-<本次派发随机后缀>`，比如 `个人中心数据库助理-1cx6p4r-a3f9k2`。
+影子目录名 = `<key 的 ASCII 部分>-<6 位哈希>-<本次派发随机后缀>`，比如 `我的示例数据库助理-1cx6p4r-a3f9k2`。
 
-为什么要那个哈希：中文名如果只做「非 ASCII 换成 `_`」，`个人中心数据库助理` 会被整串换成 `_________` ——
+为什么要那个哈希：中文名如果只做「非 ASCII 换成 `_`」，`我的示例数据库助理` 会被整串换成 `_________` ——
 **两个同字数的中文助理就撞同一个目录，并行派发时互相覆盖 `mcp.json`**。拼一段基于原名的哈希就没这事了。
 末尾再加「本次派发」的随机后缀：**同一个助理并发派发时也不会互相覆盖**。旧目录由 `session_start` 回收（超 24h 的删）。
 
@@ -791,9 +791,9 @@ mcp: center-pg
 ```text
 …对话（滚动区）…
  ▛ 子代理 1 个在跑
- ● 个人中心服务器助理  1:23
-   在 VM 上修好记忆中心的依赖安装，能修好就一路把环境准备跑完
-   ✗ execute_command  cd ~/memory-center && pip install…  → Validation failed…
+ ● 业务服务器助理  1:23
+   在 VM 上修好服务的依赖安装，能修好就一路把环境准备跑完
+   ✗ execute_command  cd ~/my-service && pip install…  → Validation failed…
    ⚙ bash  git pull --rebase  已跑 5s
  ▛ 任务 记忆中心上 VM 并接入中心 · 8/8
  ✓ 1 修 VM 依赖安装      │ ⚙ 运行     │ 会话信息
@@ -833,7 +833,7 @@ mcp: center-pg
 | **task-board** | **825** | 临时移走那个文件 |
 | **delegate** | **327** | `-xt delegate` |
 | **ai-config** | **0** | 它不注册工具、不注入任何东西 |
-| **MCP（center-pg + nas，9 个工具）** | **0** | `-xt` 掉全部 9 个 MCP 工具后，**一个 token 都没变** |
+| **MCP（my-db + my-server，9 个工具）** | **0** | `-xt` 掉全部 9 个 MCP 工具后，**一个 token 都没变** |
 | **合计** | **~4790** | |
 
 三个反直觉的结论：

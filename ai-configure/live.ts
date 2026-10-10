@@ -51,9 +51,9 @@ export interface ToolRun {
 
 /** 一个子代理的完整实时状态。 */
 export interface LiveJob {
-	/** 模板 key（如 `个人中心服务器助理`），仅作标识 */
+	/** 模板 key（如 `我的数据库助理`），仅作标识 */
 	key: string;
-	/** 显示名，如 `个人中心服务器助理` */
+	/** 显示名，如 `我的数据库助理` */
 	name: string;
 	/** 任务首行，给面板当副标题 */
 	taskBrief: string;
