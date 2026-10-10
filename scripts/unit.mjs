@@ -371,6 +371,24 @@ allOk =
 			"const tried = bga.attempts;",
 			"await pollBgTasks();",
 			'ok("undelivered 后不再自动重试", readBgTask("dtest-2").attempts === tried);',
+			"// 假孤儿修复：判“孤儿”要按任务自己的 deadlineAt，不能写死 10 分钟",
+			"// （MAX_TIMEOUT_MS 是 30 分钟：设 20 分钟的活会在第 10 分钟被误判失败，投一张假失败卡）",
+			"const base = { key: \"k\", name: \"n\", task: \"t\", sessionId: \"s\", status: \"running\" };",
+			"writeBgTask({ ...base, id: \"stale-live\", startedAt: Date.now() - 11 * 60 * 1000, deadlineAt: Date.now() + 9 * 60 * 1000 });",
+			"reapStaleBgTasks();",
+			'ok("没到 deadlineAt 不误杀（跑了 11 分钟但时限 20 分钟）", readBgTask("stale-live").status === "running");',
+			"writeBgTask({ ...base, id: \"stale-dead\", startedAt: Date.now() - 11 * 60 * 1000, deadlineAt: Date.now() - 1000 });",
+			"reapStaleBgTasks();",
+			'ok("过了 deadlineAt → 标失败", readBgTask("stale-dead").status === "failed");',
+			'ok("失败原因写清了是超期未回报", /超期未回报/.test(readBgTask("stale-dead").resultText ?? ""));',
+			"writeBgTask({ ...base, id: \"stale-old\", startedAt: Date.now() - 11 * 60 * 1000 });",
+			"reapStaleBgTasks();",
+			'ok("老文件没 deadlineAt → 退回 10 分钟兑底", readBgTask("stale-old").status === "failed");',
+			"// 面板「⚠ N 个助理在跑 · 退出会中止」靠的就是这个数",
+			'const jr = newJob({ key: "k", name: "n", task: "t", sessionId: "rr" }); addJob(jr);',
+			'ok("runningBgCount 能数到在跑的", runningBgCount() === 1);',
+			'markEnd(jr, "done");',
+			'ok("跑完就不算「在跑」了（面板那行也就没了）", runningBgCount() === 0);',
 		],
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-delegate") },
 	) && allOk;
@@ -423,6 +441,32 @@ allOk =
 			"ch.closeStdin();",
 			'ok("关 stdin 真的关了", isClosed() === true);',
 			`ok("关闭后 send=false（不再往里写）", ch.send({ type: "steer", message: "x" }) === false);`,
+		],
+		{},
+	) && allOk;
+
+// ---------- 套件 1.6：live 面板保鲜期（跑完的子代理到点自动摘掉）----------
+bundle("live.ts", "live.mjs");
+allOk =
+	runSuite(
+		"live：面板保鲜期（不再越堆越多）",
+		join(tmp, "live.mjs"),
+		[
+			"const mk = (id, st) => { const j = newJob({ key: 'k', name: 'n', task: 't', sessionId: id }); addJob(j); markEnd(j, st); return j; };",
+			"setLingerMs(45_000);",
+			"const a = mk('a', 'done');",
+			`ok("刚跑完还在面板上", liveJobs().length === 1);`,
+			"const e = a.endedAt;",
+			`ok("没到保鲜期不摘", pruneFinishedJobs(e + 44_999) === 0 && liveJobs().length === 1);`,
+			`ok("到保鲜期自动摘掉", pruneFinishedJobs(e + 45_001) === 1 && liveJobs().length === 0);`,
+			"const r = newJob({ key: 'k', name: 'n', task: 't', sessionId: 'r' }); addJob(r);",
+			`ok("还在跑的永不摘", pruneFinishedJobs(Date.now() + 10 * 60 * 1000) === 0);`,
+			"ok('所有都结束了 → 没卡住的', liveJobs().filter((j) => j.status === 'running').length === 1);",
+			"setLingerMs(0); const z = mk('z', 'failed');",
+			`ok("linger=0 → 跑完立刻消失", pruneFinishedJobs(Date.now()) >= 1);`,
+			`ok("setLingerMs 拒绝非法值", (setLingerMs(-5), getLingerMs() === 0));`,
+			"clearJobs();",
+			`ok("clearJobs 全清", liveJobs().length === 0);`,
 		],
 		{},
 	) && allOk;

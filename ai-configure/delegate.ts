@@ -43,7 +43,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
-import { addJob, beginRun, consume, markEnd, newJob, type EndStatus, type LiveJob } from "./live";
+import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
@@ -421,8 +421,42 @@ function killTree(child: ChildProcess): void {
 	}
 }
 
-/** 杀掉所有在跑的子进程 */
+/**
+ * 主进程退出前：把还在跑的后台任务标成「被中止」。
+ *
+ * 不写的话，bg 文件会永远停在 `running` —— 要等下次启动 `reapStaleBgTasks()` 才被标成
+ * 「孤儿任务：子进程已消失」，那是**误导**（其实是你退了 pi），而且不提「能 resume」
+ *
+ * ⚠️ 走的是 `process.on("exit")` —— 那里**不能 await**，所以只能用同步写盘。
+ * 而且这是退出路径：写不进去就算了，绝不能再抛错。
+ */
+function markRunningBgTasksAborted(): void {
+	try {
+		const running = liveJobList().filter((j) => j.status === "running");
+		if (!running.length) return;
+		const now = Date.now();
+		for (const t of listBgTasks()) {
+			if (t.status !== "running") continue;
+			if (!running.some((j) => j.sessionId === t.sessionId)) continue;
+			writeBgTask({
+				...t,
+				status: "failed",
+				resultText:
+					"（主会话退出，任务被中止）\n" +
+					`要接着做：回到主会话重新派一次，带上 resume: "${t.sessionId}" —— 它的历史都在，会接着做而不是重做。`,
+				finishedAt: now,
+				delivered: false,
+				undelivered: false,
+			});
+		}
+	} catch {
+		/* 退出路径：不抛错 */
+	}
+}
+
+/** 杀掉所有在跑的子进程，并把它们的后台任务标成中止（强杀由看门狗负责） */
 function killAll(): void {
+	markRunningBgTasksAborted();
 	for (const c of [...liveJobs]) killTree(c);
 	liveJobs.clear();
 }
@@ -1260,6 +1294,14 @@ interface BgTaskFile {
 	lastError?: string;
 	/** 自动重试已放弃（超时），等 /agents bg redeliver 手动投 */
 	undelivered?: boolean;
+	/**
+	 * 这个任务最晚该什么时候有动静（= startedAt + timeoutMs + 余量）。
+	 * `reapStaleBgTasks()` 按它判“是不是真孤儿”，**不能写死 10 分钟** ——
+	 * timeoutMs 最大能到 30 分钟，写死就会把还在正常跑的活在第 10 分钟误判失败
+	 * （实测后果：先投一张假失败卡，真跑完后再投一张）。
+	 * 老文件没这个字段 → 回退到原来的 10 分钟兑底。
+	 */
+	deadlineAt?: number;
 }
 
 function bgRoot(): string {
@@ -2061,19 +2103,43 @@ export function undeliveredBgCount(): number {
 	}
 }
 
-/** 孤儿任务清理：running 但超过 10 分钟（正常 timeout 最多 5 分钟）→ 标 failed */
+/**
+ * 当前还在跑的后台任务条数。
+ *
+ * 面板靠它说「退出 pi 会中止」—— 看门狗会在主进程退出时 SIGKILL 掉子进程
+ * （这是「不留孤儿」的代价），不提醒的话用户很可能不知情地关掉窗口。
+ */
+export function runningBgCount(): number {
+	try {
+		return liveJobList().filter((j) => j.status === "running").length;
+	} catch {
+		return 0;
+	}
+}
+
+/** 孤儿任务清理：`running` 但已经过了自己的 deadline → 标 failed。
+ *
+ * deadlineAt 由派发时写（= startedAt + timeoutMs + 2min 余量）。
+ * 为什么不能写死 10 分钟：MAX_TIMEOUT_MS 是 30 分钟 —— 一个设了 20 分钟的助理
+ * 会在第 10 分钟被误判成“孤儿、子进程已消失”，投一张**假失败卡**，
+ * 等它 20 分钟真跑完又投一张真结果卡。老文件没 deadlineAt → 回退 10 分钟兑底。
+ */
 function reapStaleBgTasks(): void {
 	const now = Date.now();
 	for (const t of listBgTasks()) {
-		if (t.status === "running" && now - t.startedAt > 10 * 60 * 1000) {
-			writeBgTask({
-				...t,
-				status: "failed",
-				resultText: "（孤儿任务：子进程已消失，标记为失败）",
-				finishedAt: now,
-				delivered: false,
-			});
-		}
+		if (t.status !== "running") continue;
+		const deadline = t.deadlineAt ?? t.startedAt + 10 * 60 * 1000;
+		if (now <= deadline) continue;
+		writeBgTask({
+			...t,
+			status: "failed",
+			resultText:
+				"（超期未回报，已标为失败）\n" +
+				`上一次有记录是在 ${new Date(t.startedAt).toLocaleString()}，过了预期时限（${Math.round((deadline - t.startedAt) / 60000)} 分钟）还是没有结果。\n` +
+				`要接着做：重新派一次并带上 resume: "${t.sessionId}" —— 它的历史都在。`,
+			finishedAt: now,
+			delivered: false,
+		});
 	}
 }
 
@@ -2208,8 +2274,42 @@ function releaseRunSlot(): void {
 }
 
 // ======================= 注册 =======================
+/** 面板保鲜期配置文件：`~/.pi/agent/ai-extensions.json`（只有这一个键，将来可以考虑加更多） */
+function extensionsConfigFile(): string {
+	return join(getAgentDir(), "ai-extensions.json");
+}
+
+function readExtensionsConfig(): Record<string, unknown> {
+	try {
+		const raw = JSON.parse(readFileSync(extensionsConfigFile(), "utf8")) as Record<string, unknown>;
+		return raw && typeof raw === "object" ? raw : {};
+	} catch {
+		return {}; // 没这个文件 / 坏了 —— 用默认值，不要因为一个配置项把插件搞挂
+	}
+}
+
+/** 启动时把配置灌进 live.ts（读不到就用默认 45s） */
+function applyExtensionsConfig(): void {
+	const v = Number(readExtensionsConfig().assistantLingerMs);
+	if (Number.isFinite(v) && v >= 0) setLingerMs(v);
+}
+
+/** 写回保鲜期（保留文件里其它键） */
+function writeLingerMs(ms: number): void {
+	const cfg = readExtensionsConfig();
+	cfg.assistantLingerMs = ms;
+	try {
+		mkdirSync(dirname(extensionsConfigFile()), { recursive: true });
+		writeFileSync(extensionsConfigFile(), `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+	} catch {
+		/* 写不进去就只改内存值，本次会话照常生效 */
+	}
+	setLingerMs(ms);
+}
+
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
+	applyExtensionsConfig(); // 面板保鲜期等偏好
 	apiRef = api; // 供后台轮询回投用
 
 	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
@@ -2462,6 +2562,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 						startedAt: Date.now(), status: "running",
 						ownerSessionFile: currentSessionFile,
 						ownerSessionId: currentSessionId,
+						// 2 分钟余量：收尾/追问/写盘都要时间，别卡在边界上误判
+						deadlineAt: Date.now() + total + 2 * 60 * 1000,
 					});
 					void runAssistant(tpl, task, {
 						timeoutMs: total,
@@ -2477,6 +2579,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 								startedAt: Date.now(), status: "running" as const,
 								ownerSessionFile: currentSessionFile,
 								ownerSessionId: currentSessionId,
+								deadlineAt: Date.now() + total + 2 * 60 * 1000,
 							};
 							writeBgTask({
 								...prev,
@@ -2568,7 +2671,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 		description:
 			"子代理实时面板：直接敲=开；off 关；detail 展开思考；text 打印快照；" +
 			"float 改成右侧浮层，widget 改回看板上方；" +
-			"bg 看后台任务状态（失败原因），bg redeliver 把没投回主会话的立刻重投",
+			"bg 看后台任务状态（失败原因），bg redeliver 把没投回主会话的立刻重投；" +
+			"linger <时长> 改跑完的子代理在面板上呆多久（默认 45s，0=立刻消失）",
 		handler: async (args: string, ctx) => {
 			const sub = (args ?? "").trim().toLowerCase();
 
@@ -2603,6 +2707,27 @@ export function setupDelegate(api: ExtensionAPI): void {
 			}
 
 			// --- 后台任务：看状态 / 手动重投（卡住时的救急口）---
+			if (sub === "linger" || sub.startsWith("linger ")) {
+				const arg = (args ?? "").trim().split(/\s+/).slice(1).join(" ").trim();
+				const cur = getLingerMs();
+				const show = `面板保鲜期：${cur === 0 ? "0（跑完立刻消失）" : humanTimeout(cur)}\n配置文件：${extensionsConfigFile()}`;
+				if (!arg) {
+					ctx.ui.notify(`${show}\n\n用法：/agents linger <时长>　（例 45s / 2m / 0=立刻消失）`, "info");
+					return;
+				}
+				const ms = arg === "off" ? 0 : parseDuration(arg);
+				if (ms === undefined) {
+					ctx.ui.notify(`看不懂「${arg}」。用法：/agents linger 45s | 2m | 0\n\n${show}`, "info");
+					return;
+				}
+				writeLingerMs(ms);
+				ctx.ui.notify(
+					`面板保鲜期已改成：${ms === 0 ? "0（跑完立刻消失）" : humanTimeout(ms)}\n` +
+						`（跑完的子代理会在面板上呆这么久再自动摘掉；以前是下次派活才清）`,
+					"info",
+				);
+				return;
+			}
 			if (sub === "bg" || sub.startsWith("bg ")) {
 				const action = sub.slice(2).trim();
 				const all = listBgTasks().sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));

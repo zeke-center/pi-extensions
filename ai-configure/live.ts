@@ -71,6 +71,8 @@ export interface LiveJob {
 	tokens?: { input: number; output: number; total: number };
 	/** 结束原因/错误 */
 	note?: string;
+	/** 终态落地时刻（面板“保鲜期”从这一刻算） */
+	endedAt?: number;
 }
 
 const TEXT_LIMIT = 2000;
@@ -151,6 +153,63 @@ export function beginRun(): void {
 export function clearJobs(): void {
 	jobs.length = 0;
 	notifyLive();
+}
+
+// ======================= 保鲜期：跑完的 job 呆多久从面板消失 =======================
+//
+// 以前只有 `beginRun()`（下次派活前）才清，所以**跑完的助理会一直挂在面板上**，
+// 直到你派下一个活 —— 面板越堆越长。现在改成“终态后再呆 lingerMs 就自动摘掉”。
+
+const DEFAULT_LINGER_MS = 45_000;
+let lingerMs = DEFAULT_LINGER_MS;
+
+/** 当前保鲜期（毫秒）。0 = 跑完立刻消失。 */
+export function getLingerMs(): number {
+	return lingerMs;
+}
+
+/** 设置保鲜期。非法值忽略（保持原值）。 */
+export function setLingerMs(ms: number): void {
+	if (Number.isFinite(ms) && ms >= 0) lingerMs = ms;
+}
+
+/**
+ * 把「已结束 + 过了保鲜期」的 job 从面板摘掉。返回摘掉几个。
+ * 纯函数式（时间可注入）→ 可以单测，不用真等 45 秒。
+ */
+export function pruneFinishedJobs(now: number = Date.now()): number {
+	let removed = 0;
+	for (let i = jobs.length - 1; i >= 0; i--) {
+		const j = jobs[i]!;
+		if (j.status === "running") continue;
+		// endedAt 没有就退回 lastEventAt（反正是终态，不会再有新事件）
+		const ended = j.endedAt ?? j.lastEventAt;
+		if (now - ended < lingerMs) continue;
+		jobs.splice(i, 1);
+		removed++;
+	}
+	return removed;
+}
+
+let pruneTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** 按“离得最近的那个到期时刻”定一次定时器；没得清就不排（不会长期占着定时器） */
+function schedulePrune(): void {
+	if (pruneTimer) return;
+	let wait = Number.POSITIVE_INFINITY;
+	for (const j of jobs) {
+		if (j.status === "running") continue;
+		const ended = j.endedAt ?? j.lastEventAt;
+		wait = Math.min(wait, ended + lingerMs - Date.now());
+	}
+	if (!Number.isFinite(wait)) return;
+	pruneTimer = setTimeout(() => {
+		pruneTimer = undefined;
+		if (pruneFinishedJobs() > 0) notifyLive();
+		schedulePrune();
+	}, Math.max(50, wait + 20));
+	// 纯清理定时器，不该拖着进程不让退（也避免单测里卡 45 秒）
+	pruneTimer.unref?.();
 }
 
 // ======================= 工具函数 =======================
@@ -440,10 +499,13 @@ export function markEnd(
 	if (note) job.note = note;
 	const now = Date.now();
 	job.lastEventAt = now;
+	job.endedAt = now;
 	for (const t of job.tools) {
 		if (!t.endedAt && t.phase === "running") t.endedAt = now;
 	}
 	notifyLive();
+	// 终态了 → 开始计保鲜期，到点自动从面板摘掉
+	schedulePrune();
 }
 
 // ======================= 渲染 =======================

@@ -20,7 +20,7 @@ import { type Focusable, truncateToWidth, visibleWidth } from "@earendil-works/p
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
-import { loadTemplates, undeliveredBgCount } from "./delegate";
+import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -261,6 +261,13 @@ function assistantLines(theme: Theme, w: number = RIGHT_WIDTH): string[] {
 	if (cachedAssistants.blocked > 0) {
 		out.push(` ${t.fg("dim", `○ ${cachedAssistants.blocked} 个不可派`)}`);
 	}
+	// 有后台助理在跑 → 必须提醒「退出会中止」。看门狗会在主进程退出时 SIGKILL 掉子进程
+	// （这是「不留孤儿」的代价），不说的话你会不知情地关掉窗口、活就白跑了。
+	const running = runningBgCount();
+	if (running > 0) {
+		out.push(` ${t.fg("warning", `⚠ ${running} 个助理在跑`)}`);
+		out.push(` ${t.fg("dim", "  退出 pi 会中止它们")}`);
+	}
 	// 有助理已经跑完、结果却没投回主会话 → 必须看得见（否则你只能干等）
 	const undelivered = undeliveredBgCount();
 	if (undelivered > 0) {
@@ -500,12 +507,15 @@ function renderWidget(force = false): void {
 function refreshStatus(): void {
 	const ctx = lastCtx;
 	if (!ctx?.hasUI) return;
+	const bits: string[] = [];
 	if (steps.length) {
 		const done = steps.filter((s) => s.status === "done").length;
-		ctx.ui.setStatus(WIDGET_KEY, ctx.ui.theme.fg("accent", `📋 ${done}/${steps.length}`));
-	} else {
-		ctx.ui.setStatus(WIDGET_KEY, undefined);
+		bits.push(`📋 ${done}/${steps.length}`);
 	}
+	// 后台助理在跑 → 状态栏也提一句（面板那栏可能被滚走 / 切到别的视图）
+	const running = runningBgCount();
+	if (running > 0) bits.push(`⏳ ${running} 个助理在跑`);
+	ctx.ui.setStatus(WIDGET_KEY, bits.length ? ctx.ui.theme.fg("accent", bits.join("  ")) : undefined);
 }
 
 function refresh(force = false): void {

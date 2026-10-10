@@ -1,0 +1,398 @@
+// ai-configure/board.ts
+import { getAgentDir as getAgentDir3 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth as truncateToWidth3, visibleWidth as visibleWidth3 } from "@earendil-works/pi-tui";
+import { existsSync as existsSync3, readFileSync as readFileSync3 } from "node:fs";
+import { basename, join as join3 } from "node:path";
+import { Type as Type2 } from "typebox";
+
+// ai-configure/delegate.ts
+import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
+import { spawn } from "node:child_process";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, readdirSync as readdirSync2, rmSync as rmSync2, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join as join2 } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
+
+// ai-configure/form.ts
+import { CURSOR_MARKER, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+// ai-configure/live.ts
+var jobs = [];
+function liveJobs() {
+  return jobs;
+}
+
+// ai-configure/panel.ts
+import { truncateToWidth as truncateToWidth2, visibleWidth as visibleWidth2 } from "@earendil-works/pi-tui";
+var overlay;
+var widgetRegistered = false;
+var visible = false;
+function panelMode() {
+  if (overlay) return "overlay";
+  if (widgetRegistered && visible) return "widget";
+  return "closed";
+}
+
+// ai-configure/mcp-pool.ts
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+function localCatalogPath() {
+  return join(getAgentDir(), "mcp-catalog.json");
+}
+function assistantSessionRoot() {
+  return join(getAgentDir(), "assistant-sessions");
+}
+function shadowRoot() {
+  return join(getAgentDir(), "shadow");
+}
+
+// ai-configure/delegate.ts
+var DEFAULT_TIMEOUT_MS = 5 * 60 * 1e3;
+var MAX_TIMEOUT_MS = 30 * 60 * 1e3;
+var MIN_TIMEOUT_MS = 5 * 1e3;
+var MIN_WINDDOWN_MS = 3 * 60 * 1e3;
+var HARD_WINDDOWN_LEAD_MS = 45 * 1e3;
+var SOFT_WINDDOWN_MIN_LEAD_MS = 120 * 1e3;
+var EXT_DIR = dirname(fileURLToPath(import.meta.url));
+var PACKAGE_DIR = dirname(EXT_DIR);
+function templateDirs(cwd) {
+  const dirs = [];
+  const project = join2(cwd, ".pi", "assistants");
+  if (existsSync2(project)) dirs.push(project);
+  const global = join2(getAgentDir2(), "assistants");
+  if (existsSync2(global)) dirs.push(global);
+  const bundled = join2(PACKAGE_DIR, "assistants");
+  if (existsSync2(bundled)) dirs.push(bundled);
+  return dirs;
+}
+function expandHome(p) {
+  return p.replace(/^~(?=[/\\]|$)/, homedir());
+}
+function splitList(v) {
+  return v.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+}
+function splitEnv(v) {
+  const out = {};
+  for (const part of v.split(",")) {
+    const i = part.indexOf("=");
+    if (i <= 0) continue;
+    out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+function parseDuration(v) {
+  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i.exec(v.trim());
+  if (!m) return void 0;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? "s").toLowerCase();
+  const mult = unit === "ms" ? 1 : unit === "s" ? 1e3 : unit === "m" ? 6e4 : 36e5;
+  return n * mult;
+}
+function parseBool(v, dflt) {
+  const s = v.trim().toLowerCase();
+  if (["1", "true", "yes", "on", "y"].includes(s)) return true;
+  if (["0", "false", "no", "off", "n"].includes(s)) return false;
+  return dflt;
+}
+function parseTemplate(file, key) {
+  let raw;
+  try {
+    raw = readFileSync2(file, "utf8");
+  } catch {
+    return null;
+  }
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+  const meta = {};
+  let body = raw;
+  if (m) {
+    body = raw.slice(m[0].length);
+    for (const line of m[1].split(/\r?\n/)) {
+      const i = line.indexOf(":");
+      if (i <= 0) continue;
+      const k = line.slice(0, i).trim().toLowerCase();
+      const v = line.slice(i + 1).trim().replace(/^["']|["']$/g, "");
+      if (k && v) meta[k] = v;
+    }
+  }
+  if (!meta.cwd && !meta.extends && !meta.name && !meta.desc) return null;
+  return {
+    key,
+    name: meta.name || key,
+    desc: meta.desc || "(\u6CA1\u6709\u63CF\u8FF0)",
+    cwd: meta.cwd ? expandHome(meta.cwd) : "",
+    model: meta.model || void 0,
+    mcp: meta.mcp ? splitList(meta.mcp) : [],
+    timeoutMs: meta.timeout ? parseDuration(meta.timeout) : void 0,
+    extends: meta.extends || void 0,
+    base: meta.base ? parseBool(meta.base, false) : void 0,
+    demo: meta.demo ? parseBool(meta.demo, false) : void 0,
+    enabled: meta.enabled ? parseBool(meta.enabled, true) : void 0,
+    agentsMd: meta.agents_md ? parseBool(meta.agents_md, true) : void 0,
+    mcpExposure: meta.mcp_exposure || void 0,
+    tools: meta.tools ? splitList(meta.tools) : void 0,
+    denyTools: meta.deny_tools ? splitList(meta.deny_tools) : void 0,
+    isolateEnv: meta.isolate_env ? parseBool(meta.isolate_env, false) : void 0,
+    envPassthrough: meta.env_passthrough ? splitList(meta.env_passthrough) : void 0,
+    env: meta.env ? splitEnv(meta.env) : {},
+    body: body.trim(),
+    file
+  };
+}
+function resolveTemplate(t, byKey, seen, depth = 0) {
+  if (!t.extends) return t;
+  if (depth >= 2 || seen.has(t.key)) return { ...t, extends: void 0 };
+  const parent = byKey.get(t.extends);
+  if (!parent) return t;
+  const next = new Set(seen);
+  next.add(t.key);
+  const p = resolveTemplate(parent, byKey, next, depth + 1);
+  return {
+    ...t,
+    cwd: t.cwd || p.cwd,
+    model: t.model ?? p.model,
+    mcp: t.mcp.length ? t.mcp : p.mcp,
+    timeoutMs: t.timeoutMs ?? p.timeoutMs,
+    mcpExposure: t.mcpExposure ?? p.mcpExposure,
+    tools: t.tools?.length ? t.tools : p.tools,
+    denyTools: t.denyTools?.length ? t.denyTools : p.denyTools,
+    isolateEnv: t.isolateEnv ?? p.isolateEnv,
+    envPassthrough: t.envPassthrough?.length ? t.envPassthrough : p.envPassthrough,
+    env: { ...p.env, ...t.env },
+    body: [p.body, t.body].filter(Boolean).join("\n\n")
+  };
+}
+function loadTemplates(cwd) {
+  const seen = /* @__PURE__ */ new Set();
+  const parsed = [];
+  for (const dir of templateDirs(cwd)) {
+    let entries;
+    try {
+      entries = readdirSync2(dir);
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.endsWith(".md")) continue;
+      const key = e.slice(0, -3);
+      if (seen.has(key)) continue;
+      const file = join2(dir, e);
+      try {
+        if (!statSync2(file).isFile()) continue;
+      } catch {
+        continue;
+      }
+      const t = parseTemplate(file, key);
+      if (!t) continue;
+      seen.add(key);
+      parsed.push(t);
+    }
+  }
+  const byKey = new Map(parsed.map((t) => [t.key, t]));
+  const out = [];
+  for (const t of parsed) {
+    const r = resolveTemplate(t, byKey, /* @__PURE__ */ new Set());
+    if (r.enabled === false) continue;
+    out.push({ ...r, cwd: r.cwd || cwd });
+  }
+  return out;
+}
+function bgRoot() {
+  const d = join2(assistantSessionRoot(), ".bg");
+  try {
+    mkdirSync2(d, { recursive: true });
+  } catch {
+  }
+  return d;
+}
+function listBgTasks() {
+  try {
+    return readdirSync2(bgRoot()).filter((f) => f.endsWith(".json")).map((f) => {
+      try {
+        return JSON.parse(readFileSync2(join2(bgRoot(), f), "utf8"));
+      } catch {
+        return void 0;
+      }
+    }).filter((t) => !!t);
+  } catch {
+    return [];
+  }
+}
+var DELIVER_BACKOFF_MAX_MS = 30 * 1e3;
+var DELIVER_GIVEUP_MS = 10 * 60 * 1e3;
+function undeliveredBgCount() {
+  try {
+    return listBgTasks().filter((t) => t.status !== "running" && !t.delivered).length;
+  } catch {
+    return 0;
+  }
+}
+var STALE_LOCK_MS = 15 * 60 * 1e3;
+
+// ai-configure/board.ts
+var pi;
+var title = "";
+var steps = [];
+var blocker;
+var activity;
+var LEVEL_RANK = { global: 0, project: 1, session: 2 };
+function readMcpNames(file) {
+  try {
+    if (!existsSync3(file)) return [];
+    const j = JSON.parse(readFileSync3(file, "utf8"));
+    return Object.keys(j.mcpServers ?? {});
+  } catch {
+    return [];
+  }
+}
+function computeMcp(cwd, trusted) {
+  const levels = /* @__PURE__ */ new Map();
+  const note = (name, lv) => {
+    const cur = levels.get(name);
+    if (!cur || LEVEL_RANK[lv] > LEVEL_RANK[cur]) levels.set(name, lv);
+  };
+  for (const n of readMcpNames(join3(getAgentDir3(), "mcp.json"))) note(n, "global");
+  if (trusted) for (const n of readMcpNames(join3(cwd, ".pi", "mcp.json"))) note(n, "project");
+  try {
+    for (const s of pi.getMcpServers()) note(s.name, "session");
+  } catch {
+  }
+  const connected = /* @__PURE__ */ new Set();
+  try {
+    for (const tool of pi.getAllTools()) {
+      if (!tool.name.startsWith("mcp__")) continue;
+      const rest = tool.name.slice(5);
+      const idx = rest.indexOf("__");
+      if (idx < 0) continue;
+      const derived = rest.slice(0, idx);
+      let hit = false;
+      for (const n of levels.keys()) {
+        if (n.replace(/[^A-Za-z0-9_]/g, "_") === derived) {
+          hit = true;
+          connected.add(n);
+        }
+      }
+      if (!hit) {
+        if (!levels.has(derived)) levels.set(derived, "session");
+        connected.add(derived);
+      }
+    }
+  } catch {
+  }
+  return [...levels.entries()].map(([name, level]) => ({ name, level, connected: connected.has(name) })).sort(
+    (a, b) => Number(b.connected) - Number(a.connected) || LEVEL_RANK[b.level] - LEVEL_RANK[a.level] || a.name.localeCompare(b.name)
+  );
+}
+var ProgressParams = Type2.Object({
+  action: Type2.Union(
+    [Type2.Literal("plan"), Type2.Literal("step"), Type2.Literal("block"), Type2.Literal("clear")],
+    { description: "\u8981\u6267\u884C\u7684\u52A8\u4F5C" }
+  ),
+  title: Type2.Optional(Type2.String({ description: "\u4EFB\u52A1\u6807\u9898\uFF0C\u5982\uFF1A\u52A0\u4E00\u4E2A\u9875\u9762" })),
+  steps: Type2.Optional(Type2.Array(Type2.String(), { description: "\u6B65\u9AA4\u5217\u8868\uFF08action=plan\uFF09\uFF0C\u6BCF\u6761\u4E00\u53E5\u8BDD" })),
+  index: Type2.Optional(Type2.Number({ description: "\u6B65\u9AA4\u5E8F\u53F7\uFF0C\u4ECE 1 \u5F00\u59CB\uFF08action=step\uFF09" })),
+  status: Type2.Optional(
+    Type2.Union(
+      [Type2.Literal("pending"), Type2.Literal("doing"), Type2.Literal("done"), Type2.Literal("blocked")],
+      { description: "\u8BE5\u6B65\u9AA4\u7684\u72B6\u6001\uFF08action=step\uFF09" }
+    )
+  ),
+  text: Type2.Optional(Type2.String({ description: "\u5361\u70B9/\u8BF4\u660E\uFF08action=block\uFF09" })),
+  skipConfirm: Type2.Optional(Type2.Boolean({ description: "action=plan \u65F6\u8DF3\u8FC7\u7528\u6237\u786E\u8BA4\uFF08\u9ED8\u8BA4 false\uFF09" }))
+});
+function boardSnapshot() {
+  return { title, steps: steps.map((s) => ({ ...s })), blocker, activity };
+}
+
+// ai-configure/health.ts
+var parts = /* @__PURE__ */ new Map();
+function failedParts() {
+  return [...parts.entries()].filter(([, error]) => error).map(([name, error]) => ({ name, error }));
+}
+function healthReport() {
+  const all = [...parts.keys()];
+  const bad = failedParts();
+  if (all.length === 0) return ["\uFF08\u8FD8\u6CA1\u52A0\u8F7D\u4EFB\u4F55\u6A21\u5757\uFF09"];
+  if (bad.length === 0) return [`\u5168\u90E8\u6A21\u5757\u5DF2\u52A0\u8F7D \u2705\uFF08${all.join(" \xB7 ")}\uFF09`];
+  const badNames = new Set(bad.map((b) => b.name));
+  const good = all.filter((n) => !badNames.has(n));
+  return [
+    ...bad.map((b) => `\u274C ${b.name}: ${b.error}`),
+    ...good.length ? [`\u2705 ${good.join(" \xB7 ")}`] : []
+  ];
+}
+
+// ai-configure/doctor.ts
+function showDoctor(ctx) {
+  const cwd = ctx.cwd ?? process.cwd();
+  const L = ["ai-configure doctor", ""];
+  L.push("## \u6A21\u5757\u5065\u5EB7\u5EA6");
+  L.push(...healthReport());
+  L.push("");
+  L.push("## \u914D\u7F6E\u4E2D\u5FC3");
+  const api = (process.env.CENTER_API ?? "").replace(/\/+$/, "");
+  L.push(`- CENTER_API: ${api || "\uFF08\u672A\u8BBE\u7F6E \u2192 /ai \u62C9\u8FDE\u63A5\u4F1A\u62A5\u9519\uFF09"}`);
+  L.push(
+    `- CENTER_TOKEN: ${process.env.CENTER_TOKEN ? "\u5DF2\u8BBE\uFF08\u73AF\u5883\u53D8\u91CF\uFF09" : "\u672A\u8BBE\u73AF\u5883\u53D8\u91CF\uFF08\u53EF\u5728 /ai \u65F6\u5F39\u6846\u8F93\u5165\uFF0C\u4EC5\u672C\u6B21\u4F1A\u8BDD\uFF09"}`
+  );
+  L.push("");
+  let mcp = [];
+  try {
+    mcp = computeMcp(cwd, ctx.isProjectTrusted());
+  } catch {
+  }
+  L.push(`## MCP\uFF08\u5171 ${mcp.length}\uFF09`);
+  if (mcp.length === 0) {
+    L.push("- \uFF08\u65E0\uFF09\u2014\u2014 /ai \u62C9\u53F0\u8D26\u3001\u6216\u624B\u5199 .pi/mcp.json \u540E /reload");
+  }
+  for (const m of mcp) {
+    L.push(`${m.connected ? "\u25CF" : "\u25CB"} ${m.name} [${m.level}] ${m.connected ? "\u5DF2\u8FDE\u63A5" : "\u672A\u8FDE / \u672A\u9A8C\u8BC1"}`);
+  }
+  if (mcp.some((m) => !m.connected)) {
+    L.push(
+      "  \u26A0 \u25CB \u7684\u5224\u5B9A\u65B9\u5F0F = \u5DE5\u5177\u540D\u91CC\u6709\u6CA1\u6709 mcp__<server>__*\uFF1B\u4E3A \u25CB \u53EF\u80FD\u662F\uFF1A\u2460\u670D\u52A1\u6162/\u51B7\u542F\u52A8\u6CA1\u8FDE\u4E0A \u2461\u672C\u4F1A\u8BDD\u8FD8\u6CA1\u8C03\u8FC7\u5B83 \u2462\u540D\u5B57\u542B\u7279\u6B8A\u5B57\u7B26\u3002\u7528 /mcp \u770B\u771F\u5B9E\u8FDE\u63A5\u3001/reload \u91CD\u8FDE\uFF0C\u6216\u968F\u4FBF\u8C03\u4E00\u6B21\u8BE5\u5DE5\u5177\u89E6\u53D1\u91CD\u8FDE\u3002"
+    );
+  }
+  L.push("");
+  L.push("## \u52A9\u7406");
+  try {
+    const all = loadTemplates(cwd);
+    const usable = all.filter((t) => !t.base && !t.demo);
+    L.push(
+      `- \u6A21\u677F\uFF1A${all.length} \u4E2A\uFF08\u53EF\u6D3E ${usable.length} \xB7 base ${all.filter((t) => t.base).length} \xB7 demo ${all.filter((t) => t.demo).length}\uFF09`
+    );
+  } catch (e) {
+    L.push(`- \u274C \u6A21\u677F\u8BFB\u53D6\u5931\u8D25\uFF1A${e instanceof Error ? e.message : String(e)}`);
+  }
+  L.push(`- \u672A\u56DE\u6295\uFF1A${undeliveredBgCount()}`);
+  L.push(`- \u8FD0\u884C\u4E2D\u5B50\u8FDB\u7A0B\uFF1A${liveJobs().filter((j) => j.status === "running").length}`);
+  L.push(`- \u5B50\u4EE3\u7406\u9762\u677F\uFF1A${panelMode()}`);
+  L.push(`- \u52A9\u7406\u4F1A\u8BDD\u76EE\u5F55\uFF1A${assistantSessionRoot()}`);
+  L.push(`- \u5F71\u5B50\u76EE\u5F55\u6839\uFF1A${shadowRoot()} \xB7 \u672C\u5730 MCP \u76EE\u5F55\uFF1A${localCatalogPath()}`);
+  L.push("");
+  const b = boardSnapshot();
+  L.push("## \u770B\u677F");
+  if (b.steps.length === 0) {
+    L.push("- \u7A7A");
+  } else {
+    const done = b.steps.filter((s) => s.status === "done").length;
+    L.push(`- \u300C${b.title || "(\u65E0\u6807\u9898)"}\u300D ${done}/${b.steps.length} \u6B65`);
+    const doing = b.steps.findIndex((s) => s.status === "doing");
+    if (doing >= 0) L.push(`- \u6B63\u5728\u505A\uFF1A\u7B2C ${doing + 1} \u6B65\u300C${b.steps[doing]?.text ?? ""}\u300D`);
+    if (b.blocker) L.push(`- \u5361\u70B9\uFF1A${b.blocker}`);
+  }
+  ctx.ui.notify(L.join("\n"), "info");
+}
+function setupDoctor(api) {
+  api.registerCommand("aidoctor", {
+    description: "AI configure \u81EA\u68C0\uFF1AMCP \u8FDE\u63A5 / \u53F0\u8D26 / \u52A9\u7406 / \u770B\u677F / \u6A21\u5757\u5065\u5EB7\u5EA6",
+    handler: async (_args, ctx) => {
+      showDoctor(ctx);
+    }
+  });
+}
+export {
+  setupDoctor,
+  showDoctor
+};
