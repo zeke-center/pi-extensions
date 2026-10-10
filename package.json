@@ -1,6 +1,6 @@
 {
   "name": "@zeke-center/pi-extensions",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Pi 扩展合集：任务面板 + AI 配置中心（连接台账 → MCP）+ delegate 临时助理 + /resume-agent",
   "keywords": [
     "pi-package"

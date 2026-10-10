@@ -375,6 +375,58 @@ allOk =
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-delegate") },
 	) && allOk;
 
+// ---------- 套件 1.5：rpc 通道（子助理双向通信的地基）----------
+// 这一层错了不会“报错”，只会“安静地派活全挂”（老版本 pi、dialog 不应答挂死）—— 所以必须钉住。
+bundle("rpc.ts", "rpc.mjs");
+allOk =
+	runSuite(
+		"rpc：分发 / U+2028 不当行界 / dialog 应答",
+		join(tmp, "rpc.mjs"),
+		[
+			"// 假 child：stdin 只记录，stdout 由 feed() 手推",
+			"const mkChild = () => {",
+			"  const written = []; const sinks = []; let closed = false;",
+			"  const child = {",
+			"    stdin: { write: (s) => { written.push(s); return true; }, end: () => { closed = true; } },",
+			"    stdout: { on: (_e, fn) => sinks.push(fn) },",
+			"  };",
+			"  return { child, written, feed: (s) => sinks.forEach((fn) => fn(s)), isClosed: () => closed };",
+			"};",
+			"const { child, written, feed, isClosed } = mkChild();",
+			"const ch = new RpcChannel(child);",
+			"const ev = []; const rs = []; const ui = [];",
+			"ch.onEvent((r) => ev.push(r)).onResponse((r) => rs.push(r)).onUi((r) => ui.push(r));",
+			"const U = '\\u2028';",
+			"feed(JSON.stringify({ id: 'r1', type: 'response', command: 'prompt', success: true }) + '\\n');",
+			"feed(JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'a' + U + 'b' } }) + '\\n');",
+			"feed(JSON.stringify({ type: 'extension_ui_request', id: 'u1', method: 'confirm' }) + '\\n');",
+			"feed(JSON.stringify({ type: 'agent_settled' }) + '\\n');",
+			`ok("response 单独分发", rs.length === 1 && rs[0].command === "prompt");`,
+			'ok("responseCount 计数", ch.responseCount === 1);',
+			`ok("U+2028 不当行界（一条记录不被劈开）", ev.length === 2 && ev[0].assistantMessageEvent.delta === "a" + U + "b");`,
+			`ok("agent_settled 走事件分支", ev[1].type === "agent_settled");`,
+			'ok("ui 请求单独分发", ui.length === 1 && ui[0].method === "confirm");',
+			"feed('\\r\\nnot json\\n');",
+			`feed(JSON.stringify({ type: "agent_settled" }) + "\\r\\n");`,
+			'ok("CRLF / 垃圾行不炸", ev.length === 3);',
+			`ch.send({ type: "steer", message: "收尾" });`,
+			'const sent = JSON.parse(written[0]);',
+			`ok("send 自动带 id", sent.type === "steer" && sent.id === "c1");`,
+			`ok("send 以 LF 结尾", written[0].endsWith("\\n"));`,
+			`rejectDialog(ch, { type: "extension_ui_request", id: "u1", method: "confirm" });`,
+			'const ans = JSON.parse(written[1]);',
+			`ok("dialog → cancelled 且复用原 id", ans.type === "extension_ui_response" && ans.id === "u1" && ans.cancelled === true);`,
+			'const before = written.length;',
+			`rejectDialog(ch, { type: "extension_ui_request", method: "notify" });`,
+			`ok("fire-and-forget 不应答", written.length === before);`,
+			`ok("isDialogRequest 只看 select/confirm/input/editor", isDialogRequest({ type: "extension_ui_request", method: "editor" }) === true && isDialogRequest({ type: "extension_ui_request", method: "notify" }) === false);`,
+			"ch.closeStdin();",
+			'ok("关 stdin 真的关了", isClosed() === true);',
+			`ok("关闭后 send=false（不再往里写）", ch.send({ type: "steer", message: "x" }) === false);`,
+		],
+		{},
+	) && allOk;
+
 // ---------- 套件 2：mcp-pool（影子目录） ----------
 bundle("mcp-pool.ts", "mcp-pool.mjs");
 allOk =

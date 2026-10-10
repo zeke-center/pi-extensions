@@ -7,7 +7,11 @@
  * 设计要点：
  *   - 并行：tasks 数组 → Promise.all，一次派多路，等全部返回
  *   - 同步停止：Esc / 主进程退出 / 主进程被强杀（看门狗），三层都杀，不留孤儿
- *   - 超时：到点就**杀**，返回「半成品 + 调过的工具 + 会话ID」；要接着做就带 resume 续跑
+ *   - 超时：**到点前先叫停，再硬杀兑底**。子进程跑在 `--mode rpc`（双向）上，所以
+ *       软档 = T - max(120s, 25%)：steer 一句“开始收尾”
+ *       硬档 = T - 45s      ：abort 打断 + 追问一次交卡（上下文还在，能拿到真结论）
+ *     这样超时卡片里是「阶段成果 + 工具时间线 + 还差什么」，而不是一句空话；
+ *     旧模式（单向 json）没这个通道，只靠 `PI_DELEGATE_RPC=0` 应急回退。
  *   - 助理之间不能互相派活（给子进程加了 -xt delegate）
  *   - 会话都留在磁盘上，但**不在 sessions/ 里**（否则 pi 自带的 /resume 会被助理刷满）：
  *     ~/.pi/agent/assistant-sessions/<助理 slug>/<时间戳>_<会话ID>.jsonl
@@ -40,6 +44,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
 import { addJob, beginRun, consume, markEnd, newJob, type EndStatus, type LiveJob } from "./live";
+import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
 
@@ -47,8 +52,14 @@ const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
 const MIN_TIMEOUT_MS = 5 * 1000; // 最少 5 秒
 const STATUS_KEY = "delegate";
-const PARTIAL_LIMIT = 2000; // 半成品最多保留的字符数
+const PARTIAL_LIMIT = 4000; // 半成品最多保留的字符数（超时卡片就靠它，给足）
 const STDERR_LIMIT = 4000;
+/** 时限低于这个就不值得发收尾提醒了（提醒本身也要占掉一个 turn） */
+const MIN_WINDDOWN_MS = 3 * 60 * 1000;
+/** 硬收尾的提前量：留出“打断 + 追问交卡”的时间 */
+const HARD_WINDDOWN_LEAD_MS = 45 * 1000;
+/** 软收尾的提前量：至少这么多秒，或总时限的 25%（取大的） */
+const SOFT_WINDDOWN_MIN_LEAD_MS = 120 * 1000;
 
 // ======================= 类型 =======================
 interface Template {
@@ -120,6 +131,10 @@ interface RunResult {
 	partial: string;
 	/** 它调用过的工具（按顺序，含重复） */
 	tools: string[];
+	/** 每个工具的耗时（超时卡片里用来看“预算被什么吃了”） */
+	toolRuns: { name: string; ms: number }[];
+	/** 到点前发过的收尾动作（收尾提醒 / 打断卡住的 run / 追问交卡） */
+	windDownLog: string[];
 	elapsedMs: number;
 	exitCode: number | null;
 	stderrTail: string;
@@ -469,6 +484,61 @@ function filteredEnv(passthrough: string[]): Record<string, string> {
 	return out;
 }
 
+/**
+ * 子进程走不走 RPC 通道？默认走。
+ * `PI_DELEGATE_RPC=0` 强制回退到旧的单向 `-p --mode json`（应急开关，代码保留不删）。
+ */
+function rpcEnabled(): boolean {
+	return (process.env.PI_DELEGATE_RPC ?? "") !== "0";
+}
+
+/**
+ * pi 到底支不支持 `--mode rpc`？
+ *
+ * 老版本没有 rpc 模式 —— 无脑切过去 = 派活全挂。所以开工前用 `pi --help` 探一次，
+ * 结果在**进程内缓存**（只花一次 0.5s）。探不到就老路径，行为跟改造前完全一样。
+ */
+let rpcProbe: Promise<boolean> | undefined;
+function rpcSupported(cli: string): Promise<boolean> {
+	if (!rpcEnabled()) return Promise.resolve(false);
+	if (rpcProbe) return rpcProbe;
+	rpcProbe = new Promise<boolean>((resolve) => {
+		let done = false;
+		const finish = (v: boolean): void => {
+			if (done) return;
+			done = true;
+			resolve(v);
+		};
+		try {
+			const p = spawn(process.execPath, [cli, "--help"], { stdio: ["ignore", "pipe", "pipe"], shell: false });
+			let out = "";
+			p.stdout?.on("data", (d: Buffer) => {
+				out += d.toString("utf8");
+			});
+			const t = setTimeout(() => {
+				try {
+					p.kill();
+				} catch {
+					/* ignore */
+				}
+				finish(false);
+			}, 20_000);
+			p.on("close", () => {
+				clearTimeout(t);
+				// 帮助里写着 `--mode <mode>  Output mode: text (default), json, or rpc`
+				finish(/\brpc\b/i.test(out));
+			});
+			p.on("error", () => {
+				clearTimeout(t);
+				finish(false);
+			});
+		} catch {
+			finish(false);
+		}
+	});
+	return rpcProbe;
+}
+
 function spawnWatched(
 	argv: string[],
 	cwd: string,
@@ -511,6 +581,44 @@ function deadlineRule(secs: number, resumed: boolean): string {
 		.join("\n");
 }
 
+/**
+ * 到点前的收尾提醒（走 RPC 的 steer）。
+ *
+ * 为什么需要：子助理**不知道时间在流逝** —— deadlineRule 只在开头说过一次“你必须在 N 秒内给出结论”，
+ * 它跑到第 8 分钟还以为“再查一个文件就好”（真事：一条 `ls` 花了 188.9s，预算直接抽干）。
+ * steer 不会打断它当前的工具调用，而是在“当前 turn 的工具跑完”后插一句 —— 正好是让它收手的时机。
+ *
+ * @param secLeft 还剩多少秒（写进提醒里，给它明确的时间感）
+ */
+function windDownText(secLeft: number): string {
+	return [
+		`【时间提醒】只剩约 ${secLeft} 秒。`,
+		"请开始收尾：不要再开新方向的大范围排查（大目录递归 ls / 全库 grep 这类）。",
+		"把**已经确认**的结论整理出来，按交卡格式输出。",
+		"还差什么就写清「未完成：…」，别硬撑到被掐断。",
+	].join("\n");
+}
+
+/**
+ * 硬收尾的「追问」文案。
+ *
+ * 为什么硬档是 `abort` + 追问，而不是只发一个更硬的 steer：
+ *   steer 的送达时机是「当前 turn 的工具调用跑完」—— 卡在一条 `sleep 240`（或那条 190s 的 ls）上时
+ *   提醒**永远送不进去**。实测：steer 被 accepted（queued），但到尾还是被硬杀，一个字没交。
+ *   而 `abort` 能真的打断正在跑的工具调用（实测 bash 被断成 "Command aborted"），
+ *   打断后上下文还在，再追一句就能拿到**像样的结论**，而不是一句 "I'll analyze..."。
+ *
+ * ⚠️ `abort_bash` 不用往里写了：它只管 RPC 客户端自己发的 `bash` 命令，掐不动模型的 bash 工具调用
+ *    （实测：返回 success，但 sleep 240 照样跑到底）。
+ */
+function wrapUpText(): string {
+	return [
+		"【时间到点，请立刻交卡】",
+		"不要再调用任何工具。把你**目前已经确认**的内容按交卡格式输出。",
+		"未完成的部分写「未完成：还差什么」，并说明下一步该做什么。",
+	].join("\n");
+}
+
 function cardPrompt(task: string): string {
 	return `【任务】
 ${task}
@@ -526,12 +634,23 @@ ${task}
 不要猜，不要编。做不到就说做不到。`;
 }
 
+/** 一条工具调用的耗时（卡片用） */
+interface ToolRunBrief {
+	id: string;
+	name: string;
+	startedAt: number;
+	/** 0 = 还没结束 */
+	ms: number;
+}
+
 // ======================= 解析 --mode json 的流 =======================
 interface Sink {
 	partial: string;
 	tools: string[];
 	final: string;
 	stderr: string;
+	/** 工具调用时序（两种模式共用；卡片里看“时间花哪了”） */
+	toolRuns: ToolRunBrief[];
 	/** 实时视图：每个事件同时喂给它，面板才看得到「它现在在干什么」 */
 	live?: LiveJob;
 }
@@ -556,19 +675,23 @@ function extractText(content: unknown): string {
 	return "";
 }
 
-/** 单行 JSON → 累积半成品 / 记录工具调用 / 取最终文本 */
-function handleLine(line: string, sink: Sink): void {
-	if (line.charCodeAt(0) !== 123 /* { */) return;
-	let obj: {
-		type?: string;
-		message?: { role?: string; content?: unknown };
-		assistantMessageEvent?: { type?: string; delta?: unknown; toolCall?: { name?: unknown } };
-	};
-	try {
-		obj = JSON.parse(line);
-	} catch {
-		return; // 不是 JSON（可能是 warning），忽略
-	}
+/** 一条 session 事件（`--mode json` 与 `--mode rpc` 形状一致） */
+interface EventRecord {
+	type?: string;
+	message?: { role?: string; content?: unknown };
+	assistantMessageEvent?: { type?: string; delta?: unknown; toolCall?: { name?: unknown } };
+	toolCallId?: unknown;
+	toolName?: unknown;
+	/** RPC 命令回执 / UI 请求也走这个形状 */
+	method?: unknown;
+	id?: unknown;
+}
+
+/**
+ * 事件对象 → 累积半成品 / 记录工具调用 / 取最终文本。
+ * **两种模式共用**：`--mode json` 从 stdout 逐行解析后进来，RPC 直接透传进来。
+ */
+function handleEvent(obj: EventRecord, sink: Sink): void {
 	// 实时视图：同一个事件同时喂给面板的状态机（它只认自己关心的字段）
 	if (sink.live) consume(sink.live, obj);
 	if (obj.type === "message_update") {
@@ -581,7 +704,38 @@ function handleLine(line: string, sink: Sink): void {
 	} else if (obj.type === "message_end" && obj.message?.role === "assistant") {
 		const t = extractText(obj.message.content);
 		if (t) sink.final = t;
+	} else if (obj.type === "tool_execution_start") {
+		sink.toolRuns.push({
+			id: String(obj.toolCallId ?? ""),
+			name: String(obj.toolName ?? "tool"),
+			startedAt: Date.now(),
+			ms: 0,
+		});
+		// 别让长任务把内存堆满
+		if (sink.toolRuns.length > 60) sink.toolRuns.splice(0, sink.toolRuns.length - 60);
+	} else if (obj.type === "tool_execution_end") {
+		const id = String(obj.toolCallId ?? "");
+		// 从后往前找第一条没结束的（id 对不上时也不至于记错）
+		for (let i = sink.toolRuns.length - 1; i >= 0; i--) {
+			const r = sink.toolRuns[i]!;
+			if (r.ms !== 0) continue;
+			if (id && r.id && r.id !== id) continue;
+			r.ms = Date.now() - r.startedAt;
+			break;
+		}
 	}
+}
+
+/** 单行 JSON → handleEvent（只有旧的 `-p --mode json` 那条路还在用） */
+function handleLine(line: string, sink: Sink): void {
+	if (line.charCodeAt(0) !== 123 /* { */) return;
+	let obj: EventRecord;
+	try {
+		obj = JSON.parse(line) as EventRecord;
+	} catch {
+		return; // 不是 JSON（可能是 warning），忽略
+	}
+	handleEvent(obj, sink);
 }
 
 function makeLineReader(sink: Sink): (chunk: string) => void {
@@ -646,12 +800,16 @@ function sessionFileFor(key: string, id: string): string | undefined {
 
 async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<RunResult> {
 	const started = Date.now();
-	const sink: Sink = { partial: "", tools: [], final: "", stderr: "" };
+	const sink: Sink = { partial: "", tools: [], final: "", stderr: "", toolRuns: [] };
+	/** 到点前发过的收尾动作（要在 base() 里带上，所以提到这层） */
+	const windDownLog: string[] = [];
 	const base = (outcome: Outcome, exitCode: number | null): RunResult => ({
 		outcome,
 		text: sink.final.trim(),
 		partial: sink.partial,
 		tools: sink.tools,
+		toolRuns: sink.toolRuns.map((t) => ({ name: t.name, ms: t.ms })),
+		windDownLog: [...windDownLog],
 		elapsedMs: Date.now() - started,
 		exitCode,
 		stderrTail: clampTail(sink.stderr.trim(), STDERR_LIMIT),
@@ -692,7 +850,12 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	//   - 模板写了 deny_tools: → 追加到黑名单
 	// ⚠️ MCP 工具名是 mcp__<server>__<tool>，用 -t 时必须逐个列出，否则 MCP 会不可用。
 	const denyTools = ["delegate", "progress", ...(tpl.denyTools ?? [])];
-	const args = [cli, "-p", "--mode", "json", "-xt", denyTools.join(",")];
+	// RPC 模式：stdin 保持打开，才能在到点前发 steering 催它收尾（这是本次改造的全部理由）。
+	// 旧模式 `-p --mode json` 是单向的，写完 prompt 就只能等它自己跑完或被杀。
+	const useRpc = await rpcSupported(cli);
+	const args = useRpc
+		? [cli, "--mode", "rpc", "-xt", denyTools.join(",")]
+		: [cli, "-p", "--mode", "json", "-xt", denyTools.join(",")];
 	if (tpl.tools?.length) args.push("-t", tpl.tools.join(","));
 	// -na：忽略项目级资源 → 掐掉 {cwd}/.pi/mcp.json。
 	//   否则项目的 MCP 会 merge 回影子配置里，「按需给」就白做了。
@@ -716,7 +879,18 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	return new Promise<RunResult>((done) => {
 		let timedOut = false;
 		let settled = false;
-		const read = makeLineReader(sink);
+
+		// ---------- 到点前优雅收尾（RPC 专属状态）----------
+		let softTimer: ReturnType<typeof setTimeout> | undefined;
+		let hardTimer: ReturnType<typeof setTimeout> | undefined;
+		let wrapUpTimer: ReturnType<typeof setTimeout> | undefined;
+		/** 硬收尾已发起 abort，等 agent_settled 到了要追问一次（而不是就此收工） */
+		let expectWrapUp = false;
+		let wrapUpSent = false;
+		/** 硬档已经开火了 → 这次运行算「超时被叫停」，而不是 done */
+		let hardWindDownFired = false;
+		/** 追问交卡的实现（在收尾块里赋值，因为要等 rpc 就绪） */
+		let wrapUpHook: (() => void) | undefined;
 
 		let child: ChildProcess;
 		try {
@@ -740,10 +914,42 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			return;
 		}
 
+		// ---------- 传输层：RPC（双向）或 旧 JSON（单向）----------
+		// RpcChannel 自己订阅 stdout；旧路径才需要 jsonRead 逐行喂。
+		let rpc: RpcChannel | undefined;
+		let jsonRead: ((chunk: string) => void) | undefined;
+		if (useRpc) {
+			rpc = new RpcChannel(child);
+			rpc.onEvent((rec) => {
+				handleEvent(rec, sink);
+				if (rec.type === "agent_settled") {
+					// 硬收尾阶段：这一条 settled 是 `abort` 把它打断产生的 → **不是**收工，而是追问交卡。
+					// 追问那一次跑完后再 settled，才真正收工。
+					if (expectWrapUp && !wrapUpSent) {
+						expectWrapUp = false;
+						wrapUpHook?.();
+					} else {
+						// 正常情况下：这一轮不会再自动续跑/重试 → 有序关闭 stdin，让 pi 收工退出。
+						// 迟迟不来的，由下面的 timer killTree 兜底。
+						rpc?.closeStdin();
+					}
+				}
+			});
+			// dialog 类请求（select/confirm/input/editor）**必须应答**：
+			// 不应答 pi 会一直 blocking 等 response → 子助理永久挂住。
+			// 语义对齐「非交互 = 拒绝」。notify/setStatus 这类不需要应答，rejectDialog 会自己跳过。
+			rpc.onUi((rec) => rejectDialog(rpc!, rec));
+		} else {
+			jsonRead = makeLineReader(sink);
+		}
+
 		const finish = (outcome: Outcome, exitCode: number | null): void => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			if (softTimer) clearTimeout(softTimer);
+			if (hardTimer) clearTimeout(hardTimer);
+			if (wrapUpTimer) clearTimeout(wrapUpTimer);
 			opt.signal?.removeEventListener("abort", onAbort);
 			liveJobs.delete(child);
 			// 面板终态：写在这里而不是事件里 —— agent_end 不代表进程结束（可能还会重试/续跑）
@@ -777,7 +983,42 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		};
 		opt.signal?.addEventListener("abort", onAbort);
 
-		child.stdout?.on("data", (d: Buffer) => read(d.toString("utf8")));
+		// ---------- 到点前优雅收尾（两档）----------
+		// 只能靠 RPC：旧模式是单向的，一个字节都发不进去，只能到点硬杀。
+		//   软档 = T - max(120s, 25%·T)：steer 一句“开始收尾，把已确认的结论整理出来”。
+		//          不打断它，只在两个 tool call 之间插话 —— 便宜（几十 tok）。
+		//   硬档 = T - 45s：它要还没交卡，就 `abort` 打断 + 追问一次交卡（见 wrapUpText）。
+		//          实测：软档对“卡在长命令里”的情况无效（steer 送不进去），硬档才是真保险。
+		if (rpc && opt.timeoutMs >= MIN_WINDDOWN_MS) {
+			const softLead = Math.max(SOFT_WINDDOWN_MIN_LEAD_MS, Math.floor(opt.timeoutMs * 0.25));
+			wrapUpHook = () => {
+				if (wrapUpSent || settled) return;
+				wrapUpSent = true;
+				windDownLog.push("追问交卡");
+				rpc?.send({ type: "prompt", message: wrapUpText() });
+			};
+			softTimer = setTimeout(() => {
+				if (settled) return;
+				windDownLog.push("收尾提醒");
+				rpc?.send({ type: "steer", message: windDownText(Math.round(softLead / 1000)) });
+			}, opt.timeoutMs - softLead);
+			hardTimer = setTimeout(() => {
+				if (settled) return;
+				windDownLog.push("打断卡住的 run");
+				hardWindDownFired = true;
+				expectWrapUp = true;
+				rpc?.send({ type: "abort" });
+				// 兜底：万一 abort 没触发 agent_settled（比如它当时本来就闲着），2 秒后直接追问
+				wrapUpTimer = setTimeout(() => {
+					if (settled || wrapUpSent) return;
+					expectWrapUp = false;
+					wrapUpHook?.();
+				}, 2_000);
+			}, opt.timeoutMs - HARD_WINDDOWN_LEAD_MS);
+		}
+
+		// RPC 路径由 RpcChannel 内部订阅（这里 jsonRead 是 undefined，等于不挂）
+		child.stdout?.on("data", (d: Buffer) => jsonRead?.(d.toString("utf8")));
 		child.stderr?.on("data", (d: Buffer) => {
 			sink.stderr = clampTail(sink.stderr + d.toString("utf8"), STDERR_LIMIT);
 		});
@@ -791,6 +1032,10 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 				finish("failed", code);
 			} else if (timedOut) {
 				finish("timeout", code);
+			} else if (hardWindDownFired) {
+				// 到点前被我们主动掐停（abort + 追问）：虽然是退出码 0、也有结论，
+				// 但**任务本身没跑完** —— 报成 timeout，让主会话拿着阶段成果自己决定要不要重启。
+				finish("timeout", code);
 			} else if (code !== 0) {
 				finish("failed", code);
 			} else if (sink.final.trim()) {
@@ -802,8 +1047,14 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 
 		// 任务正文走 stdin —— 避开命令行转义问题
 		try {
-			child.stdin?.write(cardPrompt(task), "utf8");
-			child.stdin?.end();
+			if (rpc) {
+				// ⚠️ 发完**不能** closeStdin()：关了 stdin 就再也发不出 steering，
+				//    而且等于立刻让 pi 收工。收工时机由 agent_settled / 超时定时器决定。
+				rpc.send({ id: "prompt-1", type: "prompt", message: cardPrompt(task) });
+			} else {
+				child.stdin?.write(cardPrompt(task), "utf8");
+				child.stdin?.end();
+			}
 		} catch (e) {
 			sink.stderr = clampTail(`${sink.stderr}\n[写入任务失败] ${e instanceof Error ? e.message : e}`, STDERR_LIMIT);
 			killTree(child);
@@ -838,19 +1089,32 @@ function renderCard(r: RunResult): string {
 			head = HEADS.done(name, secs);
 			body = r.text || "(空)";
 			break;
-		case "timeout":
+		case "timeout": {
 			head = HEADS.timeout(name, secs);
-			body = [
-				"状态: 超时（未完成）",
+			// 到点前已经叫停过（abort + 追问）的那次，结论在 r.text 里；只有硬杀才是空的 r.partial。
+			// 两者都可能为空 —— 那就是预算全耗在工具上了，会说清楚，而不是留一句
+			// “I'll analyze the directory structure...” 让人干瞪眼。
+			const gave = r.text.trim() || r.partial.trim();
+			const slow = r.toolRuns
+				.filter((t) => t.ms >= 5_000)
+				.sort((a, b) => b.ms - a.ms)
+				.slice(0, 3)
+				.map((t) => `${t.name} ${(t.ms / 1000).toFixed(1)}s`);
+			const parts: string[] = [
+				"状态: 超时（到点前已叫停，下面是它交回的阶段成果）",
 				"",
-				"到点前的产出：",
-				r.partial.trim() || "(还没吐出文字 —— 它可能一直在跑工具)",
-				"",
-				tools ? `它调用过：${tools}` : "它还没来得及动手。",
+				gave || "(它连文字都没来得及吐 —— 预算大概全耗在工具上了)",
+			];
+			if (tools) parts.push(`它调用过：${tools}`);
+			if (slow.length) parts.push(`最慢的几步：${slow.join(" · ")}`);
+			if (r.windDownLog.length) parts.push(`收尾动作：${r.windDownLog.join(" → ")}`);
+			parts.push(
 				"",
 				`要接着做就再调一次 delegate，带上 resume: "${r.names.id}" 和补充的时间 —— 它的历史都在，会接着做而不是重做。`,
-			].join("\n");
+			);
+			body = parts.join("\n");
 			break;
+		}
 		case "failed":
 			head = HEADS.failed(name, secs, r.exitCode === null ? "" : `，退出码 ${r.exitCode}`);
 			body = [
