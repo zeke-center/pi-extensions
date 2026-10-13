@@ -364,6 +364,28 @@ function stamp(d = new Date()): string {
 	);
 }
 
+/** 带毫秒的时间戳 —— 会话 ID 用。秒级粒度下，同一秒并发派发会撞 ID。 */
+function stampMs(d = new Date()): string {
+	return `${stamp(d)}${String(d.getMilliseconds()).padStart(3, "0")}`;
+}
+
+/**
+ * 助理 key 的稳定 ASCII 指纹（6 位 base36）。
+ *
+ * ⚠️ 为什么必需：中文 key（如「个人中心服务器助理」）会被 sanitizeSessionId
+ * 整段抹成 "-" 再剔掉，结果会话 ID 里**完全不含助理身份**，
+ * 于是同一秒并发派两个不同助理 → 两侧 ID 一模一样 → 第二个被锁拒掉。
+ * 用 FNV-1a 算个短指纹补上身份，纯 ASCII、稳定、不依赖名字长度。
+ */
+export function keyFingerprint(key: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < key.length; i++) {
+		h ^= key.charCodeAt(i);
+		h = Math.imul(h, 0x01000193) >>> 0;
+	}
+	return h.toString(36).padStart(6, "0").slice(0, 6);
+}
+
 /** 主进程的会话名；没设就兜底 */
 function mainName(ctx: ExtensionContext): string {
 	try {
@@ -383,9 +405,23 @@ function nextSeq(key: string): number {
 	return n;
 }
 
+/**
+ * 生成一个会话 ID：`<助理指纹>-<带毫秒时间戳>-<序号>`
+ *
+ * ⚠️ 两个坑，缺一不可：
+ *   1. 指纹：中文 key（如「个人中心服务器助理」）会被 sanitizeSessionId 整段抹成 "-" 再剔掉，
+ *      ID 里就【没有助理身份】了 → 同一秒派两个不同助理必然撞 ID。
+ *   2. 毫秒：秒级粒度下，并发派发同样能撞。
+ *
+ * 导出是为了单测（scripts/unit.mjs 直接断言「同毫秒两个助理不撞」）。
+ */
+export function makeSessionId(key: string, seq: number, at: Date = new Date()): string {
+	return sanitizeSessionId(`${keyFingerprint(key)}-${stampMs(at)}-${seq}`);
+}
+
 function buildNames(main: string, tpl: Template, seq: number, resumeId?: string): Names {
 	const display = `${main}-${tpl.name}${seq}`;
-	const id = resumeId ?? sanitizeSessionId(`${tpl.key}-${stamp()}-${seq}`);
+	const id = resumeId ?? makeSessionId(tpl.key, seq);
 	return { display, id };
 }
 

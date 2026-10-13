@@ -6,13 +6,13 @@
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
 ```
 
-装完就能用 `/board`、`/ai`（含 `/ai doctor` 自检）、`/assistants`、`/resume-agent`、`/agent-resume-back`、`/agents`、`/ai-delegate`，以及一个能直接派的**通用助理**。
+装完就能用 `/board`、`/usage`（全局 token 账）、`/ai`（含 `/ai doctor` 自检）、`/assistants`、`/resume-agent`、`/agent-resume-back`、`/agents`、`/ai-delegate`，以及一个能直接派的**通用助理**。
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
 | `ai-configure/pi-extensions.ts` | 入口：装配下面九个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
 | `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
-| `ai-configure/board.ts` | **任务进度看板** | `/board` + `progress` 工具 |
+| `ai-configure/board.ts` | **任务进度看板**（含中栏运行状态 + 全局用量） | `/board` · `/usage` + `progress` 工具 |
 | `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` + `delegate` 工具 |
 | `ai-configure/live.ts` | 子代理实时状态机（把 JSON 事件流翻成可画的行） | — |
 | `ai-configure/panel.ts` | 子代理实时面板（看板正上方整宽，默认） | `/agents` |
@@ -93,6 +93,7 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `clear` | 清空任务列表 |
 | | `above` \| `below` | 面板放输入框上方 / 下方 |
 | | `right` \| `mid` | 显示 / 隐藏右区（MCP / 插件 / 助理）/ 中栏 |
+| **`/usage`** | — | **全局 token 账**：本会话 + 所有子代理（按助理列明细）。中栏只显示合计，要明细敲这个 |
 | **`/assistants`** | — | 列出所有助理模板（分「可派发 / 基础模板 / 示例模板」三组） |
 | | `show <key>` | 展开全部字段 + 继承链 + 提示词正文 |
 | | `edit <key>` | 弹面板改（**基础模板 / MCP / 超时 / AGENTS.md / 存哪儿 / 正文**）。底座只读，会被拒 |
@@ -367,7 +368,8 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 | `/board clear` | 清空任务 |
 | `/board above` · `/board below` | 面板在输入框**上方** / **下方** |
 | `/board right` | 显示 / 隐藏**右区**（MCP / 插件 / 助理 三栏）|
-| `/board mid` | 显示 / 隐藏**中栏**（现在 / 本轮 / 会话）|
+| `/board mid` | 显示 / 隐藏**中栏**（现在 / 本轮 / 会话 / 子代理）|
+| `/usage` | **全局用量**：本会话 + 所有子代理的 token 账（含按助理明细表） |
 
 ### 面板分栏
 
@@ -376,13 +378,13 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 | 栏 | 宽度 | 内容 |
 |---|---|---|
 | 左（任务） | 自适应，**保底 28** | 任务进度：标题、步骤（最多显示 **8** 步）、卡点、以及**自动跟踪的当前动作**（由 `tool_call` 事件推出，如「读取文件」「执行命令」） |
-| 中（运行） | 24 | `现在` / `本轮` / `会话`。**面板总宽 ≥ 110 列才出现**，窄终端自动收起 |
+| 中（运行） | 30 | `现在` / `本轮` / `会话` / `子代理`（详见下）。**面板总宽 ≥ 116 列才出现**，窄终端自动收起 |
 | MCP | 平分剩余（上限 26 / 下限 9） | **MCP 服务**（区分 session / project / global 三级） |
 | 插件 | 同上 | **已加载插件** |
 | 助理 | 同上 | **助理**（`delegate` 现在能派谁） |
 
 > **窄终端自动降级**：面板总宽 **< 88 列**时，MCP / 插件 / 助理 会**叠回一栏**（就是改之前的样子）。
-> 名字按**实际栏宽**截断（带 `…`）。所以是 **4 栏**（总宽 < 110）还是 **5 栏**（总宽 ≥ 110）取决于你的终端宽度。
+> 名字按**实际栏宽**截断（带 `…`）。所以是 **4 栏**（总宽 < 116）还是 **5 栏**（总宽 ≥ 116）取决于你的终端宽度。
 
 长这样（总宽 100 → 4 栏）：
 
@@ -395,6 +397,29 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 ```
 
 > 面板**曾**有「模型 / token 用量 / git 分支」一行，已删 —— 一是你不想看，二是它每 2.4s 要跑一次 `git branch` 子进程。想看 token 用量和成本，用内置的 **`/session`**。
+
+#### 「中栏」一栏
+
+常驻显示**这一次到底花掉了什么**。四行：
+
+| 行 | 内容 |
+|---|---|
+| `⚙ 运行 · N 轮` | 标题 + 本会话跑过几轮（**一轮 = 一问一答**） |
+| `现在` | `生成中 · 62t/s`（流式实时估算） / `工具 · 3.2s` / `思考中…` / `待命` |
+| `本轮` | 本回合**真正在跑**的时长 + `↑输入 ↓输出 R缓存` |
+| `会话` | 本会话**累计活跃时长** + `↑↓R` |
+| `子代理` | 所有 `delegate` 子会话的累计 + `↑↓R`（没有子代理时不显示这一行） |
+
+**四条关键设计**：
+
+1. **「一轮」= 一问一答，不是一次模型请求**。pi 里 `turn` 是「一次模型请求」，而一次问答里可能夹着好几次请求（工具调用）。面板统计的是 `agent_start` → `agent_settled`。
+2. **计时只在真正运行时走**：跑完**立刻定格**，不会继续涨；**弹窗等你点按钮的时间扣掉**（否则发会儿呆，时长就虚高了）。
+3. **TPS 是估算值**：用流式回调里的**字符数**除以时间；每轮结束再拿 API 返回的**真实 `output` token** 反推 `charsPerToken` 自动校准（首次默认 2.0）。所以它只能「看个趋势」，不是精确值。
+4. **子代理的账要单独扫**：`delegate` 的返回值里**不含 usage**，子代理的用量只写在它自己的会话文件里 —— 所以 `/usage` 和这行会去扫 `~/.pi/agent/assistant-sessions/*/*.jsonl`，**按 mtime + size 缓存**，不是每帧重读。
+
+**token 只能「跳跃更新」** —— 只有每次 API 请求结束才知道真实用量（流式过程中只数得到字符）。所以**时长是连续涨的，token 是一跳一跳的**，这是物理限制，不是 bug。
+
+**三色**：`↑` 输入（亮） / `↓` 输出（accent） / `R` 缓存命中（灰）。**不显示命中率** —— footer 的 `CH` 已经有了，中栏不重复。
 
 #### 「MCP」一栏
 
@@ -436,7 +461,8 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 ### 其他
 
 - **状态会持久化**：每次更新都 `pi.appendEntry("task-board", …)`，所以 `/resume`、`/tree`、fork 之后看板还在。
-- 监听的事件：`session_start`、`tool_call`、`turn_start`、`turn_end`、`agent_end`、`model_select`、`mcp_servers_change`、`before_agent_start`、`session_shutdown`。
+- 监听的事件：`session_start`、`tool_call`、`agent_start`、`agent_end`、`agent_settled`、`turn_start`、`turn_end`、`message_start`、`message_update`、`message_end`、`ui_prompt_start`、`ui_prompt_end`、`model_select`、`mcp_servers_change`、`before_agent_start`、`session_shutdown`。
+- **`agent_end` 和 `agent_settled` 都收（双保险）**，用 `runAccounted` 标记防重复入账 —— 只挂其中一个，遇到压缩 / 自动重试 / 排队续跑时可能漏记。
 - 顶栏的 spinner 会随 agent 运行状态动。
 
 ---
@@ -564,7 +590,11 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 | | 格式 | 例子 |
 |---|---|---|
 | **显示名**（`/resume-agent` 里看到的） | `<主进程名>-<代理名><序号>` | `修复登录bug-数据库助理1` |
-| **会话 ID**（ASCII，机器用） | `<slug>-<年月日>-<时分秒>-<序号>` | `db-20261003-195122-1` |
+| **会话 ID**（ASCII，机器用） | `<助理指纹>-<年月日>-<时分秒毫秒>-<序号>` | `yd4ljq-20261013-102109-802-1` |
+
+> ⚠️ **ID 里必须带「助理指纹」**（v1.9.0 起）：pi 硬性要求会话 ID 只能是 ASCII，中文助理名过一遍清洗（`[^A-Za-z0-9\-_.]` → `-`，再把首尾非字母数字剥掉）会被**整段抹掉** ——
+> 于是 `个人中心服务器助理` 和 `个人中心数据库助理` 在同一秒派发会得到**完全相同**的 ID（都退化成 `20261013-102109-1`），第二个直接被会话锁拒掉。**这不是巧合，是必然。**
+> 现在把助理 key 用 **FNV-1a 哈希**压成 6 位 ASCII 指纹（`yd4ljq` / `1cx6p4` / `a6tffv`）拼在最前面，并且时间戳**精确到毫秒**，并发派多少个都不会撞。
 
 - 主进程名 = 主 pi 的 `/name`；没设就是 `主进程`
 - 序号 = 该代理**在本会话里第几次被派**（累加，所以不会撞名）

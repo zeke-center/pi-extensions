@@ -17,7 +17,7 @@
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Focusable, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
@@ -28,8 +28,8 @@ const MAX_VISIBLE_STEPS = 8;
 const RIGHT_WIDTH = 26; // 右区（MCP/插件/助理）每栏宽度上限
 const RIGHT_MIN = 9; // 右区每栏宽度下限（再窄就没法看了）
 const LEFT_MIN = 28; // 左栏（任务进度）保底宽度
-const MID_WIDTH = 24;
-const MID_MIN_COLS = 110; // 面板总宽 ≥ 此值才显示中栏（运行状态）
+const MID_WIDTH = 30;
+const MID_MIN_COLS = 116; // 面板总宽 ≥ 此值才显示中栏（运行状态）
 const NARROW_COLS = 88; // 总宽 < 此值：右区三栏退回「三段叠一栏」
 const MAX_LISTED = 6;
 
@@ -62,12 +62,40 @@ let activity: string | undefined;
 let turnNo = 0;
 let lastProgressTurn = 0;
 
-// 中栏「运行」统计
-let turnStart = 0; // 本轮开始时间
-let turnCalls = 0; // 本轮工具调用次数
+// 中栏「运行」统计 —— ⚠️ 一轮 = 一问一答（agent_start → agent_settled），
+// 不是模型请求（turn）。实测 pi 的 turn_start 是「每次模型请求」。
+let running = false; // 我是否正在跑（决定「现在」行显示什么、计时走不走）
+let runStart = 0; // 本轮起点（agent_start）
+let runFrozenMs = 0; // 本轮已定格时长（跑完后不再增长）
+let pausedTotal = 0; // 本轮累计「等你点弹窗」的时长（要扣掉）
+let pauseStart = 0; // 当前暂停起点（0 = 未暂停）
+let activeTotalMs = 0; // 会话累计活跃时长（只算真正在跑的）
+let runCount = 0; // 会话轮数（一问一答次数）
+let runTokIn = 0; // 本轮输入 token 累计
+let runTokOut = 0; // 本轮输出 token 累计
+let runTokCache = 0; // 本轮缓存命中 token 累计
 let activityStart = 0; // 当前动作开始时间
-let sessionStart = 0; // 本 pi 会话开始时间
-let sessionTurns = 0; // 会话轮数
+let sessionStart = 0; // 本 pi 会话开始时间（挂钟）
+
+// LLM 生成速度（TPS）
+let genStart = 0; // 本次生成起点（0 = 未在生成）
+let genChars = 0; // 本次生成累计收到的字符数
+let lastTps = 0; // 最近一次测得的 TPS（生成结束后定格）
+let charsPerToken = 2.0; // 字符→token 比值（中文约 2；首次响应后自动校准）
+
+// 会话累计 token（与 pi footer 同源：遍历 session entries，缓存避免每 300ms 重算）
+let sessTok = { input: 0, output: 0, cacheRead: 0 };
+
+// 子代理用量 —— delegate 的返回值【不含用量】，子代理的消耗记在它自己的会话文件里，
+// 主会话 footer / getSessionStats 都看不到。想算全局账只能自己扫 assistant-sessions/。
+interface TokAgg {
+	sessions: number;
+	input: number;
+	output: number;
+	cacheRead: number;
+}
+let subTok: TokAgg = { sessions: 0, input: 0, output: 0, cacheRead: 0 };
+let subDetail: Array<TokAgg & { name: string }> = [];
 
 let showWidget = true;
 let showRight = true;
@@ -99,21 +127,231 @@ function fmtDur(ms: number): string {
 	return `${h}h${String(m % 60).padStart(2, "0")}m`;
 }
 
+/** token 数量格式化：1234 → 1.2k，8000 → 8k（最多 4 字符，保证中栏不溢出） */
+function fmtTok(n: number): string {
+	if (!Number.isFinite(n) || n <= 0) return "0";
+	if (n < 1000) return String(Math.round(n));
+	const trim = (s: string) => s.replace(/\.0$/, "");
+	if (n < 1_000_000) {
+		const k = n / 1000;
+		return `${k < 10 ? trim(k.toFixed(1)) : Math.round(k)}k`;
+	}
+	if (n < 1_000_000_000) {
+		const m = n / 1_000_000;
+		return `${m < 10 ? trim(m.toFixed(1)) : Math.round(m)}M`;
+	}
+	const g = n / 1_000_000_000;
+	return `${g < 10 ? trim(g.toFixed(1)) : Math.round(g)}G`;
+}
+
+/** 从一条 assistant 消息里量出「已生成的文本长度」（用于实时估 TPS） */
+function assistantTextLen(msg: unknown): number {
+	const content = (msg as { content?: unknown })?.content;
+	if (typeof content === "string") return content.length;
+	if (!Array.isArray(content)) return 0;
+	let n = 0;
+	for (const part of content) {
+		const p = part as { type?: string; text?: string; thinking?: string };
+		if (p?.type === "text" && typeof p.text === "string") n += p.text.length;
+		else if (p?.type === "thinking" && typeof p.thinking === "string") n += p.thinking.length;
+	}
+	return n;
+}
+
+/** 本轮是否已入账（防止 agent_end 与 agent_settled 重复累加活跃时长） */
+let runAccounted = false;
+
+/** 停表 + 定格 + 入账（幂等，重复调用不会重复累加） */
+function settleRun(): void {
+	if (running) {
+		running = false;
+		runFrozenMs = Date.now() - runStart - pausedTotal;
+	}
+	if (!runAccounted && runFrozenMs > 0) {
+		activeTotalMs += runFrozenMs;
+		runAccounted = true;
+	}
+}
+
+/** 本轮耗时：跑完就拿冻结值，不再增长 */
+function turnMs(): number {
+	return running ? Date.now() - runStart - pausedTotal : runFrozenMs;
+}
+
+/** 会话活跃时长（含正在跑的那一段） */
+function sessionActiveMs(): number {
+	return activeTotalMs + (running ? Date.now() - runStart - pausedTotal : 0);
+}
+
+/** 把一份 usage 累加进汇总（字段可能缺失） */
+function addUsageInto(
+	into: { input: number; output: number; cacheRead: number },
+	usage: { input?: number; output?: number; cacheRead?: number } | undefined,
+): void {
+	if (!usage) return;
+	into.input += usage.input ?? 0;
+	into.output += usage.output ?? 0;
+	into.cacheRead += usage.cacheRead ?? 0;
+}
+
+/** 会话累计 token —— 与 pi footer 用同一套口径（含压缩/工具摘要用量） */
+function recomputeSessTok(ctx: ExtensionContext): void {
+	const totals = { input: 0, output: 0, cacheRead: 0 };
+	try {
+		const entries = ctx.sessionManager.getEntries() as Array<{
+			type?: string;
+			usage?: { input?: number; output?: number; cacheRead?: number };
+			message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number } };
+		}>;
+		for (const e of entries) {
+			if (e.type === "usage") addUsageInto(totals, e.usage);
+			else if (e.type === "message" && e.message?.role === "assistant") addUsageInto(totals, e.message.usage);
+			else if (e.type === "message" && e.message?.role === "toolResult") addUsageInto(totals, e.message.usage);
+			else if (e.type === "branch_summary" || e.type === "compaction") addUsageInto(totals, e.usage);
+		}
+	} catch {
+		/* 读不到就保留旧值 */
+	}
+	sessTok = totals;
+}
+
+/** 每个子会话文件的上次结果（按 mtime+size 缓存：未改动的文件不重读） */
+const subFileCache = new Map<string, TokAgg & { mtimeMs: number; size: number }>();
+const USAGE_RE = /"usage":\s*\{"input":(\d+),\s*"output":(\d+),\s*"cacheRead":(\d+)/g;
+
+/** 扫描 ~/.pi/agent/assistant-sessions/<助理>/*.jsonl 里的 usage，汇总到 subTok / subDetail */
+function recomputeSubTok(): void {
+	const root = join(getAgentDir(), "assistant-sessions");
+	const detail: Array<TokAgg & { name: string }> = [];
+	const total: TokAgg = { sessions: 0, input: 0, output: 0, cacheRead: 0 };
+
+	try {
+		if (!existsSync(root)) {
+			subTok = total;
+			subDetail = detail;
+			return;
+		}
+		for (const dir of readdirSync(root, { withFileTypes: true })) {
+			if (!dir.isDirectory()) continue;
+			const dpath = join(root, dir.name);
+			const agg: TokAgg & { name: string } = { name: dir.name, sessions: 0, input: 0, output: 0, cacheRead: 0 };
+			let files: string[] = [];
+			try {
+				files = readdirSync(dpath);
+			} catch {
+				continue;
+			}
+			for (const f of files) {
+				if (!f.endsWith(".jsonl")) continue;
+				const fp = join(dpath, f);
+				let mtimeMs = 0;
+				let size = 0;
+				try {
+					const st = statSync(fp);
+					mtimeMs = st.mtimeMs;
+					size = st.size;
+				} catch {
+					continue;
+				}
+				agg.sessions++;
+				let hit = subFileCache.get(fp);
+				if (!hit || hit.mtimeMs !== mtimeMs || hit.size !== size) {
+					let input = 0;
+					let output = 0;
+					let cacheRead = 0;
+					try {
+						const text = readFileSync(fp, "utf8");
+						USAGE_RE.lastIndex = 0;
+						let m: RegExpExecArray | null;
+						while ((m = USAGE_RE.exec(text)) !== null) {
+							input += Number(m[1]);
+							output += Number(m[2]);
+							cacheRead += Number(m[3]);
+						}
+					} catch {
+						/* 读不了当 0 */
+					}
+					hit = { mtimeMs, size, sessions: 0, input, output, cacheRead };
+					subFileCache.set(fp, hit);
+				}
+				agg.input += hit.input;
+				agg.output += hit.output;
+				agg.cacheRead += hit.cacheRead;
+			}
+			if (agg.sessions > 0) {
+				detail.push(agg);
+				total.sessions += agg.sessions;
+				total.input += agg.input;
+				total.output += agg.output;
+				total.cacheRead += agg.cacheRead;
+			}
+		}
+	} catch {
+		/* 整块失败就保留旧值 */
+	}
+
+	detail.sort((a, b) => b.input + b.output - (a.input + a.output));
+	subTok = total;
+	subDetail = detail;
+}
+
 /** 中栏：运行状态（动态过程）—— 底部状态栏已经有的东西这里不放 */
 function midLines(theme: Theme): string[] {
 	const t = theme;
 	const out: string[] = [];
-	out.push(` ${t.fg("accent", t.bold("⚙ 运行"))}`);
 
-	const now = activity ? `${activity} · ${fmtDur(Date.now() - activityStart)}` : "待命";
-	out.push(` ${t.fg("muted", "现在")} ${t.fg(activity ? "text" : "dim", shortText(now, MID_WIDTH - 6))}`);
+	// 标题行：⚙ 运行 · N 轮（轮 = 一问一答）
+	out.push(` ${t.fg("accent", t.bold("⚙ 运行"))}${runCount ? t.fg("muted", ` · ${runCount} 轮`) : ""}`);
 
-	const t0 = turnStart || sessionStart;
-	const calls = t0 ? `${turnCalls} 次 · ${fmtDur(Date.now() - t0)}` : "—";
-	out.push(` ${t.fg("muted", "本轮")} ${t.fg("text", shortText(calls, MID_WIDTH - 6))}`);
+	// ── 现在 ──
+	let now: string;
+	let tone: "text" | "dim" | "accent" = "dim";
+	if (activity) {
+		now = `${activity} · ${fmtDur(Date.now() - activityStart)}`;
+		tone = "text";
+	} else if (genStart) {
+		const sec = (Date.now() - genStart) / 1000;
+		const tps = sec > 0.4 && genChars > 0 ? Math.max(1, Math.round(genChars / charsPerToken / sec)) : lastTps;
+		now = `生成中 · ${tps}t/s`;
+		tone = "accent";
+	} else if (running) {
+		now = "思考中…";
+		tone = "text";
+	} else {
+		now = "待命";
+	}
+	out.push(` ${t.fg("muted", "现在")} ${t.fg(tone, shortText(now, MID_WIDTH - 6))}`);
 
-	const sess = sessionStart ? `${fmtDur(Date.now() - sessionStart)} · ${sessionTurns} 轮` : "—";
-	out.push(` ${t.fg("muted", "会话")} ${t.fg("text", shortText(sess, MID_WIDTH - 6))}`);
+	// ── 本轮（跑完定格；token 按 输入/输出/缓存 三类上色）──
+	const hasRun = running || runFrozenMs > 0 || runTokIn > 0 || runTokOut > 0 || runTokCache > 0;
+	if (!hasRun) {
+		out.push(` ${t.fg("muted", "本轮")} ${t.fg("dim", "—")}`);
+	} else {
+		out.push(
+			` ${t.fg("muted", "本轮")} ${t.fg("text", fmtDur(turnMs()))}` +
+				t.fg("text", ` ↑${fmtTok(runTokIn)}`) +
+				t.fg("accent", ` ↓${fmtTok(runTokOut)}`) +
+				t.fg("dim", ` R${fmtTok(runTokCache)}`),
+		);
+	}
+
+	// ── 会话（活跃时长 + 三类累计）──
+	out.push(
+		` ${t.fg("muted", "会话")} ${t.fg("text", fmtDur(sessionActiveMs()))}` +
+			t.fg("text", ` ↑${fmtTok(sessTok.input)}`) +
+			t.fg("accent", ` ↓${fmtTok(sessTok.output)}`) +
+			t.fg("dim", ` R${fmtTok(sessTok.cacheRead)}`),
+	);
+
+	// ── 子代理（delegate 的账，主会话看不到，得自己扫）──
+	if (subTok.sessions > 0) {
+		out.push(
+			` ${t.fg("muted", "子代理")}` +
+				t.fg("text", ` ↑${fmtTok(subTok.input)}`) +
+				t.fg("accent", ` ↓${fmtTok(subTok.output)}`) +
+				t.fg("dim", ` R${fmtTok(subTok.cacheRead)}`),
+		);
+	}
 
 	return out;
 }
@@ -395,6 +633,8 @@ function refreshMcp(ctx: ExtensionContext): void {
 function refreshData(ctx: ExtensionContext): void {
 	lastCtx = ctx;
 	refreshMcp(ctx);
+	recomputeSessTok(ctx);
+	recomputeSubTok();
 	try {
 		cachedPlugins = computePlugins();
 	} catch {
@@ -527,7 +767,7 @@ function startTimer(): void {
 	if (timer) return;
 	timer = setInterval(() => {
 		tickCount++;
-		const busy = steps.some((s) => s.status === "doing") || !!activity;
+		const busy = running || steps.some((s) => s.status === "doing");
 		if (busy) {
 			spinnerIdx++;
 			// 以前这里直接 return（只重画不刷新）—— 只要有个步骤卡在 doing，
@@ -772,19 +1012,100 @@ export function setupBoard(api: ExtensionAPI): void {
 	// ---------- 事件 ----------
 	api.on("tool_call", async (event, ctx) => {
 		lastCtx = ctx;
-		turnCalls++;
 		if (event.toolName === "progress") return;
 		activity = summarizeTool(event.toolName);
 		activityStart = Date.now();
 		renderWidget();
 	});
 
+	// ⚠️ 一轮 = 一问一答：agent_start → agent_settled
+	//    pi 的 turn_start / turn_end 是「每次模型请求」，不是「一轮」，不拿它计时/计轮数。
+
+	/** 🟢 一轮开始：你发消息 → 我开始跑 */
+	api.on("agent_start", async (_event, ctx) => {
+		lastCtx = ctx;
+		running = true;
+		runAccounted = false;
+		runStart = Date.now();
+		runFrozenMs = 0;
+		pausedTotal = 0;
+		pauseStart = 0;
+		runTokIn = 0;
+		runTokOut = 0;
+		runTokCache = 0;
+		runCount++;
+		genStart = 0;
+		genChars = 0;
+		activity = undefined;
+		renderWidget();
+	});
+
+	/** 一条 assistant 消息开始生成 → 进入「生成中」 */
+	api.on("message_start", async (event, ctx) => {
+		lastCtx = ctx;
+		if ((event as { message?: { role?: string } }).message?.role !== "assistant") return;
+		activity = undefined;
+		genStart = Date.now();
+		genChars = 0;
+		renderWidget();
+	});
+
+	/** 流式增量 → 累计字符数，实时估 TPS */
+	api.on("message_update", async (event, ctx) => {
+		lastCtx = ctx;
+		const ev = event as {
+			message?: { role?: string };
+			assistantMessageEvent?: { delta?: unknown; text?: unknown };
+		};
+		if (ev.message?.role !== "assistant") return;
+		if (!genStart) {
+			genStart = Date.now();
+			genChars = 0;
+		}
+		// 双路兜底：优先用增量 delta，退化用「累积消息的文本长度」
+		const ame = ev.assistantMessageEvent;
+		const delta = typeof ame?.delta === "string" ? ame.delta : typeof ame?.text === "string" ? ame.text : "";
+		if (delta) genChars += delta.length;
+		const acc = assistantTextLen(ev.message);
+		if (acc > genChars) genChars = acc;
+		renderWidget();
+	});
+
+	/** 一条消息结束 → 累加本轮 token + 用真实 output 校准字符/token 比值 */
+	api.on("message_end", async (event, ctx) => {
+		lastCtx = ctx;
+		const msg = (
+			event as {
+				message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number } };
+			}
+		).message;
+		if (msg?.role !== "assistant") return;
+		const u = msg.usage;
+		if (u) {
+			runTokIn += u.input ?? 0;
+			runTokOut += u.output ?? 0;
+			runTokCache += u.cacheRead ?? 0;
+			// 自动校准：本次流的字符数 ÷ 真实 output token → 越用越准
+			const out = u.output ?? 0;
+			if (genChars > 200 && out > 0) {
+				const ratio = genChars / out;
+				if (ratio > 0.8 && ratio < 8) charsPerToken = ratio;
+			}
+		}
+		if (genStart) {
+			const sec = (Date.now() - genStart) / 1000;
+			if (sec > 0.3 && genChars > 0) lastTps = Math.max(1, Math.round(genChars / charsPerToken / sec));
+			genStart = 0;
+			genChars = 0;
+		}
+		refreshData(ctx);
+		renderWidget();
+	});
+
+	/** ⚠️ 这只是一个模型请求结束，不是「一轮」 */
 	api.on("turn_start", async (_event, ctx) => {
 		lastCtx = ctx;
-		turnStart = Date.now();
-		turnCalls = 0;
-		sessionTurns++;
-		// 每轮开头也重算一次：保证「一轮里至少刷一次」
+		// 每个模型请求开头也重算一次 MCP：保证会话开始后至少刷一次
 		refreshMcp(ctx);
 		renderWidget();
 	});
@@ -796,11 +1117,38 @@ export function setupBoard(api: ExtensionAPI): void {
 		refresh();
 	});
 
+	/** 🟡 agent loop 结束（后面可能还有自动重试 / 压缩 / 续跑） */
 	api.on("agent_end", async (_event, ctx) => {
 		lastCtx = ctx;
 		activity = undefined;
+		genStart = 0;
+		settleRun();
 		refreshData(ctx);
 		refresh();
+	});
+
+	/** 🟢 本轮彻底结束：定格 + 入账 */
+	api.on("agent_settled", async (_event, ctx) => {
+		lastCtx = ctx;
+		activity = undefined;
+		genStart = 0;
+		settleRun();
+		refreshData(ctx);
+		refresh();
+	});
+
+	/** ⏸ 弹窗等你点（✅/✏️/⛔）—— 这段不该算进我的工作时长 */
+	api.on("ui_prompt_start", async (_event, ctx) => {
+		lastCtx = ctx;
+		if (running && !pauseStart) pauseStart = Date.now();
+	});
+
+	api.on("ui_prompt_end", async (_event, ctx) => {
+		lastCtx = ctx;
+		if (pauseStart) {
+			pausedTotal += Date.now() - pauseStart;
+			pauseStart = 0;
+		}
 	});
 
 	api.on("model_select", async (_event, ctx) => {
@@ -893,6 +1241,34 @@ ${planLine}
 	});
 
 	// ---------- 命令 ----------
+	api.registerCommand("usage", {
+		description: "用量：主会话 + 子代理的全局 token 账",
+		handler: async (_args: string, ctx: ExtensionContext) => {
+			lastCtx = ctx;
+			recomputeSessTok(ctx);
+			recomputeSubTok();
+			const f = fmtTok;
+			const lines: string[] = [];
+			lines.push(`⚙ 用量 · ${runCount} 轮 · 活跃 ${fmtDur(sessionActiveMs())}`);
+			lines.push("");
+			lines.push(`  主会话   ↑${f(sessTok.input)}  ↓${f(sessTok.output)}  R${f(sessTok.cacheRead)}`);
+			lines.push(`  子代理   ↑${f(subTok.input)}  ↓${f(subTok.output)}  R${f(subTok.cacheRead)}`);
+			lines.push("  " + "─".repeat(34));
+			lines.push(
+				`  合计     ↑${f(sessTok.input + subTok.input)}  ↓${f(sessTok.output + subTok.output)}  R${f(sessTok.cacheRead + subTok.cacheRead)}`,
+			);
+			lines.push("");
+			lines.push(`子代理明细（共 ${subTok.sessions} 个会话）`);
+			if (subDetail.length === 0) lines.push("  （还没有子代理会话）");
+			for (const d of subDetail) {
+				lines.push(`  ${d.name}  ${d.sessions}个  ↑${f(d.input)} ↓${f(d.output)} R${f(d.cacheRead)}`);
+			}
+			lines.push("");
+			lines.push("↑输入  ↓输出  R缓存读（缓存命中率看底部状态栏 CH）");
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
 	api.registerCommand("board", {
 		description: "任务/会话面板：/board [on|off|clear|above|below|right|mid]",
 		handler: async (args: string, ctx: ExtensionContext) => {
@@ -943,10 +1319,22 @@ ${planLine}
 	// ---------- 生命周期 ----------
 	api.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
-		sessionStart = Date.now();
-		turnStart = Date.now();
-		turnCalls = 0;
-		sessionTurns = 0;
+		sessionStart = Date.now(); // 仅作挂钟参考；「会话」行显示的是活跃时长
+		running = false;
+		runAccounted = false;
+		runStart = 0;
+		runFrozenMs = 0;
+		pausedTotal = 0;
+		pauseStart = 0;
+		activeTotalMs = 0;
+		runCount = 0;
+		runTokIn = 0;
+		runTokOut = 0;
+		runTokCache = 0;
+		genStart = 0;
+		genChars = 0;
+		lastTps = 0;
+		sessTok = { input: 0, output: 0, cacheRead: 0 };
 
 		try {
 			const entries = ctx.sessionManager.getEntries();
