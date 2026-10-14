@@ -46,6 +46,7 @@ import { type FormResult, type FormField, showForm, type PickItem } from "./form
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
+import { isExtDisabled, onGateApply } from "./gate";
 import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
@@ -135,6 +136,8 @@ interface RunResult {
 	toolRuns: { name: string; ms: number }[];
 	/** 到点前发过的收尾动作（收尾提醒 / 打断卡住的 run / 追问交卡） */
 	windDownLog: string[];
+	/** 最终回复被模型的输出上限截断（pi 1.2.0 起 `-p` 会因此在 stderr 报警并以 1 退出） */
+	truncated: boolean;
 	elapsedMs: number;
 	exitCode: number | null;
 	stderrTail: string;
@@ -785,12 +788,15 @@ function handleEvent(obj: EventRecord, sink: Sink): void {
 		if (sink.toolRuns.length > 60) sink.toolRuns.splice(0, sink.toolRuns.length - 60);
 	} else if (obj.type === "tool_execution_end") {
 		const id = String(obj.toolCallId ?? "");
+		// pi 1.1.0 起事件直接带 durationMs（单调时钟量的 execute() 耗时，两路都有）→
+		// 优先用它：比 Date.now() 差值准（不受事件乱序影响），重载会话后也照样准。
+		const reported = typeof obj.durationMs === "number" ? obj.durationMs : undefined;
 		// 从后往前找第一条没结束的（id 对不上时也不至于记错）
 		for (let i = sink.toolRuns.length - 1; i >= 0; i--) {
 			const r = sink.toolRuns[i]!;
 			if (r.ms !== 0) continue;
 			if (id && r.id && r.id !== id) continue;
-			r.ms = Date.now() - r.startedAt;
+			r.ms = reported ?? Date.now() - r.startedAt;
 			break;
 		}
 	}
@@ -880,6 +886,9 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		tools: sink.tools,
 		toolRuns: sink.toolRuns.map((t) => ({ name: t.name, ms: t.ms })),
 		windDownLog: [...windDownLog],
+		// pi 1.2.0：`-p` 模式下最终回复撞到输出上限时，会打印已产出的文本、
+		// stderr 写 "Response was truncated: the model reached its output token limit."、并以退出码 1 结束。
+		truncated: /output token limit/i.test(sink.stderr),
 		elapsedMs: Date.now() - started,
 		exitCode,
 		stderrTail: clampTail(sink.stderr.trim(), STDERR_LIMIT),
@@ -916,9 +925,11 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// -xt：助理不需要面板工具（影子目录下本来也没有 ai-configure，这里是双保险）
 	// 工具控制：
 	//   - 默认：黑名单只挡面板工具（助理不需要 delegate/progress）
-	//   - 模板写了 tools: → 白名单（-t），只给列出的工具（精确匹配）
+	//   - 模板写了 tools: → 白名单（-t），只给列出的工具
 	//   - 模板写了 deny_tools: → 追加到黑名单
-	// ⚠️ MCP 工具名是 mcp__<server>__<tool>，用 -t 时必须逐个列出，否则 MCP 会不可用。
+	// ⚠️ pi 1.0.4 起 `-t/--tools` 的语义：**MCP 工具默认保留**，只有白名单里出现
+	//    `mcp__` 开头的条目时才按它过滤 MCP。所以「列了 tools 就必须逐个列出 MCP 工具」
+	//    已经是旧说法（老版本会把 MCP 一起挡掉）。
 	const denyTools = ["delegate", "progress", ...(tpl.denyTools ?? [])];
 	// RPC 模式：stdin 保持打开，才能在到点前发 steering 催它收尾（这是本次改造的全部理由）。
 	// 旧模式 `-p --mode json` 是单向的，写完 prompt 就只能等它自己跑完或被杀。
@@ -995,10 +1006,21 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 				if (rec.type === "agent_settled") {
 					// 硬收尾阶段：这一条 settled 是 `abort` 把它打断产生的 → **不是**收工，而是追问交卡。
 					// 追问那一次跑完后再 settled，才真正收工。
-					if (expectWrapUp && !wrapUpSent) {
+					//
+					// pi 1.1.0 起 agent_settled 带 `aborted`（RPC / JSON 都透传：{type,aborted}）。
+					// 有它就按它判，不再靠 expectWrapUp 猜 —— 否则「abort 发出去时对方刚好自己跑完了」
+					// 会被当成被我们打断，白多发一轮追问。aborted === undefined 才是旧版 pi，退回猜。
+					const aborted = (rec as { aborted?: boolean }).aborted;
+					const wantWrapUp = expectWrapUp && !wrapUpSent && aborted !== false;
+					if (wantWrapUp) {
 						expectWrapUp = false;
+						if (wrapUpTimer) {
+							clearTimeout(wrapUpTimer);
+							wrapUpTimer = undefined;
+						}
 						wrapUpHook?.();
 					} else {
+						expectWrapUp = false;
 						// 正常情况下：这一轮不会再自动续跑/重试 → 有序关闭 stdin，让 pi 收工退出。
 						// 迟迟不来的，由下面的 timer killTree 兜底。
 						rpc?.closeStdin();
@@ -1078,7 +1100,8 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 				hardWindDownFired = true;
 				expectWrapUp = true;
 				rpc?.send({ type: "abort" });
-				// 兜底：万一 abort 没触发 agent_settled（比如它当时本来就闲着），2 秒后直接追问
+				// 兜底：万一 abort 根本没产生 agent_settled（比如它当时本来就闲着、没有可打断的 run），
+				// 2 秒后直接追问。正常情况在上面的 settled 里按 aborted 就接住了，这个定时器不会开火。
 				wrapUpTimer = setTimeout(() => {
 					if (settled || wrapUpSent) return;
 					expectWrapUp = false;
@@ -1107,7 +1130,14 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 				// 但**任务本身没跑完** —— 报成 timeout，让主会话拿着阶段成果自己决定要不要重启。
 				finish("timeout", code);
 			} else if (code !== 0) {
-				finish("failed", code);
+				// ⚠️ pi 1.2.0 改了 `-p` 的退出码：最终回复被输出上限截断时，它照样把已产出的
+				//    文本写进 stdout（结论是有的，只是可能不全），但退出码变成 1。
+				//    所以「有结论 + 非零退出」不能再当失败 —— 否则会把已经拿到的成果丢掉。
+				if (sink.final.trim()) {
+					finish("done", code);
+				} else {
+					finish("failed", code);
+				}
 			} else if (sink.final.trim()) {
 				finish("done", code);
 			} else {
@@ -1158,6 +1188,13 @@ function renderCard(r: RunResult): string {
 		case "done":
 			head = HEADS.done(name, secs);
 			body = r.text || "(空)";
+			if (r.truncated) {
+				body +=
+					"\n\n⚠️ 它的最终回复撞到了模型的输出上限，被**截断**了（pi 1.2.0 起 `-p` 会因此以退出码 1 结束，" +
+					"结论已按上面的原文保留）。要完整结果：再调一次 delegate，带 resume: \"" +
+					r.names.id +
+					"\" 让它接着写，或者让它分成几段输出。";
+			}
 			break;
 		case "timeout": {
 			head = HEADS.timeout(name, secs);
@@ -2029,7 +2066,24 @@ async function backToMain(ctx: ExtensionCommandContext): Promise<void> {
 
 // ======================= 后台轮询 + 自动回投 =======================
 let apiRef: ExtensionAPI | undefined;
+/** 最近一次拿到的上下文：回投前用它判「主会话空闲没」 */
+let bgCtx: ExtensionContext | undefined;
 let bgTimer: ReturnType<typeof setInterval> | undefined;
+
+/** 挂后台回投轮询（幂等）。
+ *  为什么 load 时就先挂一次：`/reload` 之后 session_start 不一定触发，只靠它会出现
+ *  「助理回来了但没人去投」；agent_settled 兑底也只在「又跑了一轮」时才来。 */
+function armBgTimer(): void {
+	// 停用态一律不挂（/ai-ext on 时会重新调本函数）
+	if (isExtDisabled()) return;
+	if (bgTimer) clearInterval(bgTimer);
+	bgTimer = setInterval(() => {
+		// 注意：pollBgTasks 是 async，rejection 只能这样接
+		void pollBgTasks().catch(() => {
+			/* 单轮出错别把进程干挂 */
+		});
+	}, 1000);
+}
 
 /** 本实例当前所在的主会话身份（session_start 与每次派活时刷新）。
  *  后台结果只投给「派发它的那个会话」，所以要能认出「我是谁」。 */
@@ -2053,6 +2107,18 @@ function isOwnBgTask(t: BgTaskFile): boolean {
 	if (t.ownerSessionFile && currentSessionFile) return t.ownerSessionFile === currentSessionFile;
 	if (t.ownerSessionId && currentSessionId) return t.ownerSessionId === currentSessionId;
 	return false; // 有 owner 但本会话身份还没认出来 → 先不投，等认出来再投
+}
+
+/** 认领文件是不是残留锁：pid 死了 / 读不出 / 太旧（投递就几十毫秒，超 60s 肯定是没清掉） */
+const STALE_CLAIM_MS = 60 * 1000;
+function claimIsStale(f: string): boolean {
+	try {
+		const pid = Number(readFileSync(f, "utf8").trim());
+		const age = Date.now() - statSync(f).mtimeMs;
+		return !Number.isFinite(pid) || !pidAlive(pid) || age > STALE_CLAIM_MS;
+	} catch {
+		return true; // 读不到 / 坏了 → 当残留处理
+	}
 }
 
 /** 退避上限：每次失败后隔多久再试（2^n 秒，封顶 30s） */
@@ -2080,13 +2146,26 @@ function bgDeliveryText(t: BgTaskFile): string {
  */
 async function deliverBgTask(t: BgTaskFile): Promise<void> {
 	if (!apiRef) throw new Error("apiRef 未就绪");
-	// 主会话空闲时：prompt() 会直接起一轮（唤醒）；正在跑：排队（followUp，本轮结束接着跑）
-	await apiRef.sendUserMessage(bgDeliveryText(t), { deliverAs: "followUp" });
+	if (isExtDisabled()) throw new Error("扩展已停用，不投递");
+	// ⚠️ 只在主会话**空闲**时投，而且**不带 deliverAs**：
+	//    pi 在 streaming 时 sendUserMessage 只是「入队」（followUp），而用户在 interactive 里按
+	//    Esc 中止时 pi 会 clearQueue() 把队列交还给编辑器（modes/interactive/interactive-mode.js）
+	//    —— 卡片压根没进上下文，可发送方已经 resolve，我们会记 delivered:true → 永久不再重投。
+	//    空闲时普通 prompt() 必然起新一轮（唤醒），或者在竞态时直接抛错（被 catch 记失败重试），
+	//    不会假成功。调用方已先判过空闲，这里再判一次纯防竞态。
+	if (bgCtx && !bgCtx.isIdle()) {
+		throw new Error("主会话正在跑，等它空闲再投（不排队，避免被 clearQueue 吞掉）");
+	}
+	await apiRef.sendUserMessage(bgDeliveryText(t));
 }
 
 /** 每秒扫一遍后台任务：终态、没回投过、且**属于本会话**的 → 回投 */
 async function pollBgTasks(): Promise<void> {
 	if (!apiRef) return;
+	// 停用态：一条也不投（小票保留，/ai-ext on 后 armBgTimer 会接着投）
+	if (isExtDisabled()) return;
+	// 主会话在跑就先不认领，等它空闲（agent_settled / 下一秒轮询会再来）
+	if (bgCtx && !bgCtx.isIdle()) return;
 	const now = Date.now();
 	for (const t of listBgTasks()) {
 		if (t.status === "running" || t.delivered) continue;
@@ -2101,7 +2180,11 @@ async function pollBgTasks(): Promise<void> {
 		try {
 			writeFileSync(claim, String(process.pid), { flag: "wx" });
 		} catch {
-			continue; // 别人正在投
+			// 已有认领文件：持有者还活着就让它投；否则是残留锁（投递途中被关窗口/强杀/`/reload`
+			// 时机不巧），**必须能接管** —— 不然这条结果会被永远跳过，既不投也不标
+			// undelivered（面板上看不出任何问题，只能人工 redeliver）。
+			if (!claimIsStale(claim)) continue; // 别人正在投
+			writeFileSync(claim, String(process.pid), "utf8"); // 接管残留锁
 		}
 		try {
 			await deliverBgTask(t);
@@ -2383,21 +2466,17 @@ export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
 	applyExtensionsConfig(); // 面板保鲜期等偏好
 	apiRef = api; // 供后台轮询回投用
+	armBgTimer(); // 先挂上（幂等）：/reload 后 session_start 不一定触发，见 armBgTimer 说明
 
 	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
 	api.on("session_start", async (_event, ctx) => {
 		rememberCurrentSession(ctx); // 记下「我是哪个会话」，后台结果靠它认领
+		bgCtx = ctx; // 回投前用它判主会话空闲没
 		reapStaleBgTasks(); // 先清理上个会话留下的孤儿任务
 		reapDeliveredBgTasks(); // 再回收「已投递成功且超 24h」的记账小票（不碰会话文件）
 		reapStaleLocks(); // 再回收 pid 已死/超时的会话运行锁
 		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 24h 的删）
-		if (bgTimer) clearInterval(bgTimer);
-		bgTimer = setInterval(() => {
-			// 注意：pollBgTasks 是 async，rejection 只能这样接
-			void pollBgTasks().catch(() => {
-				/* 单轮出错别把进程干挂 */
-			});
-		}, 1000);
+		armBgTimer(); // 幂等再挂一次
 	});
 	api.on("session_shutdown", async () => {
 		if (bgTimer) clearInterval(bgTimer);
@@ -2406,7 +2485,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 	// 兑底：agent 一变空闲就查一次。
 	// 为什么需要：1 秒定时器是 session_start 挂的，如果 /reload 之后 session_start 没触发，
 	// 定时器就不在 —— 光靠它会出现“助理回来了但没人去投”。agent_settled 每个 turn 结束都会来。
-	api.on("agent_settled", async () => {
+	api.on("agent_settled", async (_event, ctx) => {
+		bgCtx = ctx;
 		// 稍微延后：避开 settle 事件自身的重入窗口（这一刻直接 prompt 可能被拒）
 		setTimeout(() => {
 			void pollBgTasks().catch(() => {
@@ -2417,7 +2497,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 	// 助理清单在加载时算一次，拼进工具参数描述（零额外开销）
 	const params = makeDelegateParams(assistantHint(process.cwd()));
 
-	api.registerTool({
+	// ⚠️ 注册成常量：停用时要按 exposure:"hidden" **重新注册**才能从模型工具表里撤下（pi 不支持反注册）
+	const DELEGATE_TOOL = {
 		name: "delegate",
 		label: "Delegate",
 		description:
@@ -2442,6 +2523,13 @@ export function setupDelegate(api: ExtensionAPI): void {
 			_onUpdate: unknown,
 			ctx: ExtensionContext,
 		) {
+			// 停用态：工具理论已被撤下，这里再兜一道（防「撤下前已在飞」的调用）
+			if (isExtDisabled()) {
+				return {
+					content: [{ type: "text" as const, text: "扩展已停用（/ai-ext on 恢复）—— 本次没有派发任何助理。" }],
+					details: { ok: false, reason: "ext_off" },
+				};
+			}
 			// wait 参数优先；没传才用 /delegate-mode 的默认（默认异步）
 			const wait = params.wait ?? (readDelegateMode() === "sync");
 			const cwd = ctx.cwd ?? process.cwd();
@@ -2497,29 +2585,10 @@ export function setupDelegate(api: ExtensionAPI): void {
 				};
 			}
 
-			// 白名单 + 挂了 MCP，但没列 mcp__ 工具 → 直接拒绝（否则 MCP 会静默不可用）
-			if (tpl.tools?.length && tpl.mcp.length > 0) {
-				const hasMcpTool = tpl.tools.some((t) => t.startsWith("mcp__"));
-				const hasCodemode = tpl.tools.includes("codemode");
-				if (!hasMcpTool && !hasCodemode) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text:
-									`「${tpl.name}」用了工具白名单（tools:），又挂了 MCP（${tpl.mcp.join(", ")}），` +
-									`但白名单里没有任何 mcp__ 工具 —— 这样 MCP 工具会静默不可用：\n\n` +
-									`  tools: ${tpl.tools.join(", ")}\n\n` +
-									`修法二选一：\n` +
-									`  ① 把要用的 MCP 工具名（mcp__<server>__<tool>）也写进 tools；\n` +
-									`  ② 或者把 codemode 写进 tools（MCP 以 codemode 暴露时）。\n` +
-									`看某台 MCP 有哪些工具：pi 里敲 /mcp 选那个 server。`,
-							},
-						],
-						details: { ok: false, reason: "tools_allowlist_blocks_mcp" },
-					};
-				}
-			}
+			// （旧代码在这里「白名单没列 mcp__ 工具 → 直接拒绝」，已删除：
+			//  pi 1.0.4 起 `-t/--tools` 默认**保留 MCP 工具**，只有白名单里出现 mcp__ 开头的
+			//  条目时才按它过滤 MCP —— 所以不列 mcp__ 工具不再会让 MCP 静默不可用，
+			//  那条拦截成了误报，会把正常模板挡在门外。）
 
 			const resumeId = params.resume?.trim() || undefined;
 			let list = (params.tasks ?? (params.task ? [params.task] : []))
@@ -2692,7 +2761,26 @@ export function setupDelegate(api: ExtensionAPI): void {
 				},
 			};
 		},
-	});
+	};
+	api.registerTool(DELEGATE_TOOL);
+
+	// ---------- 停用闸门：delegate 工具撤下 + 后台回投暂停 ----------
+	function applyDelegateGate(off: boolean): void {
+		try {
+			apiRef?.registerTool({ ...DELEGATE_TOOL, exposure: off ? "hidden" : "direct" });
+		} catch (e) {
+			console.error("[ai-configure] delegate: 切换 delegate 工具失败：", e);
+		}
+		if (off) {
+			// 停轮询：小票一律不删、不投；/ai-ext on 后 armBgTimer() 会自动补投
+			if (bgTimer) {
+				clearInterval(bgTimer);
+				bgTimer = undefined;
+			}
+		} else {
+			armBgTimer();
+		}
+	}
 
 	api.registerCommand("assistants", {
 		description: "助理模板：直接敲列出；show / edit / mcp / new / open <名字>",
@@ -2860,4 +2948,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 			ctx.ui.notify(`子代理面板：${panelMode()}`, "info");
 		},
 	});
+
+	// 停用闸门：最后登记（工具定义 / 轮询都在这一层）
+	onGateApply("delegate", applyDelegateGate);
 }

@@ -16,3 +16,12 @@ export const CURSOR_MARKER = "";
 export type Focusable = any;
 export type Component = any;
 export type TUI = any;
+
+/** 工具行文本组件（board.ts 的 renderResult 用它）；无头测试不渲染，给个最小实现 */
+export class Text {
+	constructor(
+		public text: string,
+		public x = 0,
+		public y = 0,
+	) {}
+}

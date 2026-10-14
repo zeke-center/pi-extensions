@@ -89,6 +89,9 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `project off` \| `project clear` | 关掉 / 清空项目级连接 |
 | | `help`（`?` / `h` 也行） | 打印全部功能与参数 |
 | **`/aihelp`** | — | 同上（`/ai help` 的快捷别名） |
+| **`/ai-ext`** | `off` \| `on` | **会话级停用 / 恢复整个扩展**（不用卸载）：面板收起、`progress`/`delegate` 从工具表撤下、后台回投暂停。本会话记住，换会话自动恢复 |
+| | `status` | 看当前状态 + 已接入闸门的模块 |
+| | 启动即停用 | `pi --no-ai-ext` 或 `PI_AI_EXT=off` |
 | **`/board`** | `on` \| `off` | 开 / 关面板 |
 | | `clear` | 清空任务列表 |
 | | `above` \| `below` | 面板放输入框上方 / 下方 |
@@ -291,6 +294,35 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 
 ---
 
+## 模块 0 · gate.ts（会话级停用总闸）
+
+`/ai-ext off` 把**整个扩展**停掉，但**不卸载插件**、不改任何配置文件；`/ai-ext on` 立刻回来。
+
+| 命令 | 作用 |
+|---|---|
+| `/ai-ext off` | 本会话停用：看板/子代理面板收起、`progress`+`delegate` 从模型工具表撤下、`before_agent_start` 不再注入看板内容、后台回投暂停 |
+| `/ai-ext on` | 恢复；**停用期间已跑完的后台结果会立刻补投** |
+| `/ai-ext status` | 看状态 + 已接入闸门的模块 |
+| `pi --no-ai-ext` / `PI_AI_EXT=off` | 启动即停用（本次运行） |
+
+**怎么实现的（以后加模块照这个来）**
+
+1. 模块入口首行判 `isExtDisabled()`（`import { isExtDisabled } from "./gate"`）；
+2. 模块 setup **末尾** `onGateApply("模块名", (off) => { … })` 登记「怎么关自己」——
+   **登记时会立刻按当前状态跑一次**，所以晚加载的模块也能正确落到停用态；
+3. 工具用 `exposure: "hidden"` **重新注册**来撤下（pi 不允许反注册，官方给的就是这条路），
+   所以工具定义必须提成常量（`PROGRESS_TOOL` / `DELEGATE_TOOL`）而不是直接 `registerTool({...})`。
+
+**会话级怎么做到的**：`/ai-ext off` 会 `appendEntry("ai-ext-off", { off: true, at })` 写进**本会话**的
+自定义 entry（不进模型上下文）；`session_start` 读该会话最后一条 → 回到停用态。
+所以：换会话 / 新建会话 / 别的 pi 窗口都不受影响；老会话重启也记得。
+
+**停用之后仍然能用的**：`/ai-ext`（否则开不回来）、`/aihelp`、`/ai doctor` 这类纯查看/自检，
+以及 pi 自带的全部能力。`/board`、`/agents`、`/ai`、`/usage` 会提示「扩展已停用」。
+
+> ⚠️ 别拿它当灯按：切换工具集会被 pi 记进 transcript（下次请求前追加），
+> provider 不支持过渡时会收到完整 checkpoint，**缓存前缀会作废**。
+
 ## 模块 1 · config.ts（AI 配置中心）
 
 把「连接台账」翻译成 pi 能用的 MCP 配置。台账里只存**账面信息**（类型、连接串、只读/可写），翻译成本扩展负责。
@@ -370,6 +402,12 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 | `/board right` | 显示 / 隐藏**右区**（MCP / 插件 / 助理 三栏）|
 | `/board mid` | 显示 / 隐藏**中栏**（现在 / 本轮 / 会话 / 子代理）|
 | `/usage` | **全局用量**：本会话 + 所有子代理的 token 账（含按助理明细表） |
+
+> ⚠️ **`/board off` 只隐藏面板，不是「关掉功能」**：
+> - `progress` 工具照旧注册、模型照旧能调（数据依旧更新并 persist）；只是你看不到。
+> - 静态规则依旧在 system prompt 的 `<task-board>` 段（只是动态状态那行不再注入）。
+> - 与助理完全无关（`/agents` / `delegate` 是另一个模块，`/board off` 不动它）。
+> - 想真的停掉看板/助理：卸掉对应扩展文件，或者在派活前自己别调 `delegate`。
 
 ### 面板分栏
 
@@ -583,6 +621,24 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 **看板里的数字只算本对话**：`⚠ N 条没回投` 只统计**本对话**派出去的 ——
 别的会话遗留的小票不会在你这儿刷警告（`/agents bg redeliver` 本来就只投自己会话的，口径保持一致）。
 
+### 结果怎么回主会话（唤醒）
+
+异步派出去后，结果靠一个小轮询回投（`session_start` 挂 1 秒定时器，`agent_settled` 再兑底一次）。三个要紧的设计：
+
+1. **只在主会话空闲时投，并且不传 `deliverAs`**。
+   pi 在 streaming 时 `sendUserMessage` 只是「入队」（followUp），而用户按 Esc 中止时 pi 会
+   `clearQueue()` 把队列**交还给编辑器** —— 卡片没进上下文，可发送方已经 resolve，我们会
+   记成 `delivered: true` → 永远不再重投（这就是以前「助理跑完了但唤不醒主会话」的一个根因）。
+   空闲时普通 prompt 必然起新一轮；万一撞上竞态会直接报错 → 记失败重试，**不会假成功**。
+2. **认领锁带接管**（`<id>.json.claim`）：同一个会话开在多个实例上时只允许一个投；
+   但持有者进程死了 / 锁太旧（>60s）就接管 —— 否则残留锁会让这条结果被**永远跳过**，
+   既不投也不标 `undelivered`（面板上看不出问题）。
+3. **轮询在扩展加载时就挂**，不只靠 `session_start`：`/reload` 之后万一 `session_start` 没触发，
+   光靠 `agent_settled` 要等你再发一句话才轮得到，助理结果就一直躺着。
+
+真的没投成功（发不出去 / 超时）时会标 `undelivered`，面板上显示 `⚠ N 条没回投`，
+可 `/agents bg redeliver` 手动救 —— 不会静默丢。
+
 ### 命名规则
 
 每次派发都会开一个**会话**，名字分两种：
@@ -681,7 +737,7 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `base` | | `true` = **只给 extends 用，不能直接派**（拿来写公共规矩） |
 | `demo` | | `true` = **示例模板：能看 / 能 show / 能 extends，但绝对不能派** |
 | `enabled` | | `false` = 列表里不显示、也派不了 |
-| `tools` | | **工具白名单**（精确匹配，逗号分隔）。写了就**只给这些工具**。⚠️ MCP 工具名是 `mcp__<server>__<tool>`，用白名单时必须逐个列出，否则那台 MCP 的工具会不可用（派发时会硬拦并提示） |
+| `tools` | | **工具白名单**（逗号分隔）。写了就只给列出的工具。✅ pi 1.0.4 起 **MCP 工具默认保留**（白名单里没写 `mcp__` 也会照常可用）；只有白名单里出现 `mcp__` 开头的条目时才按它过滤 MCP。要连 MCP，记得模型得能看见工具（`-t` 里给 `codemode`，或直接列 `mcp__<server>__<tool>`） |
 | `deny_tools` | | 额外禁用的工具，逗号分隔（追加到默认的 `delegate,progress` 黑名单） |
 | `isolate_env` | | `true` = **环境变量隔离**：子进程只拿一份白名单（系统必需变量 + `PI_*`/`NODE_*`/`npm_*`）。默认 `false`（继承全部）。⚠️ 模型 key 若只放在环境变量里，要用 `env_passthrough` 显式保留 |
 | `env_passthrough` | | `isolate_env: true` 时额外保留的环境变量名，逗号分隔（如 `ANTHROPIC_API_KEY`） |
@@ -1036,6 +1092,18 @@ export function setupBoard(api: ExtensionAPI): void {
 2. **清理孤儿**：目标目录里已不存在于源里的根级 `.ts`/`.js` 和插件目录会被删掉。范围严格限定，不会动无关文件；`-List` 时只打印不删。
 
 参考 pi 自带文档（装在 `@earendil-works/pi-coding-agent` 包里）：`docs/extensions.md`、`docs/mcp.md`、`docs/codemode.md`、`docs/settings.md`、`docs/tui.md`。
+
+### 与 pi 版本的兼容点（改代码前先看这张表）
+
+| pi 版本 | 变更 | 我们怎么适配 |
+|---|---|---|
+| 1.2.0 | `before_agent_start` 也会为 `pi.sendMessage(..., { triggerTurn: true })` 起的 run 触发（`event.messageType === "custom"`） | `board.ts` 的处理器先 `if (event.messageType === "custom") return`：custom run 不算一轮、不注入看板提示（否则 `turnNo` 虚涨会把「计划已 N 轮没更新」误判成作废） |
+| 1.2.0 | `-p` 打印模式：最终回复撞到输出上限时**打印已产出的文本 + stderr 警告 + 退出码 1** | `delegate.ts` 的 `child.on("close")`：非零退出但 `sink.final` 非空 → 按 `done` 收，卡片上补一句「被输出上限截断」；`RunResult.truncated` 用 stderr 里的 `output token limit` 判定 |
+| 1.0.4 | `-t/--tools` 默认保留 MCP 工具，只有列了 `mcp__` 条目才过滤 MCP | 删掉「白名单没列 mcp__ 工具 → 直接拒绝派发」那条误报拦截；README 的 `tools` 说明同步改 |
+| 1.1.0 | `agent_settled` 带 `aborted`（RPC/JSON 都透传） | 硬收尾不再只靠猜：`rec.aborted !== false` 才算「被我们 abort 打断」→ 追问交卡；否则正常收工。避免了「abort 发出时对方刚好自己跑完」白多发一轮追问 |
+| 1.1.0 | `tool_execution_end` 事件、工具渲染上下文带 `durationMs` | 子代理「最慢的几步」改用它（比 `Date.now()` 差值准，不受事件乱序影响）；`progress` 工具行用 `renderResult` 显示耗时 |
+| 1.2.0 | `before_agent_start` 的段（`systemPromptOptions.sections`）在 run 首轮工具调用后不会被删了 | 看板的**静态规则**搬进 `<task-board>` 段（只吃一次上下文、变更走 transcript delta），每轮只注入动态的「当前面板」一行 |
+| 1.1.0 | run 启动阶段就算 busy：`pi.sendUserMessage()` 必须传 `deliverAs` | 我们现在**空闲时才投**，且**不传 `deliverAs`**（见下面「结果怎么回主会话」）|
 
 ## 故障排查
 

@@ -33,6 +33,7 @@ const entry = join(root, "ai-configure", "pi-extensions.ts");
 /** 扩展应当注册的全部命令 */
 const EXPECT = [
 	"ai",
+	"ai-ext",
 	"aihelp",
 	"aidoctor",
 	"board",

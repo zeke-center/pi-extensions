@@ -25,6 +25,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { showHelp } from "./help";
 import { showDoctor } from "./doctor";
+import { isExtDisabled, onGateApply } from "./gate";
 
 // 没有默认值：没设就报错提示，而不是偷偷指向某个人的服务器
 const API = (process.env.CENTER_API ?? "").replace(/\/+$/, "");
@@ -325,6 +326,10 @@ export function setupConfig(api: ExtensionAPI): void {
 		description: "从 AI 配置中心拉取连接（/ai help 看全部功能）",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			lastCtx = ctx;
+			if (isExtDisabled()) {
+				ctx.ui.notify("扩展已停用（/ai-ext on 恢复）", "info");
+				return;
+			}
 			const a = (args ?? "").trim().toLowerCase();
 
 			// ---------- /ai help ----------
@@ -494,10 +499,30 @@ export function setupConfig(api: ExtensionAPI): void {
 
 	api.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
+		if (isExtDisabled()) {
+			// 停用态：不刷状态，也不显示状态栏那一行
+			try {
+				ctx.ui.setStatus(STATUS_KEY, undefined);
+			} catch {
+				/* ignore */
+			}
+			return;
+		}
 		refreshStatus();
 	});
 
 	api.on("session_shutdown", async () => {
 		sessionNames = [];
+	});
+
+	// 停用闸门：撤 / 恢复状态栏那一行（⚙ AI n）
+	onGateApply("config", (off) => {
+		try {
+			if (!lastCtx?.hasUI) return;
+			if (off) lastCtx.ui.setStatus(STATUS_KEY, undefined);
+			else refreshStatus();
+		} catch {
+			/* ignore */
+		}
 	});
 }

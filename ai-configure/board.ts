@@ -16,11 +16,12 @@
  * 注意: pi 的 widget 只支持 above/below 两个位置，"左右分栏"是本组件自己画出来的。
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { type Focusable, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Focusable, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
+import { onGateApply } from "./gate";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -32,6 +33,35 @@ const MID_WIDTH = 30;
 const MID_MIN_COLS = 116; // 面板总宽 ≥ 此值才显示中栏（运行状态）
 const NARROW_COLS = 88; // 总宽 < 此值：右区三栏退回「三段叠一栏」
 const MAX_LISTED = 6;
+
+/**
+ * 看板给模型的**静态规则**：写进 system prompt 的 `<task-board>` 段（只吃一次上下文）。
+ * 动态状态（当前面板是什么）走 before_agent_start 返回的消息，见下面 handler。
+ *
+ * ⚠️ 改这里 = 改 system prompt 的段，pi 会作为 transcript delta 追加；
+ *    所以只准放「永远不变」的规则，别放任何随状态变化的内容。
+ */
+const BOARD_RULES = `用户有一个常驻在输入框上方的进度看板（左栏任务进度，右侧几栏会话信息）。
+
+【给计划：必须两步走，不能只弹窗】
+1. **先在对话里给详细计划表**（Markdown 表格：# / 步骤 / 具体做什么 / 改哪个文件）。
+   「具体做什么」要写到能看出你要动什么（改哪个函数、加哪个接口、换哪个配置），
+   不是把步骤名换个说法重复一遍。后面补上「为什么这么做」「用户会看到什么变化」「哪里要拍板」。
+2. **然后再调 progress(action="plan")**，只放 <=20 字的简短步骤（面板很窄）。
+   弹窗确认用的就是这些短句。详细内容不要塞这里。
+
+【执行过程】
+- ⚠️ 每一步都要真的调 progress(action="step")：开始 status="doing"，完成 status="done"。
+  不调的话面板会一直停在第一步，用户就看不到进度了。
+- 每开始一步 / 遇到卡点，都要**同时在对话里说一句现在干什么**，别只改面板不说话。
+- 卡点：progress(action="block", text="...") + 对话里解释。
+- 全部完成：progress(action="clear")。
+
+【❌ 不要执行过时计划（很重要）】
+- 每轮消息里「当前面板」那一行是**真实状态**，以它为准。不要凭对话历史里的旧计划行事。
+- 面板上的计划如果和用户最新的话对不上、或用户说了“算了/先不管/换个事” → **先调 progress(action="clear")**，再按用户最新要求来。
+- **面板为空时，不要去“补做”以前讨论过但没确认的任务。**
+- 用户否掉方案（“我要改”/“先别做”）时，面板会自动还原到声明前的状态；不要把它当成“计划还在进行中”。`;
 
 type StepStatus = "pending" | "doing" | "done" | "blocked";
 type Placement = "aboveEditor" | "belowEditor";
@@ -109,6 +139,15 @@ let tickCount = 0;
 let lastCtx: ExtensionContext | undefined;
 let widgetTui: { requestRender(): void } | undefined;
 let mounted = false;
+/** 停用态（由 gate 的 applyBoardGate 设置）。
+ *  用模块内局部变量而不是每次都问 gate：一是本模块有十几处判定，二是单测能直接驱动它（可回归）。 */
+let boardOff = false;
+/** 供 gate（和单测）设置停用态 */
+export function setBoardOff(off: boolean): void {
+	boardOff = off;
+}
+/** 停用态是否已经「真的撤过一次」 widget（避免每次事件都重复 setWidget） */
+let gateCleared = false;
 
 let cachedMcp: McpEntry[] = [];
 let cachedPlugins: string[] = [];
@@ -715,6 +754,10 @@ function renderWidget(force = false): void {
 	const ctx = lastCtx;
 	if (!ctx?.hasUI) return;
 
+	// ⚠️ 停用闸门**必须在这里**（不能只在 refresh 里）：board 有十几处 handler 直接调
+	//    renderWidget()，少一处就会把刚撤掉的面板又挂回来（实测踩过）。
+	if (boardOff) return;
+
 	if (!showWidget) {
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		widgetTui = undefined;
@@ -759,6 +802,26 @@ function refreshStatus(): void {
 }
 
 function refresh(force = false): void {
+	// ⚠️ 停用闸门：整个看板（widget + 状态栏那一行）在这里总收口。
+	//    用 mounted 判断而不是一次性 flag —— 一旦有别的路径把 widget 挂回来，下次 refresh 还会撤。
+	if (boardOff) {
+		if (mounted || widgetTui || !gateCleared) {
+			gateCleared = true;
+			const ctx = lastCtx;
+			if (ctx?.hasUI) {
+				try {
+					ctx.ui.setWidget(WIDGET_KEY, undefined);
+					ctx.ui.setStatus(WIDGET_KEY, undefined);
+				} catch {
+					/* 撤不掉也不影响停用语义 */
+				}
+			}
+			widgetTui = undefined;
+			mounted = false;
+		}
+		return;
+	}
+	gateCleared = false;
 	renderWidget(force);
 	refreshStatus();
 }
@@ -856,7 +919,9 @@ export function setupBoard(api: ExtensionAPI): void {
 	pi = api;
 
 	// ---------- 工具：模型用来汇报进度 ----------
-	api.registerTool({
+	// ⚠️ 注册成常量而不是直接 api.registerTool({...})：停用时要按 exposure:"hidden" **重新注册**
+	//    才能从模型工具表里撤下（pi 不支持反注册，官方给的路子就是重注册成 hidden）。
+	const PROGRESS_TOOL = {
 		name: "progress",
 		label: "Progress",
 		description:
@@ -887,6 +952,11 @@ export function setupBoard(api: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			lastCtx = ctx;
+
+			// 停用态：工具理论已被撤下，这里再兜一道（防「撤下前已在飞」的调用）
+			if (boardOff) {
+				return { content: [{ type: "text" as const, text: "扩展已停用（/ai-ext on 恢复）" }], details: {} };
+			}
 
 			if (params.action === "clear") {
 				title = "";
@@ -1007,7 +1077,33 @@ export function setupBoard(api: ExtensionAPI): void {
 
 			return { content: [{ type: "text" as const, text: `未知 action: ${params.action}` }], details: {} };
 		},
-	});
+
+		// 工具行里补一个耗时（pi 1.1.0 起渲染上下文带 durationMs）：默认渲染只给结果文本，
+		// 看不出这次打点花了多久。outputPad 只有 renderShell:"self" 的渲染器要自己应用，这里不用管。
+		renderResult(result, _options, theme, context) {
+			const first = result.content?.find((c) => c.type === "text");
+			const body = first && first.type === "text" ? first.text : "";
+			const ms = context?.durationMs;
+			const dur =
+				typeof ms === "number"
+					? theme.fg("dim", ` · ${ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`}`)
+					: "";
+			return new Text(theme.fg("muted", body) + dur, 0, 0);
+		},
+	};
+	api.registerTool(PROGRESS_TOOL);
+
+	// ---------- 停用闸门：progress 工具撤下 / 恢复 ----------
+	function applyBoardGate(off: boolean): void {
+		setBoardOff(off);
+		try {
+			pi?.registerTool({ ...PROGRESS_TOOL, exposure: off ? "hidden" : "direct" });
+		} catch (e) {
+			console.error("[ai-configure] board: 切换 progress 工具失败：", e);
+		}
+		gateCleared = false; // 让 refresh() 重走一遍：停用 → 撤 widget；恢复 → 重画
+		refresh(true);
+	}
 
 	// ---------- 事件 ----------
 	api.on("tool_call", async (event, ctx) => {
@@ -1171,8 +1267,23 @@ export function setupBoard(api: ExtensionAPI): void {
 	});
 
 	// ---------- 提示词注入 ----------
-	api.on("before_agent_start", async () => {
+	api.on("before_agent_start", async (event) => {
+		// ⚠️ pi 1.2.0 起：本事件也会为 `pi.sendMessage(..., { triggerTurn: true })` 起的 run 触发
+		//    （event.messageType === "custom"）。那种 run 不是「用户提问」，既不该算一轮，
+		//    也不该注入看板提示 —— 否则 turnNo 虚涨会把「计划已 N 轮没更新」误判成作废。
+		if (event.messageType === "custom") return;
+		// 停用态：不注入任何看板内容（连 system prompt 的段都不碰）
+		if (boardOff) return;
 		turnNo++;
+
+		// 静态规则走 **system prompt 段**，不再每轮当消息注入：
+		//   pi 1.2.0 起段是稳定的（修好了 triggerTurn run 首轮工具调用后把段删掉的 bug），
+		//   pi 会把段的变化作为 transcript delta 追加 —— 同样的内容只吃一次上下文，
+		//   也不像每轮注入消息那样反复破坏 prompt cache。动态状态仍走下面的 message。
+		if (event.systemPromptOptions.sections["task-board"] !== BOARD_RULES) {
+			event.systemPromptOptions.sections["task-board"] = BOARD_RULES;
+		}
+
 		const doneN = steps.filter((s) => s.status === "done").length;
 		const doingIdx = steps.findIndex((s) => s.status === "doing");
 		const staleTurns = steps.length > 0 ? turnNo - lastProgressTurn : 0;
@@ -1193,48 +1304,11 @@ export function setupBoard(api: ExtensionAPI): void {
 			}
 		}
 
-		// 面板空 → 只给一句短提示（省 token：完整规则每轮都进上下文，很重）
-		if (steps.length === 0) {
-			return {
-				message: {
-					customType: "task-board-hint",
-					content:
-						"[任务进度看板] 输入框上方有进度看板，当前为空。\n" +
-						'多步骤任务（>=3 步）开始前：先在对话给详细计划表，再 progress(action="plan", title, steps) 声明步骤（每条 <=20 字）；' +
-						'每步 progress(action="step", index, status="doing"/"done")；卡点 progress(action="block", text)；全部完成 progress(action="clear")。' +
-						"单步任务 / 纯问答不用。",
-					display: false,
-				},
-			};
-		}
-
+		// 只注入**动态**状态（完整规则在 system prompt 的 <task-board> 段里，不重复）
 		return {
 			message: {
 				customType: "task-board-hint",
-				content: `[任务进度看板]
-用户有一个常驻在输入框上方的进度看板（左栏任务进度，右侧几栏会话信息）。
-
-${planLine}
-
-【给计划：必须两步走，不能只弹窗】
-1. **先在对话里给详细计划表**（Markdown 表格：# / 步骤 / 具体做什么 / 改哪个文件）。
-   「具体做什么」要写到能看出你要动什么（改哪个函数、加哪个接口、换哪个配置），
-   不是把步骤名换个说法重复一遍。后面补上「为什么这么做」「用户会看到什么变化」「哪里要拍板」。
-2. **然后再调 progress(action="plan")**，只放 <=20 字的简短步骤（面板很窄）。
-   弹窗确认用的就是这些短句。详细内容不要塞这里。
-
-【执行过程】
-- ⚠️ 每一步都要真的调 progress(action="step")：开始 status="doing"，完成 status="done"。
-  不调的话面板会一直停在第一步，用户就看不到进度了。
-- 每开始一步 / 遇到卡点，都要**同时在对话里说一句现在干什么**，别只改面板不说话。
-- 卡点：progress(action="block", text="...") + 对话里解释。
-- 全部完成：progress(action="clear")。
-
-【❌ 不要执行过时计划（很重要）】
-- 上面「当前面板」那一行是**真实状态**，以它为准。不要凭对话历史里的旧计划行事。
-- 面板上的计划如果和用户最新的话对不上、或用户说了“算了/先不管/换个事” → **先调 progress(action="clear")**，再按用户最新要求来。
-- **面板为空时，不要去“补做”以前讨论过但没确认的任务。**
-- 用户否掉方案（“我要改”/“先别做”）时，面板会自动还原到声明前的状态；不要把它当成“计划还在进行中”。`,
+				content: `[任务进度看板] ${planLine}`,
 				display: false,
 			},
 		};
@@ -1245,6 +1319,10 @@ ${planLine}
 		description: "用量：主会话 + 子代理的全局 token 账",
 		handler: async (_args: string, ctx: ExtensionContext) => {
 			lastCtx = ctx;
+			if (boardOff) {
+				ctx.ui.notify("扩展已停用（/ai-ext on 恢复）", "info");
+				return;
+			}
 			recomputeSessTok(ctx);
 			recomputeSubTok();
 			const f = fmtTok;
@@ -1273,6 +1351,10 @@ ${planLine}
 		description: "任务/会话面板：/board [on|off|clear|above|below|right|mid]",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			lastCtx = ctx;
+			if (boardOff) {
+				ctx.ui.notify("扩展已停用（/ai-ext on 恢复）", "info");
+				return;
+			}
 			const a = (args ?? "").trim().toLowerCase();
 
 			if (a === "clear") {
@@ -1358,4 +1440,7 @@ ${planLine}
 	api.on("session_shutdown", async () => {
 		stopTimer();
 	});
+
+	// 停用闸门：最后登记（此时工具定义 / 模块状态都已就绪；登记时立刻按当前状态跑一次）
+	onGateApply("board", applyBoardGate);
 }

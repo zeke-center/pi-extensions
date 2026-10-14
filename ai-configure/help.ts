@@ -17,6 +17,11 @@ export const HELP_TEXT = `AI configure · 全部功能
   /ai project off         关掉项目级连接
   /ai project clear       清空项目级连接
   /ai help                就是你现在看的这个（= /aihelp）
+/ai-ext                   会话级停用 / 恢复整个扩展（不用卸载，本会话记住）
+  /ai-ext off             停用：面板收起、progress/delegate 从工具表撤下、后台回投暂停
+  /ai-ext on              恢复（后台已跑完的结果会立刻补投）
+  /ai-ext status          看当前状态
+  （启动即停用：pi --no-ai-ext，或环境变量 PI_AI_EXT=off）
 /board                    任务进度看板
   /board on | off         开 / 关
   /board clear            清空任务列表

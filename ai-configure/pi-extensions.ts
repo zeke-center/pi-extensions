@@ -30,13 +30,16 @@ import { setupBoard } from "./board";
 import { setupPanel } from "./panel";
 import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
+import { setupGate } from "./gate";
 import { showHelp } from "./help";
 import { healthLine, markFail, markOk } from "./health";
 
 export default function (api: ExtensionAPI): void {
 	// ⚠️ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
-	// 顺序也重要：panel 必须在 board 之前（widget 按注册顺序从上往下排）。
+	// 顺序也重要：① gate 最前（它的 session_start 要最先跑，否则会先画一帧再隐藏）
+	//            ② panel 必须在 board 之前（widget 按注册顺序从上往下排）。
 	const parts: Array<[string, (a: ExtensionAPI) => void]> = [
+		["gate", setupGate],
 		["config", setupConfig],
 		["panel", setupPanel],
 		["board", setupBoard],

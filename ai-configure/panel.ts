@@ -30,6 +30,7 @@ import {
 	type LiveLine,
 	type Tone,
 } from "./live";
+import { onGateApply, isExtDisabled } from "./gate";
 
 const WIDGET_KEY = "agent-live";
 
@@ -374,11 +375,23 @@ export function setupPanel(api: ExtensionAPI): void {
 		if (widgetTimer) clearInterval(widgetTimer);
 		widgetTimer = undefined;
 	});
+
+	// 停用闸门：停用时把子代理面板收起来（widget 仍挂着，只是画 0 行）
+	onGateApply("panel", (off) => {
+		if (!off) return;
+		try {
+			closeAgentPanel();
+		} catch {
+			/* 收不起来也不能连累别的模块 */
+		}
+	});
 }
 
 /** 打开面板（默认走看板正上方的 widget；`preferOverlay` 时才用浮层）。已经开着就什么都不做。 */
 export function openAgentPanel(ctx: ExtensionContext, opts: { force?: boolean } = {}): void {
 	if (!ctx.hasUI) return;
+	// 停用闸门：不许再弹（否则一个还在跑的后台助理跑完时会把面板又拉回来）
+	if (isExtDisabled()) return;
 	try {
 		if (opts.force) {
 			suppressed = false;
