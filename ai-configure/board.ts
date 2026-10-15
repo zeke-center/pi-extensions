@@ -22,6 +22,8 @@ import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
+import { cardNotify } from "./notify";
+import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk } from "./shared";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -141,13 +143,49 @@ let widgetTui: { requestRender(): void } | undefined;
 let mounted = false;
 /** 停用态（由 gate 的 applyBoardGate 设置）。
  *  用模块内局部变量而不是每次都问 gate：一是本模块有十几处判定，二是单测能直接驱动它（可回归）。 */
-let boardOff = false;
-/** 供 gate（和单测）设置停用态 */
+let boardOff = false;/** 供 gate（和单测）设置停用态 */
 export function setBoardOff(off: boolean): void {
 	boardOff = off;
 }
 /** 停用态是否已经「真的撤过一次」 widget（避免每次事件都重复 setWidget） */
 let gateCleared = false;
+
+/**
+ * 「自上次 progress() 以来跑了几次工具调用」——用来治一个真坑：
+ * 一个多步任务常常在**同一次用户输入**里就跑完了（一整轮 = 一个 turn），
+ * 而原来的过时判定只数 turn（`turnNo - lastProgressTurn`）→ 轮内永远不报警，
+ * 于是模型从头做到底一次也不更新看板，面板一直停在 0/N（实测踩过）。
+ * 所以再加一个**轮内**计数：工具调用数。
+ */
+let toolCallsSinceProgress = 0;
+/** 上次 progress() 更新的挂钟时刻（轮内也能看出“太久没动了”） */
+let lastProgressAt = Date.now();
+/** 每这么多次工具调用提醒一次（不是每次都呼） */
+const NAG_EVERY_CALLS = 8;
+
+function resetProgressWatch(): void {
+	toolCallsSinceProgress = 0;
+	lastProgressAt = Date.now();
+}
+
+/** 给模型的一句提醒（很短，能看懂就行） */
+function progressNag(): string {
+	const doneN = steps.filter((s) => s.status === "done").length;
+	const doingIdx = steps.findIndex((s) => s.status === "doing");
+	const where =
+		steps.length === 0
+			? "当前没有计划"
+			: `计划「${title || "(无标题)"}」${doneN}/${steps.length} 步` +
+				(doingIdx >= 0 ? `，卡在第 ${doingIdx + 1} 步「${steps[doingIdx]!.text}」` : "");
+	const mins = Math.floor((Date.now() - lastProgressAt) / 60000);
+	return (
+		`\n\n⚠ 看板提醒：这轮已经 ${toolCallsSinceProgress} 次工具调用没调 progress()` +
+		(mins >= 2 ? `（距上次更新 ${mins} 分钟）` : "") +
+		` —— ${where}。` +
+		`\n做完一步就 progress(action="step", index=N, status="done")，再开下一步 status="doing"；` +
+		`全部完成就 progress(action="clear")。别等到最后批量补。`
+	);
+}
 
 let cachedMcp: McpEntry[] = [];
 let cachedPlugins: string[] = [];
@@ -952,6 +990,7 @@ export function setupBoard(api: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			lastCtx = ctx;
+			resetProgressWatch(); // 任何 progress() 调用都算“有更新”
 
 			// 停用态：工具理论已被撤下，这里再兜一道（防「撤下前已在飞」的调用）
 			if (boardOff) {
@@ -994,14 +1033,56 @@ export function setupBoard(api: ExtensionAPI): void {
 					persist();
 				};
 
-				if (params.skipConfirm !== true && ctx?.hasUI) {
-					// 用 pi 自带的 select + editor（不自己写组件）。
-					// 步骤列表在对话表格和面板里都能看到，弹窗只需要“确认 / 改 / 取消”。
-					const choice = await ctx.ui.select(
-						`开始执行这个方案？${title ? `（${title}）` : ""} · 共 ${steps.length} 步`,
+				// 计划确认：分两种情况
+				//   · **剪贴板投递来的计划**（你在后台用输入法/复制文本）→ 默认直接执行，不打扰你
+				//   · 你在终端亲手派的计划 → 照旧弹终端确认（要改就先改）
+				// 另外「粘贴一句话」和「超时兜底」两条通道仍然管用（谁先答算谁）
+				const stepTexts = pending.map((x) => x.text);
+				const bgTurn = isBackgroundTurn();
+				const pcfg = getPlanCfg();
+				const needAsk = params.skipConfirm !== true && !bgTurn && ctx?.hasUI;
+				let choice: string | undefined = "✅ 按这个执行";
+				if (needAsk) {
+					const tuiAsk = ctx.ui.select(
+						`开始执行这个方案？${pendingTitle ? `（${pendingTitle}）` : ""} · 共 ${pending.length} 步`,
 						["✅ 按这个执行", "✏️ 我要改（输入意见）", "⛔ 先别做"],
 					);
-
+					const pasteAsk = new Promise<string | undefined>((res) => {
+						openPlanAsk(pendingTitle, stepTexts, (a, note) => {
+							if (a === "yes") res("✅ 按这个执行");
+							else if (a === "no") res("⛔ 先别做");
+							else if (a === "edit") res(`✏️ 我要改（输入意见）${note ? `|${note}` : ""}`);
+							else res(undefined);
+						});
+					});
+					const timeoutAsk =
+						pcfg.timeoutSec > 0
+							? new Promise<string | undefined>((res) => {
+									const t = setTimeout(() => res(pcfg.timeoutRun ? "✅ 按这个执行" : "⛔ 先别做"), pcfg.timeoutSec * 1000);
+									t.unref?.();
+								})
+							: undefined;
+					choice = await Promise.race(timeoutAsk ? [tuiAsk, pasteAsk, timeoutAsk] : [tuiAsk, pasteAsk]);
+					closePlanAsk(); // 谁先答都要把挂起状态清掉（否则下一轮计划会被误应答）
+				} else if (bgTurn) {
+					ctx.ui.notify(`📋 剪贴板投递的计划（${pending.length} 步）→ 默认开始执行：${pendingTitle || ""}`, "info");
+				}					if (choice && choice.startsWith("✏️") && choice.includes("|")) {
+						// 粘贴通道带来的修改意见：直接当"我要改"处理（不用再弹输入框）
+						const note = choice.split("|").slice(1).join("|").trim();
+						restore();
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: note
+										? `用户**不要**这个方案，改完再重新声明。\n用户原话：\n"${note}"\n\n请根据这个意见调整，先在对话里重新给详细计划，再重新 progress(action="plan") 声明步骤。`
+										: "用户在修改输入里取消了，没有执行方案。请等用户进一步指示。",
+								},
+							],
+							details: { revised: true, note: note || null },
+							isError: true,
+						};
+					}
 					if (choice?.startsWith("✏️")) {
 						const note = (await ctx.ui.editor("想怎么改？（Esc 取消）", ""))?.trim();
 						restore();
@@ -1032,8 +1113,13 @@ export function setupBoard(api: ExtensionAPI): void {
 							isError: true,
 						};
 					}
-				}
 
+				// 计划开跑 → 弹一张**常驻**的「执行弹窗」：把要干的事完整列出来（点 X 才关）
+				{
+					const lines = pending.map((x, i) => `  ${i + 1}. ${x.text}`).join("\n");
+					const tail = bgTurn ? "（剪贴板投递 → 默认执行；点 X 关掉这张）" : "（点 X 关掉这张）";
+					cardNotify(`pi · 已按这个计划开工（${pending.length} 步）`, `${pendingTitle ? pendingTitle + "\n" : ""}${lines}\n${tail}`, 0);
+				}
 				// ✅ 到这里才算确认通过 —— 现在才提交到面板和磁盘
 				title = pendingTitle;
 				steps = pending;
@@ -1112,6 +1198,26 @@ export function setupBoard(api: ExtensionAPI): void {
 		activity = summarizeTool(event.toolName);
 		activityStart = Date.now();
 		renderWidget();
+	});
+
+	/**
+	 * 轮内提醒（治“一到到底、看板不动”）：
+	 * 同一次用户输入里模型可能跑几十次工具调用 —— 中途它看不到新的提示词，
+	 * 所以把提醒**附在工具结果后面**（pi 允许 tool_result 处理器改写内容）。
+	 * 只数顶层调用（nested 的 codemode 调用不数，免得虚高），每 NAG_EVERY_CALLS 次提醒一次。
+	 */
+	api.on("tool_result", async (event) => {
+		if (boardOff || steps.length === 0) return;
+		if (event.toolName === "progress") {
+			resetProgressWatch();
+			return;
+		}
+		if (event.parentToolCallId) return; // nested 调用不数
+		toolCallsSinceProgress++;
+		if (toolCallsSinceProgress < NAG_EVERY_CALLS) return;
+		const nag = progressNag();
+		toolCallsSinceProgress = 0;
+		return { content: [...event.content, { type: "text" as const, text: nag }] };
 	});
 
 	// ⚠️ 一轮 = 一问一答：agent_start → agent_settled
@@ -1287,6 +1393,8 @@ export function setupBoard(api: ExtensionAPI): void {
 		const doneN = steps.filter((s) => s.status === "done").length;
 		const doingIdx = steps.findIndex((s) => s.status === "doing");
 		const staleTurns = steps.length > 0 ? turnNo - lastProgressTurn : 0;
+		// 轮内也算：同一个 turn 里跑了很多工具却没更新看板（多步任务常常都发生在同一轮里）
+		const staleCalls = steps.length > 0 ? toolCallsSinceProgress : 0;
 
 		// 把面板的【真实状态】告诉模型，而不是只给一套静态规则
 		let planLine: string;
@@ -1297,10 +1405,14 @@ export function setupBoard(api: ExtensionAPI): void {
 				`当前面板：计划「${title || "(无标题)"}」 ${doneN}/${steps.length} 步` +
 				(doingIdx >= 0 ? `，正在做第 ${doingIdx + 1} 步「${steps[doingIdx]!.text}」` : "") +
 				(blocker ? `，卡点：${blocker}` : "");
-			if (staleTurns >= 2) {
+			if (staleTurns >= 2 || staleCalls >= NAG_EVERY_CALLS) {
 				planLine +=
-					`\n⚠️ 这个计划已经 ${staleTurns} 轮没有任何 progress() 更新，**很可能已作废**。` +
-					`执行前必须先确认它还对得上用户最新的要求；对不上就先 progress(action="clear")。`;
+					`\n⚠️ 这个计划` +
+					(staleTurns >= 2 ? `已经 ${staleTurns} 轮没有任何 progress() 更新` : "") +
+					(staleCalls >= NAG_EVERY_CALLS ? `${staleTurns >= 2 ? "，" : "已经"}本轮 ${staleCalls} 次工具调用没更新` : "") +
+					`，**很可能已作废或忘了同步**。` +
+					`做完一步就 progress(action="step", index=N, status="done")；全部完成就 clear；` +
+					`对不上用户最新要求就先 progress(action="clear")。`;
 			}
 		}
 
@@ -1402,6 +1514,7 @@ export function setupBoard(api: ExtensionAPI): void {
 	api.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
 		sessionStart = Date.now(); // 仅作挂钟参考；「会话」行显示的是活跃时长
+		resetProgressWatch();
 		running = false;
 		runAccounted = false;
 		runStart = 0;

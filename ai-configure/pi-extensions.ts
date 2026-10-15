@@ -31,6 +31,7 @@ import { setupPanel } from "./panel";
 import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
 import { setupGate } from "./gate";
+import { setupVoice } from "./voice";
 import { showHelp } from "./help";
 import { healthLine, markFail, markOk } from "./health";
 
@@ -44,6 +45,7 @@ export default function (api: ExtensionAPI): void {
 		["panel", setupPanel],
 		["board", setupBoard],
 		["delegate", setupDelegate],
+		["voice", setupVoice],
 		["doctor", setupDoctor],
 	];
 	for (const [name, setup] of parts) {

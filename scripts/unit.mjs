@@ -255,6 +255,22 @@ allOk =
 		'const fakeCtx = { hasUI: true, mode: "tui", cwd: process.cwd(), isProjectTrusted: () => false, ui: { setWidget: (k, v) => { widgetCalls.push(v === undefined ? "clear" : "mount"); }, setStatus() {}, notify() {}, theme: { fg: (_c, t) => t } }, sessionManager: { getEntries: () => [], getSessionFile: () => undefined, getSessionId: () => "test" } };',
 		"await H2.session_start({}, fakeCtx);",
 		'ok("看板：session_start 会挂 widget", widgetCalls.includes("mount"));',
+		"// ---- 轮内提醒：同一 turn 里跑很多工具却没更新看板 → 往工具结果后面附一句提醒 ----",
+		"const tr = H2[\"tool_result\"];",
+		'steps = [{ text: "查现状", status: "pending" }, { text: "改代码", status: "pending" }];',
+		'title = "测试计划";',
+		'ok("没计划时不提醒", (await tr({ toolName: "bash", content: [] })) === undefined);',
+		"let nagOut;",
+		'for (let i = 0; i < 6; i++) nagOut = await tr({ toolName: "bash", content: [{ type: "text", text: "x" }] });',
+		'ok("数到第 7 次还不提醒", nagOut === undefined);',
+		'nagOut = await tr({ toolName: "bash", content: [{ type: "text", text: "x" }] });',
+		'ok("第 8 次：附上一条看板提醒", !!nagOut && nagOut.content.length === 2 && nagOut.content[1].text.includes("看板提醒"));',
+		'ok("提醒里带上了进度（0/2 步）", nagOut.content[1].text.includes("0/2"));',
+		'ok("nested 调用不计数", (await tr({ toolName: "bash", parentToolCallId: "p/1", content: [] })) === undefined);',
+		'await tr({ toolName: "progress", content: [] });',
+		'ok("progress() 后计数清零 → 后续工具不再连着提醒", (await tr({ toolName: "bash", content: [] })) === undefined);',
+		"steps = [];",
+		'title = "";',
 		"setBoardOff(true); // = gate 的 applyBoardGate(true) 那一步",
 		"await H2.agent_end({}, fakeCtx); // agent_end 会走 refresh() → 应当撤掉",
 		'ok("停用态：refresh 会撤掉 widget", widgetCalls[widgetCalls.length - 1] === "clear");',
@@ -619,6 +635,320 @@ allOk =
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-gate"), PI_AI_EXT: "" },
 	) && allOk;
+
+// ---------- 套件：notify（TTS 文本清洗）----------
+// ---------- 套件：shared（计划确认：答复解析 + 风险判定） ----------
+bundle("shared.ts", "shared.mjs");
+allOk =
+	runSuite(
+		"shared：计划答复解析 / 低风险判定",
+		join(tmp, "shared.mjs"),
+		[
+			'ok("答复：同意(短句) → yes", parsePlanAnswer("同意").a === "yes" && parsePlanAnswer("可以").a === "yes");',
+			'ok("答复：ok/行/继续 → yes", parsePlanAnswer("ok").a === "yes" && parsePlanAnswer("行").a === "yes" && parsePlanAnswer("继续").a === "yes");',
+			'ok("答复：不行/先别做/取消 → no", parsePlanAnswer("不行").a === "no" && parsePlanAnswer("先别做").a === "no" && parsePlanAnswer("取消吧").a === "no");',
+			'ok("答复：我不同意 → no", parsePlanAnswer("我不同意").a === "no");',
+			'ok("答复：长句 → 当修改意见(edit)", parsePlanAnswer("把第二步改成先备份再做").a === "edit");',
+			'ok("答复：edit 会带上原话", parsePlanAnswer("改用另一个接口").note.indexOf("另一个接口") >= 0);',
+			'ok("答复：空字符串 → undefined", parsePlanAnswer("   ") === undefined);',
+			'ok("风险：3 步只读 → 低风险（可自动过）", isLowRiskPlan(["查一下表行数", "看看最近记录", "汇总给我"]) === true);',
+			'ok("风险：含 write/delete 词 → 高风险", isLowRiskPlan(["查表", "删掉旧记录"]) === false && isLowRiskPlan(["写一个脚本"]) === false);',
+			'ok("风险：含提交/部署 → 高风险", isLowRiskPlan(["统计一下", "提交代码"]) === false && isLowRiskPlan(["查日志", "部署到线上"]) === false);',
+			'ok("风险：4 步以上 → 不自动过", isLowRiskPlan(["查A", "看B", "统计C", "汇总D"]) === false);',
+			'ok("风险：全是动作没有只读词 → 不自动过", isLowRiskPlan(["跑一下", "处理一下"]) === false);',
+			'ok("桥：open/answerPlanAsk 能收工", (() => { let got = null; openPlanAsk("t", ["a"], (a) => { got = a; }); const hit = answerPlanAsk("yes"); return hit === true && got === "yes" && hasPendingPlanAsk() === false; })());',
+			'ok("桥：没有挂起时 answerPlanAsk 返回 false", answerPlanAsk("yes") === false);',
+			'ok("桥：新问题会放掉旧问题(undefined)", (() => { let old = "x"; openPlanAsk("a", [], () => { old = undefined; }); openPlanAsk("b", [], () => {}); return old === undefined; })());',
+			'ok("桥：closePlanAsk 清掉挂起", (() => { openPlanAsk("c", [], () => {}); closePlanAsk(); return hasPendingPlanAsk() === false; })());',
+			'ok("桥：后台轮标记可读写", (() => { setBackgroundTurn(true); const a = isBackgroundTurn(); setBackgroundTurn(false); return a === true && isBackgroundTurn() === false; })());',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-shared") },
+	) && allOk;
+
+bundle("notify.ts", "notify2.mjs");
+allOk =
+	runSuite(
+		"notify：语音播报文本清洗 / TTS 状态",
+		join(tmp, "notify2.mjs"),
+		[
+			'ok("TTS：默认关（不会突然出声）", getTts().on === false);',
+			'setTts({ on: true, rate: 99, volume: -5 });',
+			'ok("TTS：rate/volume 会被夹到合法区间", getTts().rate === 10 && getTts().volume === 0);',
+			'setTts({ on: false, rate: 0, volume: 100 });',
+			'ok("念法：去 markdown 记号", speechText("**结论**：`npm test` 全过").indexOf("*") < 0 && speechText("**结论**：`npm test` 全过").indexOf("`") < 0);',
+			'ok("念法：去 emoji", speechText("✅ 都修好了 🎉").indexOf("✅") < 0 && speechText("✅ 都修好了 🎉").indexOf("🎉") < 0);',
+			'ok("念法：去中文括号旁注", speechText("已修好（见截图）") === "已修好");',
+			'ok("念法：去链接只留文字", speechText("看 [文档](https://x.com/a) 第三节") === "看 文档 第三节");',
+			'ok("念法：超 300 字截断 + 提示", speechText("字".repeat(500)).length <= 306 && speechText("字".repeat(500)).indexOf("以下省略") > 0);',
+			'ok("念法：空输入不炸", speechText("") === "" && speechText(undefined) === "");',
+			'ok("念法：正常一句话原样保留", speechText("数据库已备份，文件名 center-1015.sql").indexOf("数据库已备份") === 0);',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-notify2") },
+	) && allOk;
+
+// ---------- 套件：voice（语音上屏判定 / 触发词 / 不误发） ----------
+bundle("voice.ts", "voice.mjs");
+allOk =
+	runSuite(
+		"voice：语音上屏判定 / 触发词 / 不误发",
+		join(tmp, "voice.mjs"),
+		[
+			"const S = (t, b, at) => ({ text: t, blockSeen: b, lastChangeAt: at });",
+			"const O = (silenceMs = 1500, idle = true, lockUntil = 0) => ({ silenceMs, idle, lockUntil, autoSend: true });",
+			"// OA = 默认档：只认触发词，绝不因“停一下”自动发",
+			"const OA = (idle = true) => ({ silenceMs: 1500, idle, lockUntil: 0, autoSend: false });",
+			'// ---- 手打：每次 +1 字，停再久也不该发 ----',
+			'let st = S("", false, 0);',
+			'st = decideFrame(st, "你", 1000, O());',
+			'st = decideFrame(st, "你好", 1200, O());',
+			'st = decideFrame(st, "你好啊", 1400, O());',
+			'ok("手打（每次 +1 字）：停 8 秒也不发", decideFrame(st, "你好啊", 9000, O()).send === false);',
+			'// ---- 块状上屏（IME 语音）----',
+			'let st2 = S("", false, 0);',
+			'st2 = decideFrame(st2, "帮我查一下数据库", 1000, O());',
+			'ok("块状上屏：还没停够 → 不发", decideFrame(st2, "帮我查一下数据库", 1500, O()).send === false);',
+			'const go = decideFrame(st2, "帮我查一下数据库", 2600, O());',
+			'ok("块状上屏 + 静默 1.5s → 自动发", go.send === true && go.body === "帮我查一下数据库");',
+			'ok("pi 正在跑（不空闲）→ 不发，等空闲", decideFrame(st2, "帮我查一下数据库", 2600, O(1500, false)).send === false);',
+			'ok("刚发完的锁内 → 不抢发", decideFrame(st2, "帮我查一下数据库", 2600, O(1500, true, 3000)).send === false);',
+			'// ---- IME 回头纠错改字 → 计时重置 ----',
+			'let st3 = S("", false, 0);',
+			'st3 = decideFrame(st3, "帮我查数据库", 1000, O());',
+			'st3 = decideFrame(st3, "帮我查一下数据库", 2000, O());',
+			'ok("改字后 600ms 内 → 不发（计时重置了）", decideFrame(st3, "帮我查一下数据库", 2600, O()).send === false);',
+			'ok("改字后再等够 → 才发", decideFrame(st3, "帮我查一下数据库", 3600, O()).send === true);',
+			'// ---- 触发词 ----',
+			'const word = decideFrame(S("", false, 0), "把那个表删了发送。", 100, O());',
+			'ok("触发词：立刻发（不用块状、不等静默）", word.send === true);',
+			'ok("触发词：从正文里剥掉（含标点）", word.body === "把那个表删了");',
+			'ok("只说了触发词 → 没正文，不发", decideFrame(S("", false, 0), "确定", 100, O()).send === false);',
+			'ok("带空格/问号的触发词也认", decideFrame(S("", false, 0), "就这个吧 发送？", 100, O()).body === "就这个吧");',
+			'// ---- 空文本 / 发完清空 ----',
+			'ok("空文本 → 不发", decideFrame(S("", false, 0), "", 5000, O()).send === false);',
+			"// ---- 默认档（只认触发词）：这是修「打字被误发」的核心回归 ----",
+			'let dflt = decideFrame(S("", false, 0), "帮我查一下数据库", 1000, OA());',
+			'ok("默认档：块状上屏也不自动发（停 30s 都不发）", decideFrame(dflt, "帮我查一下数据库", 30000, OA()).send === false);',
+			'const dfltWord = decideFrame(S("", false, 0), "把那个表删了发送", 100, OA());',
+			'ok("默认档：句尾触发词照旧立刻发", dfltWord.send === true);',
+			'ok("默认档：触发词会被剥掉", dfltWord.body === "把那个表删了");',
+			'ok("默认档：只认触发词，手打半句永不发", decideFrame(S("", false, 0), "我在打", 9000, OA()).send === false);',
+			'const cleared = decideFrame(S("帮我查一下", true, 1000), "", 2000, O());',
+			'ok("发完被清空 → blockSeen 重置（下一条重新认）", cleared.blockSeen === false);',
+			'// ---- clip：触发词匹配（含抗识别误差）----',
+			"const T = DEFAULT_TRIGGERS;",
+			'ok("clip：结尾「发送」命中", matchTrigger("帮我查一下，发送", T).hit === true);',
+			'ok("clip：剥离触发词 + 尾部标点", matchTrigger("帮我查一下，发送。", T).body === "帮我查一下");',
+			'ok("clip：语气词「发送吧」也命中", matchTrigger("帮我查一下 发送吧", T).hit === true);',
+			'ok("clip：复制了个网址 → 不命中", matchTrigger("https://example.com/a?b=1", T).hit === false);',
+			'ok("clip：正文提到「发送」但不在结尾 → 不命中", matchTrigger("发送那个文件给我", T).hit === false);',
+			'ok("clip：≥3 字允许 1 字识别错（投给pi → 头给pi）", matchTrigger("帮我查一下 头给pi", T).hit === true);',
+			'ok("clip：2 字不放宽（发生 ≠ 发送）", matchTrigger("这事发生了", T).hit === false);',
+			'ok("clip：自定义触发词可用（结束）", matchTrigger("帮我查一下，结束", ["结束"]).hit === true);',
+			'ok("clip：只有触发词 → 正文空（调用方丢弃）", matchTrigger("发送", T).hit === true && matchTrigger("发送", T).body === "");',
+			'// ---- clip：前置清洗（真实语音样本回归）----',
+			'const NL = String.fromCharCode(10), CTRL = String.fromCharCode(7), NUL = String.fromCharCode(0), WSP = String.fromCharCode(0x3000);',
+			'ok("清洗：控制字符清掉", preprocessClip(CTRL + "帮我查一下" + NUL) === "帮我查一下");',
+			'ok("清洗：全角空格压成一个半角空格", preprocessClip("帮" + WSP + "我") === "帮 我");',
+			'ok("清洗：三个以上换行压成两个", preprocessClip("a" + NL.repeat(4) + "b") === "a" + NL.repeat(2) + "b");',
+			'ok("清洗：成对包裹的引号剥掉", preprocessClip("「帮我查一下」") === "帮我查一下");',
+			'ok("清洗：不成对的不动", preprocessClip("「帮我查一下") === "「帮我查一下");',
+			'ok("清洗：句子中间的口癖不碰", preprocessClip("嗯那个帮我查一下") === "嗯那个帮我查一下");',
+			'// ---- 正文收尾清洗（真实样本：看看看到底 / 尾部话头）----',
+			'ok("收尾：ASR 叠字 看看看到底 → 看看到底", cleanBody("看看看到底区别在哪里").text === "看看到底区别在哪里");',
+			'ok("收尾：尾部悬空话头「然后」剥掉", cleanBody("有可以优化的地方，然后").text === "有可以优化的地方");',
+			'ok("收尾：话头在句子中间不碰", cleanBody("然后我们再开始").text === "然后我们再开始");',
+			'ok("收尾：只说了话头 → 剩下空（调用方丢弃）", cleanBody("然后").text === "然后");',
+			'// ---- clip：循环剥触发词（治「说了两遍发送」）----',
+			'ok("clip：说两遍发送 → 全剥干净", matchTrigger("帮我查一下 发送 发送", T).body === "帮我查一下");',
+			'ok("clip：说两遍（带标点）也全剥", matchTrigger("帮我查一下，发送，发送。", T).body === "帮我查一下");',
+			'ok("clip：剥两层会记账 strips=2", matchTrigger("帮我查一下 发送 发送", T).strips === 2);',
+			'ok("clip：只说两遍触发词 → 正文空 → 丢弃", matchTrigger("发送发送", T).hit === true && matchTrigger("发送发送", T).body === "");',
+			'ok("clip：没触发词时 body 原样返回", matchTrigger("看看看到底", T).body === "看看看到底");',
+			'const b64s = (x) => Buffer.from(x, "utf8").toString("base64");',
+			'// ---- 静默投递护栏（looksLikeSpeech）：挡住你 Ctrl+C 的代码/网址/日志 ----',
+			'ok("护栏：正常一句话 → 放行", looksLikeSpeech("帮我把日志按天切一下").ok === true);',
+			'ok("护栏：/voice clip mark on|off 这种 help 行 → 挡掉（真实误投过）", looksLikeSpeech("/voice clip mark on|off 投递正文加不加 「📋 」前缀（默认加，便于分辨是不是语音投递）").ok === false);',
+			'ok("护栏：斜杠开头（指令）→ 挡掉", looksLikeSpeech("/reload").ok === false || looksLikeSpeech("/voice clip on 把这个打开").ok === false);',
+			'ok("护栏：网址 → 拦下", looksLikeSpeech("https://example.com/a?b=1 看看这个").ok === false);',
+			'ok("护栏：代码 → 拦下", looksLikeSpeech("const a = {b: 1}; function f() { return a; }").ok === false);',
+			'ok("护栏：错误栈 → 拦下", looksLikeSpeech("TypeError: x is undefined").ok === false);',
+			'ok("护栏：英文文档 → 拦下", looksLikeSpeech("this is a long english paragraph copied from a doc").ok === false);',
+			'ok("护栏：太短 → 拦下", looksLikeSpeech("好").ok === false);',
+			'ok("护栏：多行日志 → 拦下", looksLikeSpeech(["一行","二行","三行","四行","五行"].join(NL)).ok === false);',
+			'ok("护栏：太长 → 拦下", looksLikeSpeech("这是一段话。".repeat(200)).ok === false);',
+			'ok("护栏：像代码但中文多的一行命令 → 放行（你说的话）", looksLikeSpeech("把它复制到 test 目录里去").ok === true);',
+			'// ---- 内容判断开关（/voice clip guess）：关了就"不猜"，只剩去重+非空 ----',
+			'ok("判断开关：开 → 网址照样拦", guardContent("https://example.com 看看这个", true).ok === false);',
+			'ok("判断开关：关 → 网址/代码/英文都放行", guardContent("https://example.com/a?b=1", false).ok === true && guardContent("const a = 1;", false).ok === true && guardContent("this is english", false).ok === true);',
+			'ok("判断开关：关 → 但太短还是拦（空/单字）", guardContent("好", false).ok === false && guardContent("   ", false).ok === false);',
+			'ok("判断开关：关 → 原因写「直接投」", guardContent("帮我看看这个", false).why.includes("直接投"));',
+			'ok("判断开关：默认参数 = 开（不给参数也走启发式）", guardContent("https://x.com").ok === false);',
+			'// ---- 静默投递：不喊触发词也会投（等安静下来） ----',
+			'clipEvt.length = 0; clipSeen = [];',
+			'clipTriggerMode = "silent"; clipSilentMs = 300;',
+			'onHelperLine("T 200 " + b64s("帮我把这张表导出成 csv"));',
+			'ok("静默模式：先记为「等待静默」，不立刻投", clipEvt[0].kind === "等待静默");',
+			'clipTriggerMode = "word";',
+			'onHelperLine("T 201 " + b64s("把上个月的账单汇总一下"));',
+			'ok("word 模式：没触发词 → 丢弃", clipEvt[clipEvt.length - 1].kind === "丢弃·无触发词");',
+			'clipTriggerMode = "silent";',
+			'onHelperLine("T 202 " + b64s("const a = 1; const b = 2;"));',
+			'ok("静默模式：代码被护栏拦下（不会乱投）", clipEvt[clipEvt.length - 1].kind === "丢弃·不像语音");',
+			'// ---- clip：真话回归（这条就是剪贴板里的原文）----',
+			'const real = matchTrigger("你可以实际去找我粘贴板上的前几条数据的实际信息，看看看到底区别在哪里，然后发送。", T);',
+			'ok("clip：真话 → 命中", real.hit === true);',
+			'ok("clip：真话 → 剥 1 层触发词", real.strips === 1);',
+			'ok("clip：真话 → 清掉尾部话头「然后」", real.cleaned === 1 && real.body.endsWith("区别在哪里"));',
+			'ok("clip：真话 → 叠字已折（不再有 看看看）", real.body.includes("看看看") === false);',
+			'ok("clip：真话 → 正文里没有触发词残留", real.body.includes("发送") === false);',
+			'// ---- 结果卡片：摘要（markdown → 能直接看懂的短结论）----',
+			'const MD = ["## 结论", "", "**三个问题都修好了**，改动如下：", "", "| 项 | 状态 |", "| --- | --- |", "| 看板 | ✅ |", "", "```bash", "npm test  # 这行不该出现", "```", "", "- 细节一：轮内计数", "- 细节二：每 8 次调用提醒"].join("\\n");',
+			'const sum = summarizeReply(MD, 120);',
+			'ok("摘要：标题符号没了", sum.startsWith("三个问题都修好了") === true);',
+			'ok("摘要：加粗标记没了", sum.includes("**") === false);',
+			'ok("摘要：表格行没混进来", sum.includes("|") === false);',
+			'ok("摘要：代码块内容没混进来", sum.includes("npm test") === false);',
+			'ok("摘要：列表符没了", sum.includes("- 细节") === false && sum.includes("细节一") === true);',
+			'ok("摘要：超长会在句读处截断并加省略号", summarizeReply("一二三四五六七八九十。".repeat(20), 20).endsWith("…") === true);',
+			'ok("摘要：空输入 → 空", summarizeReply("") === "");',
+			'ok("摘要：纯代码块 → 空（调用方给兜底文案）", summarizeReply("```js\\nconst a = 1;\\n```") === "");',
+			'ok("摘要：开场空话被跳过", summarizeReply("好的。\\n真正的结论在这里，共修了三处。", 120).startsWith("真正的结论") === true);',
+			'// ---- 结果卡片：元信息行 ----',
+			'ok("元信息：耗时/工具/文件/失败", formatResultMeta({ secs: 42, tools: 12, failed: 1, files: ["a.ts", "b.ts", "c.ts", "d.ts"] }).includes("42s") === true);',
+			'ok("元信息：文件多了折叠成「等 N 个」", formatResultMeta({ files: ["a.ts","b.ts","c.ts","d.ts"] }).includes("等 4 个") === true);',
+			'ok("元信息：失败会标 ⚠️", formatResultMeta({ failed: 2 }).includes("⚠️ 2 个工具失败") === true);',
+			'ok("元信息：一分钟以上换成 m/s", formatResultMeta({ secs: 95 }).includes("1m35s") === true);',
+			'ok("元信息：啥都没有 → 空串", formatResultMeta({}) === "");',
+			'// ---- 触发词结尾窗口（治「IME 整理把发送挪走/后面补字」）----',
+			'const W6 = 6;',
+			'ok("窗口：发送后面被补了「，就这样」→ 命中", matchTrigger("帮我查一下，发送，就这样", T, W6).hit === true);',
+			'ok("窗口：命中后把填充尾巴也丢掉", matchTrigger("帮我查一下，发送，就这样", T, W6).body === "帮我查一下");',
+			'ok("窗口：发送一下 → 命中", matchTrigger("帮我查一下 发送一下", T, W6).hit === true);',
+			'ok("窗口：窗口关掉（0）就回到严格结尾", matchTrigger("帮我查一下，发送，就这样", T, 0).hit === false);',
+			'ok("窗口：正文中间提「发送」不算（后面不是填充物）", matchTrigger("发送那个文件给我", T, W6).hit === false);',
+			'ok("窗口：不能隔太远（末尾 20 字外）", matchTrigger("发送然后说了一大堆没用的东西在这里", T, W6).hit === false);',
+			'ok("窗口：命中位置会被记下（台账用）", matchTrigger("帮我查一下，发送，谢谢", T, W6).at === 6);',
+			'// ---- 否定词护栏 ----',
+			'ok("护栏：「别发送」不算", matchTrigger("别发送", T, W6).hit === false);',
+			'ok("护栏：「先别发送」不算", matchTrigger("先别发送", T, W6).hit === false);',
+			'ok("护栏：「不要发送」不算", matchTrigger("这文件不要发送", T, W6).hit === false);',
+			'ok("护栏：正常「发送」照旧命中", matchTrigger("把日志跑一遍发送", T, W6).hit === true);',
+			'// ---- helper 启动登记（治「/reload 后重放旧话」）+ 台账判定 ----',
+			'const b64v = (x) => Buffer.from(x, "utf8").toString("base64");',
+			'clipEvt.length = 0;',
+			'clipSeen = [];',
+			'onHelperLine("P 100 " + b64v("帮我查一下，发送"));',
+			'ok("启动登记：P 行只登记不投递", clipEvt.length === 1 && clipEvt[0].kind === "启动登记");',
+			'onHelperLine("T 101 " + b64v("帮我查一下，发送"));',
+			'ok("启动登记过的内容再来 → 判重复丢弃", clipEvt[1].kind === "丢弃·重复");',
+			'clipTriggerMode = "word";',
+			'onHelperLine("T 102 " + b64v("今天天气不错"));',
+			'ok("没带触发词 → 台账记「无触发词」", clipEvt[2].kind === "丢弃·无触发词");',
+			'onHelperLine("T 103 " + b64v("发送"));',
+			'ok("只说了触发词 → 台账记「只说了触发词」", clipEvt[3].kind === "丢弃·只说了触发词");',
+			'ok("台账只留最近 12 条", clipEvt.length <= 12);',
+			'// ---- 悬浮窗按钮 → 计划确认 通道 ----',
+			'let asked = null;',
+			'// ---- clip：投递档位 ----',
+			'const D = decideDelivery;',
+			'ok("clip：空闲 → 直接起一轮（不带 deliverAs）", D({ idle: true, mode: "steer" }).deliverAs === undefined && D({ idle: true, mode: "queue" }).note === "已直接开始处理");',
+			'ok("clip：忙 + steer → 插话", D({ idle: false, mode: "steer" }).deliverAs === "steer");',
+			'ok("clip：忙 + queue → 排队", D({ idle: false, mode: "queue" }).deliverAs === "followUp");',
+			'ok("clip：忙 + abort → 打断", D({ idle: false, mode: "abort" }).abort === true && D({ idle: false, mode: "abort" }).note.includes("打断"));',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-voice") },
+	) && allOk;
+
+// ---------- 套件：notify（终端探测 / 通知通道 / 摘要） ----------
+bundle("notify.ts", "notify.mjs");
+allOk =
+	runSuite("notify：终端探测 / 通道选择 / 摘要", join(tmp, "notify.mjs"), [
+		'ok("探测：Warp → 支持胶囊", detectTerminal({ TERM_PROGRAM: "WarpTerminal" }).osc === true);',
+		'ok("探测：Windows Terminal → 支持", detectTerminal({ WT_SESSION: "abc" }).osc === true);',
+		'ok("探测：iTerm2 → 支持", detectTerminal({ TERM_PROGRAM: "iTerm.app" }).osc === true);',
+		'ok("探测：kitty → 支持", detectTerminal({ KITTY_WINDOW_ID: "1" }).osc === true);',
+		'ok("探测：cmd/conhost → **不支持**（绝不写 OSC，免得出乱码）", detectTerminal({ ComSpec: "C:/Windows/system32/cmd.exe" }).osc === false);',
+		'ok("探测：完全未知 → 保守当不支持", detectTerminal({}).osc === false);',
+		'ok("探测：名字能看懂（给你看的状态里用）", detectTerminal({ TERM_PROGRAM: "WarpTerminal" }).name === "Warp");',
+		'ok("通道：默认 auto（终端支持就发胶囊，不支持才换）", getNotifyMode() === "auto");',
+		'setNotifyMode("both");',
+		'ok("通道：能切到 both（胶囊 + 自绘弹窗）", getNotifyMode() === "both");',
+		'setNotifyMode("auto");',
+		'ok("摘要：标题+正文能洗干净", summarizeReply("## 结论" + String.fromCharCode(10) + String.fromCharCode(10) + "三处都修好了。") === "三处都修好了。");',
+		'ok("元信息：超一分钟显示 m ss", formatResultMeta({ secs: 61 }) === "1m01s");',
+			'ok("弹窗：登记簿目录 = <agent>/pi-cards", cardDirPath().replace(/[\\\\/]/g, "/").endsWith("pi-cards"));',
+			'ok("弹窗：cardDirPath 是函数（新弹窗靠它叠在旧弹窗下面）", typeof cardDirPath() === "string");',
+]) && allOk;
+
+// ---------- 静态检查：删掉的功能不许留"幽灵引用" ----------
+// （踩过：hud.ts 删掉后 voice.ts 还 calling answerPlan()/cardNotify()，打包能过、一 reload 才炸）
+{
+	const files = ["board.ts", "voice.ts", "notify.ts", "pi-extensions.ts", "config.ts", "panel.ts", "delegate.ts", "gate.ts", "help.ts"];
+	let src = "";
+	for (const f of files) {
+		try {
+			src += readFileSync(join(ext, f), "utf8");
+		} catch {
+			/* 文件不在就算了 */
+		}
+	}
+	const ghosts = [
+		"answerPlan(", "askPlanInHud", "hudPlanAsk", "setPlanAsker", "askPlanViaHud", "planAskAvailable", "setPlanAskAvailable",
+		"armHud", "disarmHud", "hudState", "pushHudNow", "pushHudThrottled", "hudLog", "hudTick", "readHudCmd", "pushHud",
+		"startHud", "stopHud", "hudRunning", "hudPos", "resetHudPos", "hudPidInfo", "hudAliveByPidFile", "killAllHuds",
+		"toggleClipFromHud", "summarizeArgs", "messageText", "liveText", "actLines",
+		"lastUserText", "hudTicks", "hudExpanded", "hudLastSummary", "hudLastMeta", "HUD_TICK_MS", "hudFont", "hudCorner",
+		"from \"./hud\"",
+	];
+	const found = ghosts.filter((g) => src.includes(g));
+	if (found.length === 0) {
+		console.log("PASS  静态：删掉的 HUD 功能没有幽灵引用");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：删掉的 HUD 功能还残留引用 → " + found.join(", "));
+	}
+}
+{
+	const shared = readFileSync(join(ext, "shared.ts"), "utf8");
+	const need = ["openPlanAsk", "answerPlanAsk", "hasPendingPlanAsk", "closePlanAsk", "isLowRiskPlan", "parsePlanAnswer", "setPlanCfg", "getPlanCfg"];
+	const missing = need.filter((n) => !shared.includes(n));
+	const wired = readFileSync(join(ext, "board.ts"), "utf8").includes('from "./shared"') && readFileSync(join(ext, "voice.ts"), "utf8").includes('from "./shared"');
+	if (missing.length === 0 && wired) {
+		// ── 静态检查：弹窗脚本不许再有 Region.FromRegion（不存在 → Add-Type 编译失败 → 弹窗永远不显示）──
+{
+	const src = readFileSync(join(ext, "notify.ts"), "utf8");
+	if (src.includes("-split 's+'")) {
+		console.log("FAIL  静态：弹窗脚本把 -split '\s+' 的反斜杠写丢了（叠窗位置会永远算成 0）");
+		allOk = false;
+	} else {
+		console.log("PASS  静态：叠窗解析用的 -split 反斜杠还在");
+	}
+	if (/Region\.FromRegion\s*\(/.test(src)) {
+		console.log("FAIL  静态：弹窗脚本用了不存在的 Region.FromRegion（应为 Region.FromHrgn）");
+		allOk = false;
+	} else {
+		console.log("PASS  静态：弹窗脚本的圆角 API 正确（Region.FromHrgn）");
+	}
+}
+{
+	const nf = readFileSync(join(ext, "notify.ts"), "utf8");
+	const gone = ["planCard", "readPlanCmd", "PlanB64", "CmdFile", "killOldPopup"].filter((x) => nf.includes(x));
+	const hasStack = nf.includes("-CardDir") && nf.includes("cardDir");
+	const hasRefs = nf.includes("ReferencedAssemblies System.Windows.Forms");
+	if (gone.length === 0 && hasStack && hasRefs) {
+		console.log("PASS  静态：弹窗按钮已彻底移除，叠窗参数与程序集引用都在");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：弹窗改动不完整 → 残留:[" + gone.join(",") + "] 叠窗:" + hasStack + " 程序集引用:" + hasRefs);
+	}
+}
+console.log("PASS  静态：共享桥 shared.ts 完整且 board/voice 都接上了");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：共享桥缺失 → " + (missing.join(", ") || "没有再 import"));
+	}
+}
+if (!allOk) console.log(String.fromCharCode(10) + "❌ 静态检查失败");
 
 rmSync(tmp, { recursive: true, force: true });
 

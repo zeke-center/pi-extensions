@@ -16,3 +16,6 @@ token.txt
 *.tmp
 .DS_Store
 Thumbs.db
+
+# 删掉的旧代码备份（留本地做参照，不入库）
+attic/
