@@ -514,6 +514,29 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
   （pi 允许 `tool_result` 处理器改写内容 → 这是唯一能在**同一轮里**让模型看到提醒的地方）
 - 过时判定同时看「N 轮没更新」和「本轮 N 次调用没更新」，提醒里带上进度和距上次更新的分钟数
 
+### ③b 会话替换：背景回调绝不许碰旧 ctx（会崩整个 pi 进程）
+
+> 真实事故（crashes.json 里躺着）：`/new` 或切会话之后，剪贴板 helper 的子进程输出回调 →
+> `noteDrop()` → `refreshStatus()` 拿着**已被 pi 失效的旧 ctx** 读 `ctx.hasUI` → 抛
+> `This extension ctx is stale after session replacement or reload` →
+> **定时器/子进程回调里没人接这个异常 → 整个 pi 进程崩掉**。
+> 表现就像是"我刚改完名/刚切会话，会话不见了"。
+
+pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 之后**旧 ctx 彻底作废**，
+任何属性访问都会抛；要把工作搬进 `withSession` 的回调，或者等新的 `session_start`。
+
+本插件的做法（`shared.ts`）：
+
+| 工具 | 作用 |
+|---|---|
+| `isStaleCtxError(e)` | 认得出 pi 的 stale 报文（普通错误**不**冒充，别吞真 bug） |
+| `guardCtx(ctx, fn)` | 用缓存 ctx 干活的唯一入口：`{ok:false, stale:true}` 时调用方就**清掉缓存**，等下一个 `session_start` 自动恢复 |
+
+后台路径（子进程输出、`setInterval`、后台助理回投）**全部**走 `guardCtx`：
+`voice.refreshStatus / isTui / tick / clearEditorIfSame` · `delegate.pollBgTasks`（`bgCtx.isIdle`）·
+`board` 撤 widget。单测里有一条专门的模拟：拿一个"一碰就抛"的假 ctx 去打真实回调链，
+并且验证过**回退修复时它会 FAIL**。
+
 ### ④ 配置面板 `/aihelp`（表单式，和 `/assistants` 一个外观）
 
 配置项太多了（26 个），靠子命令记不住 —— 所以 `/aihelp` 是个**表单弹窗**（复用 `form.ts` 的 FormPane）：

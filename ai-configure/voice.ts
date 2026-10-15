@@ -59,6 +59,8 @@ import {
 } from "./notify";
 import {
 	answerPlanAsk,
+	guardCtx,
+	isStaleCtxError,
 	getPlanCfg,
 	hasPendingPlanAsk,
 	parsePlanAnswer,
@@ -558,11 +560,8 @@ let lastAssistantText = "";
 
 
 function isTui(ctx: ExtensionContext | undefined): boolean {
-	try {
-		return ctx?.hasUI === true && ctx.mode === "tui";
-	} catch {
-		return false;
-	}
+	const r = guardCtx(ctx, (c) => c.hasUI === true && c.mode === "tui");
+	return r.value === true;
 }
 
 function running(): boolean {
@@ -590,9 +589,11 @@ function noteDrop(why: string): void {
 }
 
 function refreshStatus(): void {
+	// ⚠️ 必须整体包在 try 里：会话一替换，旧 ctx 连 hasUI 都不让读（抛 stale），
+	//    而这里是**子进程输出/定时器**调进来的 —— 抛出去就崩整个 pi 进程（真踩过）
 	const ctx = lastCtx;
-	if (!ctx?.hasUI) return;
 	try {
+		if (!ctx?.hasUI) return;
 		// ⚠️ 两个通道是独立的，状态栏必须各写各的（以前剪贴板那截不显示模式 →
 		// 你把剪贴板改成「自动」后，看到输入框那截还写着「只认触发词」就会以为没生效）
 		const bits: string[] = [];
@@ -606,8 +607,9 @@ function refreshStatus(): void {
 				? ctx.ui.theme.fg("accent", `${bits.join(" ")}${sentCount + clipCount ? ` ·${sentCount + clipCount}` : ""}`)
 				: undefined,
 		);
-	} catch {
-		/* 状态栏失败不影响功能 */
+	} catch (e) {
+		// 会话被替换 → 这份 ctx 作废：清掉，等新的 session_start 再赋
+		if (isStaleCtxError(e)) lastCtx = undefined;
 	}
 }
 
@@ -663,13 +665,17 @@ async function sendNow(body: string): Promise<void> {
 function tick(): void {
 	if (!running() || !talkOn) return;
 	const ctx = lastCtx;
-	if (!ctx?.hasUI) return;
-	let text = "";
-	try {
-		text = ctx.ui.getEditorText();
-	} catch {
-		return; // ctx 可能已过期（切会话/重载），静等下一次 session_start 刷新
+	// 轮询定时器回调：会话一替换旧 ctx 就抛，这里不能让它冒出去（统一走 guardCtx）
+	const g = guardCtx(ctx, (c) => {
+		if (!c.hasUI) return "";
+		return String(c.ui.getEditorText() ?? "");
+	});
+	if (g.stale) {
+		lastCtx = undefined;
+		return;
 	}
+	let text = g.value ?? "";
+	if (!g.ok) return; // ctx 没了/已过期（会话替换）→ 静等下一次 session_start
 	let idle = false;
 	try {
 		idle = ctx.isIdle();
@@ -963,17 +969,18 @@ function onHelperLine(line: string): void {
  */
 function clearEditorIfSame(raw: string, body: string): void {
 	const ctx = lastCtx;
-	if (!ctx?.hasUI) return;
-	try {
-		const cur = ctx.ui.getEditorText();
+	const r = guardCtx(ctx, (c) => {
+		if (!c.hasUI) return false;
+		const cur = String(c.ui.getEditorText() ?? "");
 		const t = cur.trim();
 		if (t && (t === raw.trim() || t === body.trim())) {
-			ctx.ui.setEditorText("");
-			console.error("[ai-configure] voice: 已清掉输入框里同一段语音文本");
+			c.ui.setEditorText("");
+			return true;
 		}
-	} catch {
-		/* 清不掉就算了，不影响投递 */
-	}
+		return false;
+	});
+	if (r.stale) lastCtx = undefined;
+	if (r.value === true) console.error("[ai-configure] voice: 已清掉输入框里同一段语音文本");
 }
 
 // 当前挂着的弹窗张数（登记簿里还有几个活着的小文件）

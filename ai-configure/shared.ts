@@ -10,6 +10,33 @@
  * ⚠️ 这里全是**内存状态**，不落盘（粘贴内容绝不写文件）。
  */
 
+// ======================= 旧 ctx 守卫（会话替换后不许再碰）=======================
+// 背景回调（定时器 / 子进程输出 / 后台助理回投）最危险：
+// 你做 newSession/switchSession/fork/reload 之后，pi 会把旧 ctx 标记失效 ——
+// 旧 ctx 一碰就抛「This extension ctx is stale after session replacement or reload」，
+// 定时器的回调里没人接这个异常 → **直接崩掉整个 pi 进程**（实测踩过，见 crashes.json）。
+
+/** 是不是「会话已替换，旧 ctx 作废」这类错误 */
+export function isStaleCtxError(e: unknown): boolean {
+	const m = e instanceof Error ? e.message : typeof e === "string" ? e : "";
+	return /stale after session replacement|ctx is stale|invalidated|not valid/i.test(m);
+}
+
+/**
+ * 用缓存的 ctx 干活的统一入口：
+ * - ctx 没缓存 → {ok:false}
+ * - 一碰就抛（会话换了）→ 接住并告诉调用方 `stale:true`（调用方应把缓存清掉，等新的 session_start）
+ * 背景路径**必须**走这里，否则会炸进程。
+ */
+export function guardCtx<T>(ctx: unknown, fn: (ctx: any) => T): { ok: boolean; stale: boolean; value?: T } {
+	if (!ctx) return { ok: false, stale: false };
+	try {
+		return { ok: true, stale: false, value: fn(ctx) };
+	} catch (e) {
+		return { ok: false, stale: isStaleCtxError(e) };
+	}
+}
+
 // ======================= 扩展配置文件（ai-extensions.json）=======================
 // 放这里是因为 settings.ts（面板）、voice.ts、delegate.ts 都要读写，谁都不该依赖谁。
 

@@ -43,6 +43,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
+import { guardCtx } from "./shared";
 import { registerSettings } from "./settings";
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
@@ -2166,7 +2167,13 @@ async function pollBgTasks(): Promise<void> {
 	// 停用态：一条也不投（小票保留，/ai-ext on 后 armBgTimer 会接着投）
 	if (isExtDisabled()) return;
 	// 主会话在跑就先不认领，等它空闲（agent_settled / 下一秒轮询会再来）
-	if (bgCtx && !bgCtx.isIdle()) return;
+	// ⚠️ bgCtx 是缓存的主会话 ctx：会话一替换（new/switch/fork/reload）它就连 isIdle() 都不让读，
+	//    这里每秒轮询会一直失败 → 统一走 guardCtx，命中 stale 就清掉等新的 session_start。
+	if (bgCtx) {
+		const g = guardCtx(bgCtx, (c) => c.isIdle() === true);
+		if (g.stale) bgCtx = undefined;
+		else if (g.ok && g.value === false) return;
+	}
 	const now = Date.now();
 	for (const t of listBgTasks()) {
 		if (t.status === "running" || t.delivered) continue;

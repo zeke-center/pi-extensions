@@ -22,6 +22,7 @@ import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
+import { guardCtx } from "./shared";
 import { cardNotify } from "./notify";
 import { registerSettings } from "./settings";
 import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk } from "./shared";
@@ -847,14 +848,13 @@ function refresh(force = false): void {
 		if (mounted || widgetTui || !gateCleared) {
 			gateCleared = true;
 			const ctx = lastCtx;
-			if (ctx?.hasUI) {
-				try {
-					ctx.ui.setWidget(WIDGET_KEY, undefined);
-					ctx.ui.setStatus(WIDGET_KEY, undefined);
-				} catch {
-					/* 撤不掉也不影响停用语义 */
-				}
-			}
+			// 会话替换后旧 ctx 一碰就抛 → 统一走 guardCtx（后台路径别让异常冒出去）
+			const r0 = guardCtx(ctx, (c) => {
+				if (!c.hasUI) return;
+				c.ui.setWidget(WIDGET_KEY, undefined);
+				c.ui.setStatus(WIDGET_KEY, undefined);
+			});
+			if (r0.stale) lastCtx = undefined;
 			widgetTui = undefined;
 			mounted = false;
 		}
