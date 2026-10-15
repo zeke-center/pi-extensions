@@ -28,6 +28,19 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join } from "node:path";
 import { boardSnapshot } from "./board";
 import { isExtDisabled, onGateApply } from "./gate";
+import { registerSettings, type SettingDef } from "./settings";
+
+export {
+	applySettingsValues,
+	fieldDetail,
+	fieldHint,
+	fieldValue,
+	getSetting,
+	parseFieldValue,
+	settingsDefs,
+	settingsFields,
+	settingsSnapshot,
+} from "./settings";
 import {
 	cardDirPath,
 	cardNotify,
@@ -49,6 +62,8 @@ import {
 	getPlanCfg,
 	hasPendingPlanAsk,
 	parsePlanAnswer,
+	patchExtCfg,
+	readExtCfg,
 	setBackgroundTurn,
 	setPlanCfg,
 } from "./shared";
@@ -429,23 +444,13 @@ function cfgFile(): string {
 	return join(getAgentDir(), "ai-extensions.json");
 }
 
+// 读写实现搬到 shared.ts（settings 面板 / delegate 都要用），这里保留薄包装不改调用点
 function readCfg(): Record<string, unknown> {
-	try {
-		const raw = JSON.parse(readFileSync(cfgFile(), "utf8")) as unknown;
-		return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-	} catch {
-		return {}; // 没文件 / 坏了 → 用默认值，别因为一个配置项把插件搞挂
-	}
+	return readExtCfg();
 }
 
-/** 改键**合并**写回（不能把 delegate 的 assistantLingerMs 冲掉） */
 function patchCfg(patch: Record<string, unknown>): void {
-	try {
-		mkdirSync(dirname(cfgFile()), { recursive: true });
-		writeFileSync(cfgFile(), `${JSON.stringify({ ...readCfg(), ...patch }, null, 2)}\n`, "utf8");
-	} catch {
-		/* 写不进去就算了，内存里照样生效 */
-	}
+	patchExtCfg(patch);
 }
 
 // ======================= 状态 =======================
@@ -1078,8 +1083,389 @@ async function deliverClip(
 
 // ======================= 注册 =======================
 
+// ======================= 配置面板（/aihelp）注册项 =======================
+// 每个配置项都要写清「干什么用的」——面板详情区会照着显示。
+
+/** 小工具：少写点样板 */
+function mkSet(d: {
+	key: string;
+	group: string;
+	label: string;
+	desc: string;
+	kind: SettingKind;
+	def: string | number | boolean | string[];
+	get: () => string | number | boolean | string[];
+	set: (v: string | number | boolean | string[]) => void;
+} & Partial<SettingDef>): SettingDef {
+	return { ...d } as SettingDef;
+}
+
+/** 把配置项注册进面板（改动立即生效 + 写盘） */
+export function registerVoiceSettings(): void {
+	registerSettings([
+		// ---------- 剪贴板 ----------
+		mkSet({
+			key: "voiceClip",
+			group: "剪贴板投递",
+			label: "总开关",
+			desc: "总开关：监听剪贴板。开 = 你在任何地方说完话（输入法/复制），pi 最小化也能收到并开始干活。",
+			kind: "bool",
+			def: false,
+			get: () => clipOn,
+			set: (v) => {
+				clipOn = !!v;
+				paused = false;
+				patchCfg({ voiceClip: clipOn });
+				if (clipOn) startClipHelper();
+				else stopClipHelper();
+				refreshStatus();
+			},
+		}),
+		mkSet({
+			key: "voiceClipTriggers",
+			group: "剪贴板投递",
+			label: "触发词",
+			desc: "句尾说到这些词就**立刻**投递（可多个）。例：发送 / 投给pi。留空 = 只能靠静默模式自动投。",
+			kind: "list",
+			def: ["发送", "投给pi"],
+			get: () => [...clipTriggers],
+			set: (v) => {
+				const list = (Array.isArray(v) ? v : String(v).split(/[,，\s]+/)).map((x) => String(x).trim()).filter(Boolean);
+				if (!list.length) return;
+				clipTriggers = list;
+				patchCfg({ voiceClipTriggers: list });
+				refreshStatus();
+			},
+		}),
+		mkSet({
+			key: "voiceClipTriggerMode",
+			group: "剪贴板投递",
+			label: "触发模式",
+			desc: "静默=不用喊触发词，剪贴板安静一会儿就投（默认档）；触发词=必须说触发词才投（最安全）。",
+			kind: "enum",
+			options: ["静默（安静就投）", "触发词（必须说）"],
+			values: ["silent", "word"],
+			def: "silent",
+			get: () => clipTriggerMode,
+			set: (v) => {
+				clipTriggerMode = v === "word" ? "word" : "silent";
+				patchCfg({ voiceClipTriggerMode: clipTriggerMode });
+				refreshStatus();
+			},
+		}),
+		mkSet({
+			key: "voiceClipSilentMs",
+			group: "剪贴板投递",
+			label: "静默等待",
+			desc: "静默模式下，剪贴板安静这么多毫秒才投。太短会投半句（输入法是一段段往上写的），建议 ≥800。",
+			kind: "number",
+			min: 300,
+			max: 10000,
+			unit: "ms",
+			def: 1200,
+			get: () => clipSilentMs,
+			set: (v) => {
+				clipSilentMs = Math.max(300, Math.min(10000, Math.round(Number(v) || 1200)));
+				patchCfg({ voiceClipSilentMs: clipSilentMs });
+			},
+		}),
+		mkSet({
+			key: "voiceClipTail",
+			group: "剪贴板投递",
+			label: "触发词窗口",
+			desc: "触发词只要出现在**末尾这么多字以内**就算命中（0 = 必须严格是最后两个字）。语音输入法有时会在「发送」后面又补字。",
+			kind: "number",
+			min: 0,
+			max: 20,
+			unit: "字",
+			def: 6,
+			get: () => clipTailWindow,
+			set: (v) => {
+				clipTailWindow = Math.max(0, Math.min(20, Math.round(Number(v) || 0)));
+				patchCfg({ voiceClipTail: clipTailWindow });
+			},
+		}),
+		mkSet({
+			key: "voiceClipMode",
+			group: "剪贴板投递",
+			label: "忙时策略",
+			desc: "我正忙着上一件事时，新投递进来的话怎么办：插话（并进当前任务）/ 排队（干完再接）/ 打断（先停掉）。",
+			kind: "enum",
+			options: ["插话", "排队", "打断"],
+			values: ["steer", "queue", "abort"],
+			def: "steer",
+			get: () => clipMode,
+			set: (v) => {
+				clipMode = v === "queue" || v === "abort" ? v : "steer";
+				patchCfg({ voiceClipMode: clipMode });
+			},
+		}),
+		mkSet({
+			key: "voiceClipMark",
+			group: "剪贴板投递",
+			label: "投递标记",
+			desc: "投给我的正文前面加个「📋 」——这样对话记录里一眼能看出这条是语音/剪贴板投来的，不是你手打的。",
+			kind: "bool",
+			def: true,
+			get: () => clipMark,
+			set: (v) => {
+				clipMark = !!v;
+				patchCfg({ voiceClipMark: clipMark });
+			},
+		}),
+		mkSet({
+			key: "voiceClipGuess",
+			group: "剪贴板投递",
+			label: "内容判断",
+			desc: "开 = 先猜「像不像人话」（太短/太长/网址/报错栈/代码/`/`开头/中文太少/符号多/分行多 → 不投）。关 = 不猜，安静下来就投（⚠️ 你 Ctrl+C 复制啥都可能被投进来）。",
+			kind: "bool",
+			def: true,
+			get: () => clipGuess,
+			set: (v) => {
+				clipGuess = !!v;
+				patchCfg({ voiceClipGuess: clipGuess });
+				refreshStatus();
+			},
+		}),
+
+		// ---------- 输入框 ----------
+		mkSet({
+			key: "voiceTalk",
+			group: "输入框投递",
+			label: "监听开关",
+			desc: "轮询 pi 输入框里的文字（不用复制粘贴）。默认只在句尾出现触发词时才投递，安全。",
+			kind: "bool",
+			def: false,
+			get: () => talkOn,
+			set: (v) => {
+				talkOn = !!v;
+				patchCfg({ voiceTalk: talkOn });
+				if (talkOn) arm();
+				else disarm();
+				refreshStatus();
+			},
+		}),
+		mkSet({
+			key: "voiceTalkAuto",
+			group: "输入框投递",
+			label: "静默自动投",
+			desc: "⚠️ 危险：连「句尾要有触发词」都不要求，输入框停了一会儿就自动发（中文选词时会误发）。只在你想全自动时说开。",
+			kind: "bool",
+			def: false,
+			get: () => talkAuto,
+			set: (v) => {
+				talkAuto = !!v;
+				patchCfg({ voiceTalkAuto: talkAuto });
+				if (talkOn) arm();
+				refreshStatus();
+			},
+		}),
+		mkSet({
+			key: "voiceSilenceMs",
+			group: "输入框投递",
+			label: "静默阈值",
+			desc: "只对上面的「静默自动投」生效：输入框停这么多毫秒才发。短了会把没说完的半句发出去。",
+			kind: "number",
+			min: 400,
+			max: 10000,
+			unit: "ms",
+			def: 1500,
+			get: () => silenceMs,
+			set: (v) => {
+				silenceMs = Math.max(400, Math.min(10000, Math.round(Number(v) || 1500)));
+				patchCfg({ voiceSilenceMs: silenceMs });
+			},
+		}),
+
+		// ---------- 通知与弹窗 ----------
+		mkSet({
+			key: "voicePopup",
+			group: "通知与弹窗",
+			label: "桌面弹窗",
+			desc: "三种卡片：输入弹窗（投递后 4 秒自消）/ 执行弹窗（计划开跑，常驻）/ 结论弹窗（答完，常驻）。多张自动往下叠，点 ✕ 才关。",
+			kind: "bool",
+			def: true,
+			get: () => popupOn,
+			set: (v) => {
+				popupOn = !!v;
+				setPopupOn(popupOn);
+				patchCfg({ voicePopup: popupOn });
+			},
+		}),
+		mkSet({
+			key: "voiceNotifyMode",
+			group: "通知与弹窗",
+			label: "通知通道",
+			desc: "auto=终端支持就发胶囊（Warp 顶部那种），否则弹窗 · osc=只胶囊 · card=只弹窗 · both=都要 · toast=系统通知。",
+			kind: "enum",
+			options: ["auto（推荐）", "胶囊", "弹窗", "胶囊+弹窗", "系统通知"],
+			values: ["auto", "osc", "card", "both", "toast"],
+			def: "auto",
+			get: () => getNotifyMode(),
+			set: (v) => {
+				const m = String(v) as NotifyMode;
+				setNotifyMode(m);
+				patchCfg({ voiceNotifyMode: m });
+			},
+		}),
+		mkSet({
+			key: "voiceResult",
+			group: "通知与弹窗",
+			label: "结果通知",
+			desc: "一轮答完给你发「答完了 + 结论」。关掉就完全安静（适合你一直盯着终端的时候）。",
+			kind: "bool",
+			def: true,
+			get: () => resultOn,
+			set: (v) => {
+				resultOn = !!v;
+				patchCfg({ voiceResult: resultOn });
+			},
+		}),
+		mkSet({
+			key: "voiceResultLongSec",
+			group: "通知与弹窗",
+			label: "结果通知阈值",
+			desc: "手打的轮里，只有耗时超过这么多秒才发结果通知（免得你正看着它时还吵你）。剪贴板/语音投递的轮一定发。",
+			kind: "number",
+			min: 0,
+			max: 600,
+			unit: "秒",
+			def: 20,
+			get: () => resultLongSec,
+			set: (v) => {
+				resultLongSec = Math.max(0, Math.min(600, Math.round(Number(v) || 0)));
+				patchCfg({ voiceResultLongSec: resultLongSec });
+			},
+		}),
+		mkSet({
+			key: "voiceBeep",
+			group: "通知与弹窗",
+			label: "提示音",
+			desc: "发作通知时顺带响一下系统提示音（工具失败时换警告音）。",
+			kind: "bool",
+			def: true,
+			get: () => beepOn,
+			set: (v) => {
+				beepOn = !!v;
+				patchCfg({ voiceBeep: beepOn });
+			},
+		}),
+
+		// ---------- 语音播报 ----------
+		mkSet({
+			key: "voiceTts",
+			group: "语音播报",
+			label: "语音播报",
+			desc: "答完自动把结论**念出来**（系统自带语音，离线、不联网）。念的是剥掉代码/链接的口播稿，最多 300 字。",
+			kind: "bool",
+			def: false,
+			get: () => ttsOn,
+			set: (v) => {
+				ttsOn = !!v;
+				setTts({ on: ttsOn });
+				patchCfg({ voiceTts: ttsOn });
+			},
+		}),
+		mkSet({
+			key: "voiceTtsVoice",
+			group: "语音播报",
+			label: "音色",
+			desc: "念结论用哪个嗓音（Windows 上常见：Microsoft Huihui Desktop / Microsoft Zira Desktop）。留空=系统默认。",
+			kind: "text",
+			def: "Microsoft Huihui Desktop",
+			get: () => ttsVoiceName,
+			set: (v) => {
+				ttsVoiceName = String(v);
+				setTts({ voice: ttsVoiceName });
+				patchCfg({ voiceTtsVoice: ttsVoiceName });
+			},
+		}),
+		mkSet({
+			key: "voiceTtsRate",
+			group: "语音播报",
+			label: "语速",
+			desc: "念的快慢：-10（很慢）~ 10（很快），0 = 正常。",
+			kind: "number",
+			min: -10,
+			max: 10,
+			def: 0,
+			get: () => ttsRate,
+			set: (v) => {
+				ttsRate = Math.max(-10, Math.min(10, Math.round(Number(v) || 0)));
+				setTts({ rate: ttsRate });
+				patchCfg({ voiceTtsRate: ttsRate });
+			},
+		}),
+		mkSet({
+			key: "voiceTtsVolume",
+			group: "语音播报",
+			label: "音量",
+			desc: "0~100。0 = 用系统默认音量。",
+			kind: "number",
+			min: 0,
+			max: 100,
+			def: 100,
+			get: () => ttsVolume,
+			set: (v) => {
+				ttsVolume = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+				setTts({ volume: ttsVolume });
+				patchCfg({ voiceTtsVolume: ttsVolume });
+			},
+		}),
+
+		// ---------- 计划确认 ----------
+		mkSet({
+			key: "voicePlanTimeout",
+			group: "计划确认",
+			label: "确认超时",
+			desc: "计划等你确认最多等这么久（0 = 一直等）。超时后按下面的「超时行为」办。",
+			kind: "number",
+			min: 0,
+			max: 1800,
+			unit: "秒",
+			def: 120,
+			get: () => getPlanCfg().timeoutSec,
+			set: (v) => {
+				const n = Math.max(0, Math.min(1800, Math.round(Number(v) || 0)));
+				setPlanCfg({ timeoutSec: n });
+				patchCfg({ voicePlanTimeout: n });
+			},
+		}),
+		mkSet({
+			key: "voicePlanTimeoutRun",
+			group: "计划确认",
+			label: "超时行为",
+			desc: "超时那一下怎么办：先别做（默认，更安全）/ 照做（你自己很确定时用）。",
+			kind: "enum",
+			options: ["先别做（安全）", "照做"],
+			values: [false, true],
+			def: false,
+			get: () => getPlanCfg().timeoutRun,
+			set: (v) => {
+				const b = v === true || v === "true";
+				setPlanCfg({ timeoutRun: b });
+				patchCfg({ voicePlanTimeoutRun: b });
+			},
+		}),
+		mkSet({
+			key: "voicePlanAuto",
+			group: "计划确认",
+			label: "低风险自动过",
+			desc: "后台投递来的计划，≤3 步且没有「写/删/提交/部署」这类词时不再问你。注：现在剪贴板来的计划本来就默认执行，这个开关基本用不上。",
+			kind: "bool",
+			def: true,
+			get: () => getPlanCfg().auto,
+			set: (v) => {
+				setPlanCfg({ auto: !!v });
+				patchCfg({ voicePlanAuto: !!v });
+			},
+		}),
+	]);
+}
+
 export function setupVoice(api: ExtensionAPI): void {
 	apiRef = api;
+	registerVoiceSettings(); // 注册到 /aihelp 配置面板（放前面：面板一开就有东西）
 
 	// 读配置（跟 delegate 的 linger 共用同一份 ai-extensions.json）
 	const cfg = readCfg();

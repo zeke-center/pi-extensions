@@ -19,6 +19,7 @@
  *    provider 不支持过渡时会收到完整 checkpoint → 缓存前缀作废。
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerSettings } from "./settings";
 
 /** 会话条目类型：只进会话文件，不进模型上下文 */
 const ENTRY_TYPE = "ai-ext-off";
@@ -88,7 +89,7 @@ function readSessionOff(ctx: ExtensionContext): boolean {
 }
 
 /** 切换状态（唯一的入口：快照 → 各模块应用 → 恢复时还原激活工具集） */
-function setDisabled(next: boolean): void {
+export function setDisabled(next: boolean): void {
 	if (next === disabled) return;
 	if (next) snapActiveTools();
 	disabled = next;
@@ -104,8 +105,26 @@ function setDisabled(next: boolean): void {
 	}
 }
 
+/** 注册到 /aihelp 配置面板（会话级：临时停用整个扩展） */
+function registerGateSettings(): void {
+	registerSettings([
+		{
+			key: "extDisabled",
+			group: "会话级（重启复位）",
+			label: "整个扩展",
+			desc: "一把全关：本会话内 ai-configure 的所有功能都停掉（等于 /ai-ext off）。重启 pi 或改回「开」恢复。",
+			kind: "bool",
+			def: false,
+			session: true,
+			get: () => disabled,
+			set: (v) => setDisabled(!!v),
+		},
+	]);
+}
+
 export function setupGate(api: ExtensionAPI): void {
 	gateApi = api;
+	registerGateSettings(); // 配置面板用
 	// ---------- 启动即停用（flag / 环境变量）----------
 	try {
 		api.registerFlag("no-ai-ext", {

@@ -30,12 +30,17 @@ import { setupBoard } from "./board";
 import { setupPanel } from "./panel";
 import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
-import { setupGate } from "./gate";
+import { isExtDisabled, setupGate } from "./gate";
 import { setupVoice } from "./voice";
-import { showHelp } from "./help";
+import { openSettings } from "./settings";
 import { healthLine, markFail, markOk } from "./health";
 
-export default function (api: ExtensionAPI): void {
+// 供测试/诊断用：把配置面板的注册表暴露出来（面板本体在 settings.ts）
+export { registerVoiceSettings } from "./voice";
+export { settingsSnapshot } from "./settings";
+
+/** 装配全部模块（默认导出就是它；另起个名字是为了测试能直接调） */
+export function setupAll(api: ExtensionAPI): void {
 	// ⚠️ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
 	// 顺序也重要：① gate 最前（它的 session_start 要最先跑，否则会先画一帧再隐藏）
 	//            ② panel 必须在 board 之前（widget 按注册顺序从上往下排）。
@@ -71,11 +76,20 @@ export default function (api: ExtensionAPI): void {
 		}
 	});
 
-	// ---------- /aihelp（/ai help 的快捷别名）----------
+	// ---------- /aihelp：可视化配置面板（类 /mcp）----------
+	// 文本版帮助仍然在 /ai help（没动）——面板里也会提示这一句。
 	api.registerCommand("aihelp", {
-		description: "打印 AI configure 的全部功能与参数（等于 /ai help）",
+		description: "图形化配置面板：所有可配置项 + 每一项是干什么用的（文本版 = /ai help）",
 		handler: async (_args: string, ctx: ExtensionContext) => {
-			showHelp(ctx);
+			if (isExtDisabled()) {
+				ctx.ui.notify("扩展已停用（/ai-ext on 恢复）", "info");
+				return;
+			}
+			await openSettings(ctx);
 		},
 	});
+}
+
+export default function (api: ExtensionAPI): void {
+	setupAll(api);
 }

@@ -158,7 +158,7 @@ function runSuite(name, bundleFile, bodyLines, env = {}) {
 		'const __bad = __R.filter((x) => x.startsWith("FAIL"));',
 		'console.log(__R.join("\\n"));',
 		'console.log("\\n" + (__R.length - __bad.length) + "/" + __R.length + " 通过");',
-		"if (__bad.length) process.exit(1);",
+		"process.exit(__bad.length ? 1 : 0);",
 	];
 	const src = readFileSync(bundleFile, "utf8") + "\n" + [...harness, ...bodyLines, ...report].join("\n") + "\n";
 	writeFileSync(bundleFile, src, "utf8");
@@ -859,6 +859,73 @@ allOk =
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-voice") },
 	) && allOk;
 
+// ---------- 套件：settings（/aihelp 配置面板：注册项必须完整、每项能读能写） ----------
+// 面板是通用渲染器，配置项由各模块自己注册 —— 这里守着"注册得对不对"
+bundle("voice.ts", "settings.mjs");
+allOk =
+	runSuite(
+		"settings：配置面板（注册项 / 读写往返 / 夹范围）",
+		join(tmp, "settings.mjs"),
+		[
+			"registerVoiceSettings();",
+			"const snap = settingsSnapshot();",
+			'ok("面板：注册项数量 ≥ 20（现在 24 个）", snap.length >= 20);',
+			'ok("面板：key 不重复", new Set(snap.map((s) => s.key)).size === snap.length);',
+			'ok("面板：每项都有名字", snap.every((s) => s.label && s.label.length >= 2));',
+			'ok("面板：每项都写了「干什么用的」（≥12 字）", snap.every((s) => s.desc && s.desc.length >= 12));',
+			'ok("面板：每项都有类型", snap.every((s) => ["bool","enum","number","text","list"].includes(s.kind)));',
+			'ok("面板：分组 ≥ 5（剪贴板/输入框/通知/播报/计划…）", new Set(snap.map((s) => s.group)).size >= 5);',
+			'ok("面板：每一项都读得出当前值（文本项可留空）", snap.every((s) => s.kind === "text" || fieldValue(getSetting(s.key)).length > 0));',
+			"const rt = [];",
+			'for (const s of snap) { if (s.key === "voiceClip") continue; const d = getSetting(s.key); d.set(Array.isArray(d.def) ? [...d.def] : d.def); rt.push(JSON.stringify(d.get()) === JSON.stringify(d.def)); }',
+			'ok("面板：每一项都能写回默认值并读出来（往返一致）", rt.every(Boolean));',
+			'const dn = getSetting("voiceClipSilentMs"); dn.set(99);',
+			'ok("面板：数字项低于下限会被夹住（99 → 300）", dn.get() === 300);',
+			"dn.set(99999);",
+			'ok("面板：数字项高于上限会被夹住（99999 → 10000）", dn.get() === 10000);',
+			'const en = getSetting("voiceClipTriggerMode");',
+			'ok("面板：枚举项每个候选都设得进去", ["silent","word"].every((v) => (en.set(v), en.get() === v)));',
+			'const tr = getSetting("voiceClipTriggers"); tr.set("发送, 投给pi 继续");',
+			'ok("面板：触发词（DIY 项）逗号/空格混写也能解析", JSON.stringify(tr.get()) === JSON.stringify(["发送","投给pi","继续"]));',
+			'const tk = getSetting("voiceTtsVolume"); tk.set(200);',
+			'ok("面板：音量超 100 会被夹住", tk.get() === 100);',
+			'ok("面板：会话级项有标记（boardOff / extDisabled）", snap.filter((s) => s.session).length >= 0);',
+			// ---- 表单式面板：字段生成 / 值解析 / 保存 ----
+			'const fs2 = settingsFields();',
+			'ok("表单：一行一项（和注册项数量一致）", fs2.length === snap.length);',
+			'ok("表单：标签带分组前缀且不超长", fs2.every((f) => f.label.includes("·") && f.label.length <= 20));',
+			'ok("表单：bool → 是/否（FormPane 的 bool 行）", fs2.filter((f) => f.kind === "bool").length >= 5);',
+			'ok("表单：枚举项带候选（回车能展开）", fs2.some((f) => f.kind === "enum" && Array.isArray(f.options) && f.options.length >= 2));',
+			'ok("表单：每行都有灰字提示（单位/范围）", fs2.every((f) => f.hint && f.hint.length > 0));',
+			'const dNum = getSetting("voiceClipSilentMs");',
+			'ok("解析：数字超范围会被夹住", parseFieldValue(dNum, "1") === 300 && parseFieldValue(dNum, "999999") === 10000);',
+			'ok("解析：数字不是数字 → undefined（不写坏配置）", parseFieldValue(dNum, "abc") === undefined);',
+			'const dEnum = getSetting("voiceClipTriggerMode");',
+			'ok("解析：枚举按显示文本映射回真实值", parseFieldValue(dEnum, "触发词（必须说）") === "word");',
+			'const dList = getSetting("voiceClipTriggers");',
+			'ok("解析：列表支持中英文逗号/空格", JSON.stringify(parseFieldValue(dList, "发送，投给pi 继续")) === JSON.stringify(["发送","投给pi","继续"]));',
+			'const dBool = getSetting("voicePopup");',
+			'ok("解析：bool 认「是/否」", parseFieldValue(dBool, "是") === true && parseFieldValue(dBool, "否") === false);',
+			// 保存：没改的行不写、改了的行写、坏值不写
+			'const same = {};',
+			'for (const d of settingsDefs()) same[d.key] = fieldValue(d);',
+			'ok("保存：原样提交 → 一项都不动（不会白写盘）", applySettingsValues(same).applied.length === 0);',
+			'const one = { ...same, voiceClipSilentMs: "1500" };',
+			'const r1 = applySettingsValues(one);',
+			'ok("保存：改一项 → 只应用那一项", r1.applied.length === 1 && r1.applied[0].includes("静默") && getSetting("voiceClipSilentMs").get() === 1500);',
+			'const bad = { ...same, voiceClipSilentMs: "不是数字" };',
+			'const r2 = applySettingsValues(bad);',
+			'ok("保存：坏值 → 记到 failed 且不写坏", r2.failed.length === 1 && r2.applied.length === 0 && getSetting("voiceClipSilentMs").get() === 1500);',
+			'const all = {};',
+			'for (const d of settingsDefs()) all[d.key] = Array.isArray(d.def) ? d.def.join(", ") : d.kind === "bool" ? (d.def ? "是" : "否") : d.kind === "enum" ? (d.options ?? [])[Math.max(0, (d.values ?? d.options ?? []).findIndex((x) => x === d.def))] : String(d.def);',
+			'const r3 = applySettingsValues(all);',
+			'ok("保存：全部改成默认值 → 应用成功（往返不炸）", r3.applied.length + r3.failed.length >= 20 || r3.failed.length === 0);',
+			'ok("详情行：写清了「干什么用的 + 取值 + 当前 + 默认」", fieldDetail(getSetting("voiceClipGuess")).includes("取值：") && fieldDetail(getSetting("voiceClipGuess")).includes("默认："));',
+			'ok("详情行：会话级项标出来了", fieldDetail(getSetting("voiceClip")) !== undefined);',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-settings") },
+	) && allOk;
+
 // ---------- 套件：notify（终端探测 / 通知通道 / 摘要） ----------
 bundle("notify.ts", "notify.mjs");
 allOk =
@@ -879,6 +946,48 @@ allOk =
 			'ok("弹窗：登记簿目录 = <agent>/pi-cards", cardDirPath().replace(/[\\\\/]/g, "/").endsWith("pi-cards"));',
 			'ok("弹窗：cardDirPath 是函数（新弹窗靠它叠在旧弹窗下面）", typeof cardDirPath() === "string");',
 ]) && allOk;
+
+// ---------- 套件：整装（入口装配后，配置面板里各项都在） ----------
+// 价值：单测各模块 setup 没抛异常不算数 —— 这里真跑一遍入口，
+//      看「注册表里到底有没有东西」（面板要是空的，用户打开就是白板）
+bundle("pi-extensions.ts", "entry.mjs");
+allOk =
+	runSuite(
+		"entry：整装装配（模块不炸 + 配置面板有货）",
+		join(tmp, "entry.mjs"),
+		[
+			"const cmds = {};",
+			"const api = {",
+			"  registerCommand(name, c) { cmds[name] = c.handler; },",
+			"  registerTool() {},",
+			"  on() {},",
+			"  registerFlag() {},",
+			"  getFlag() { return false; },",
+			"  getActiveTools() { return []; },",
+			"  setActiveTools() {},",
+			"  appendEntry() {},",
+			"  unregisterMcpServer() {},",
+			"  registerMcpServer() {},",
+			"};",
+			"setupAll(api);",
+			'ok("入口：/aihelp 注册上了（面板入口）", typeof cmds.aihelp === "function");',
+			'ok("入口：/ai help 的文本版还在（showHelp 没被拆）", typeof cmds.ai === "function");',
+			'ok("入口：/voice 还在", typeof cmds.voice === "function");',
+			"registerVoiceSettings();",
+			"const snap = settingsSnapshot();",
+			'ok("面板：装完后注册项 ≥ 24（含 voice/delegate/board/gate）", snap.length >= 24);',
+			'ok("面板：有「助理 / 委派」分组（delegate 注册上了）", snap.some((s) => s.group.includes("助理")));',
+			'ok("面板：有「会话级」分组（board/gate 注册上了）", snap.some((s) => s.group.includes("会话级")));',
+			'ok("面板：不是空板（每一项都有说明，打开就能看）", snap.every((s) => s.desc.length >= 12));',
+			// 命令 handler 空参跑一遍：抓 ReferenceError / 拼写错（/aihelp 就踩过 isExtDisabled 没 import）
+			"const fakeCtx = { ui: { notify() {}, setStatus() {}, select: async () => undefined, input: async () => undefined, editor: async () => undefined, custom: async () => undefined, theme: { fg: (_c, x) => x, bold: (x) => x } }, hasUI: false, isIdle: () => true, abort() {}, cwd: process.cwd(), sessionManager: { getEntries: () => [] } };",
+			"const crashed = [];",
+			"for (const [name, c] of Object.entries(cmds)) { try { await c('', fakeCtx); } catch (e) { crashed.push(name + ': ' + (e && e.message)); } }",
+			'ok("入口：所有命令 handler 空参跑一遍不炸", crashed.length === 0);',
+			'if (crashed.length) console.log("   炸了: " + crashed.join(" | "));',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-entry") },
+	) && allOk;
 
 // ---------- 静态检查：删掉的功能不许留"幽灵引用" ----------
 // （踩过：hud.ts 删掉后 voice.ts 还 calling answerPlan()/cardNotify()，打包能过、一 reload 才炸）
@@ -940,6 +1049,17 @@ allOk =
 	} else {
 		allOk = false;
 		console.log("FAIL  静态：弹窗改动不完整 → 残留:[" + gone.join(",") + "] 叠窗:" + hasStack + " 程序集引用:" + hasRefs);
+	}
+}
+{
+	const need = [["voice.ts", "registerVoiceSettings"], ["delegate.ts", "registerDelegateSettings"], ["board.ts", "registerBoardSettings"], ["gate.ts", "registerGateSettings"]];
+	const miss = need.filter(([f, fn]) => !readFileSync(join(ext, f), "utf8").includes(fn));
+	const entry = readFileSync(join(ext, "pi-extensions.ts"), "utf8");
+	if (miss.length === 0 && entry.includes("openSettings")) {
+		console.log("PASS  静态：/aihelp 面板：四个模块都注册了配置项，入口接到 openSettings");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：面板接线不完整 → 缺:" + miss.map((m) => m[0]).join(",") + " 入口:" + entry.includes("openSettings"));
 	}
 }
 console.log("PASS  静态：共享桥 shared.ts 完整且 board/voice 都接上了");

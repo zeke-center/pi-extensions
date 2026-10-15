@@ -43,6 +43,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
+import { registerSettings } from "./settings";
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
@@ -2462,8 +2463,28 @@ function writeLingerMs(ms: number): void {
 	setLingerMs(ms);
 }
 
+/** 注册到 /aihelp 配置面板：后台助理的「保鲜期」 */
+function registerDelegateSettings(): void {
+	registerSettings([
+		{
+			key: "assistantLingerMs",
+			group: "助理 / 委派",
+			label: "助理保鲜期",
+			desc: "后台助理（子代理）跑完之后，它的小票还在面板上留多久 —— 留一会儿你回来还能看到它干了啥。0 = 跑完立刻撤掉。",
+			kind: "number",
+			min: 0,
+			max: 600000,
+			unit: "ms",
+			def: 45000,
+			get: () => getLingerMs(),
+			set: (v) => writeLingerMs(Math.max(0, Math.min(600000, Math.round(Number(v) || 0)))),
+		},
+	]);
+}
+
 export function setupDelegate(api: ExtensionAPI): void {
 	ensureCatalog(); // 本地 MCP 目录文件不存在就建个空壳
+	registerDelegateSettings(); // 注册到 /aihelp 配置面板
 	applyExtensionsConfig(); // 面板保鲜期等偏好
 	apiRef = api; // 供后台轮询回投用
 	armBgTimer(); // 先挂上（幂等）：/reload 后 session_start 不一定触发，见 armBgTimer 说明

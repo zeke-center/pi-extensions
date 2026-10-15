@@ -10,7 +10,40 @@
  * ⚠️ 这里全是**内存状态**，不落盘（粘贴内容绝不写文件）。
  */
 
+// ======================= 扩展配置文件（ai-extensions.json）=======================
+// 放这里是因为 settings.ts（面板）、voice.ts、delegate.ts 都要读写，谁都不该依赖谁。
+
+/** 配置文件路径：<agent dir>/ai-extensions.json */
+export function extCfgFile(): string {
+	return join(getAgentDir(), "ai-extensions.json");
+}
+
+/** 读配置；文件没了/坏了都返回 {}（绝不因为一个配置项把插件搞挂） */
+export function readExtCfg(): Record<string, unknown> {
+	try {
+		const raw = JSON.parse(readFileSync(extCfgFile(), "utf8")) as unknown;
+		return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	} catch {
+		return {};
+	}
+}
+
+/** 改键**合并**写回（别把别人的键冲掉） */
+export function patchExtCfg(patch: Record<string, unknown>): void {
+	try {
+		mkdirSync(dirname(extCfgFile()), { recursive: true });
+		writeFileSync(extCfgFile(), `${JSON.stringify({ ...readExtCfg(), ...patch }, null, 2)}
+`, "utf8");
+	} catch {
+		/* 写不进去就算了，内存里照样生效 */
+	}
+}
+
 // ======================= 计划确认的答复通道 =======================
+
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 export type PlanAnswer = "yes" | "no" | "edit";
 

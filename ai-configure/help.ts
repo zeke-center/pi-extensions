@@ -1,7 +1,8 @@
 /**
  * AI configure 的「说明书」。
  *
- * /aihelp 和 /ai help 都调这里的 showHelp()，所以文案只有一份，不会两边不一致。
+ * /ai help 调这里的 showHelp() 打文本版说明书。
+ * /aihelp 是**可视化配置面板**（像 /mcp 那样上下选、直接改），不在这个文件里（见 settings.ts）。
  * 以后加功能 / 改参数说明，只改这个文件。
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,7 +17,10 @@ export const HELP_TEXT = `AI configure · 全部功能
   /ai off                 关掉本会话拉进来的连接
   /ai project off         关掉项目级连接
   /ai project clear       清空项目级连接
-  /ai help                就是你现在看的这个（= /aihelp）
+  /ai help                就是你现在看的这个（文本版说明书）
+/aihelp                   **可视化配置面板**（表单式，和 /assistants 一样）：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消
+                           标签前缀就是分组（剪贴板·/ 输入框·/ 通知·/ 播报·/ 计划·/ 助理·/ 会话级·），
+                           每一项都写了「这是干什么用的」，改完立即生效并写进 ai-extensions.json
 /ai-ext                   会话级停用 / 恢复整个扩展（不用卸载，本会话记住）
   /ai-ext off             停用：面板收起、progress/delegate 从工具表撤下、后台回投暂停
   /ai-ext on              恢复（后台已跑完的结果会立刻补投）

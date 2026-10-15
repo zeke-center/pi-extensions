@@ -139,6 +139,8 @@ export class FormPane implements Focusable {
 		private mcp: PickItem[],
 		private done: (r: FormResult | null) => void,
 		focusKey?: string,
+		/** 可选：给选中的行显示一段完整说明（配置面板用它写「这是干什么用的」） */
+		private detail?: (f: FormField) => string,
 	) {
 		if (focusKey) {
 			const i = fields.findIndex((f) => f.key === focusKey);
@@ -328,6 +330,13 @@ export class FormPane implements Focusable {
 			out.push(line(row));
 		});
 
+		// 选中行的完整说明（可选）—— 配置面板靠这行讲清「这是干什么用的」
+		if (this.detail && this.cur()) {
+			const txt = this.detail(this.cur()!);
+			out.push(b(`├${"─".repeat(inner)}┤`));
+			for (const ln of wrapText(txt, inner - 2)) out.push(line(` ${t.fg("muted", ln)}`));
+		}
+
 		out.push(b(`├${"─".repeat(inner)}┤`));
 		const help =
 			this.mode === "mcp"
@@ -369,10 +378,27 @@ export async function showForm(
 	fields: FormField[],
 	mcp: PickItem[] = [],
 	focusKey?: string,
+	detail?: (f: FormField) => string,
 ): Promise<FormResult | null> {
 	const r = await ctx.ui.custom<FormResult | null>(
-		(_tui, theme, _kb, done) => new FormPane(theme, title, fields, mcp, done, focusKey),
+		(_tui, theme, _kb, done) => new FormPane(theme, title, fields, mcp, done, focusKey, detail),
 		{ overlay: true },
 	);
 	return r ?? null;
+}
+
+/** 按可见宽度折行（详情说明可能很长） */
+function wrapText(s: string, w: number): string[] {
+	const out: string[] = [];
+	let line = "";
+	for (const ch of s) {
+		if (visibleWidth(line + ch) > w) {
+			out.push(line);
+			line = ch;
+		} else {
+			line += ch;
+		}
+	}
+	if (line) out.push(line);
+	return out.length ? out.slice(0, 3) : [""]; // 最多 3 行，别把面板撑爆
 }

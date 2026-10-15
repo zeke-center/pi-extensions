@@ -23,6 +23,7 @@ import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
 import { cardNotify } from "./notify";
+import { registerSettings } from "./settings";
 import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk } from "./shared";
 
 const WIDGET_KEY = "task-board";
@@ -953,8 +954,26 @@ export function boardSnapshot(): {
 	return { title, steps: steps.map((s) => ({ ...s })), blocker, activity };
 }
 
+/** 注册到 /aihelp 配置面板（会话级项：重启 pi 就复位） */
+function registerBoardSettings(): void {
+	registerSettings([
+		{
+			key: "boardOff",
+			group: "会话级（重启复位）",
+			label: "任务面板",
+			desc: "会话级临时关掉看板（不落盘，重启 pi 自动恢复）。想永久不用就别启用这个扩展。",
+			kind: "bool",
+			def: false,
+			session: true,
+			get: () => boardOff,
+			set: (v) => setBoardOff(!!v),
+		},
+	]);
+}
+
 export function setupBoard(api: ExtensionAPI): void {
 	pi = api;
+	registerBoardSettings(); // 配置面板用
 
 	// ---------- 工具：模型用来汇报进度 ----------
 	// ⚠️ 注册成常量而不是直接 api.registerTool({...})：停用时要按 exposure:"hidden" **重新注册**
