@@ -1,0 +1,21 @@
+# 统一编辑器行为，跟 .gitattributes 保持一致：
+#   换行符一律 LF（仓库里不许出现 CRLF；Windows 上编辑也保持 LF）
+#   缩进一律 Tab（现有 .ts 都是 Tab），JSON/YAML/Markdown 用 2 空格
+# 这样别人 clone 之后用任何编辑器改，都不会再造出「换行符大 diff」。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = tab
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = false
