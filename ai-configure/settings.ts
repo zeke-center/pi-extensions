@@ -17,7 +17,7 @@ import { type FormField, showForm } from "./form";
 
 // ======================= 注册表 =======================
 
-export type SettingKind = "bool" | "enum" | "number" | "text" | "list";
+export type SettingKind = "bool" | "enum" | "number" | "text" | "list" | "action";
 
 export interface SettingDef {
 	/** 配置键（写进 ai-extensions.json 的名字）；会话级项也给个稳定 id */
@@ -77,6 +77,7 @@ export function settingsSnapshot(): { key: string; group: string; label: string;
 
 /** 面板里那个「值」列（原始值，不带单位 —— 单位放提示里，改的时候好输入） */
 export function fieldValue(d: SettingDef): string {
+	if (d.kind === "action") return "→ 回车执行";
 	const v = d.get();
 	if (d.kind === "bool") return v ? "是" : "否";
 	if (d.kind === "list") return Array.isArray(v) ? v.join(", ") : String(v);
@@ -91,7 +92,8 @@ export function fieldValue(d: SettingDef): string {
 /** 值后面那句灰字（单位 / 范围 / 会话级标记） */
 export function fieldHint(d: SettingDef): string {
 	const bits: string[] = [];
-	if (d.kind === "number") bits.push(`${d.min ?? "-"}~${d.max ?? "+"}${d.unit ?? ""}`);
+	if (d.kind === "action") bits.push("回车直接执行");
+	else if (d.kind === "number") bits.push(`${d.min ?? "-"}~${d.max ?? "+"}${d.unit ?? ""}`);
 	else if (d.kind === "list") bits.push("多个用逗号");
 	else if (d.kind === "enum") bits.push("回车选");
 	else if (d.kind === "bool") bits.push("回车切换");
@@ -105,7 +107,8 @@ export function fieldDetail(d: SettingDef): string {
 	const cur = d.get();
 	const curTxt = Array.isArray(cur) ? cur.join(", ") : String(cur);
 	let range = "";
-	if (d.kind === "bool") range = "开 / 关";
+	if (d.kind === "action") range = "回车 = 立即执行（不存值）";
+	else if (d.kind === "bool") range = "开 / 关";
 	else if (d.kind === "enum") range = (d.options ?? []).join(" / ");
 	else if (d.kind === "number") range = `${d.min ?? "-∞"} ~ ${d.max ?? "+∞"}${d.unit ?? ""}`;
 	else if (d.kind === "list") range = "逗号分隔的多个词（例：发送, 投给pi）";
@@ -115,17 +118,8 @@ export function fieldDetail(d: SettingDef): string {
 }
 
 /** 面板里的分组顺序（常用的在前，「会话级」这种偶尔用的压最后） */
-const GROUP_ORDER = ["剪贴板投递", "输入框投递", "通知与弹窗", "语音播报", "计划确认", "助理 / 委派", "会话级（重启复位）"];
-/** 标签前缀用短名（"会话级（重启复位）" → "会话级"） */
-const GROUP_SHORT: Record<string, string> = {
-	"剪贴板投递": "剪贴板",
-	"输入框投递": "输入框",
-	"通知与弹窗": "通知",
-	"语音播报": "播报",
-	"计划确认": "计划",
-	"助理 / 委派": "助理",
-	"会话级（重启复位）": "会话级",
-};
+// 「手机接管」排第一：这儿天最常动的就是它（在手机上远程指挥时）
+const GROUP_ORDER = ["手机接管", "命令", "剪贴板投递", "输入框投递", "通知与弹窗", "语音播报", "计划确认", "助理 / 委派", "会话级（重启复位）"];
 
 /** 按上面的顺序排一遍（未知分组排在最后，按注册顺序稳定） */
 export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {
@@ -138,14 +132,25 @@ export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {
 
 /** 注册表 → 表单字段（一行一项，标签带分组前缀） */
 export function settingsFields(defs: SettingDef[] = registry): FormField[] {
-	return orderedDefs(defs).map((d) => ({
-		key: d.key,
-		label: `${GROUP_SHORT[d.group] ?? d.group}·${d.label}`.slice(0, 20),
-		value: fieldValue(d),
-		kind: d.kind === "bool" ? "bool" : d.kind === "enum" ? "enum" : "text",
-		options: d.kind === "enum" ? d.options : undefined,
-		hint: fieldHint(d),
-	}));
+	const out: FormField[] = [];
+	let lastGroup = "";
+	for (const d of orderedDefs(defs)) {
+		// 分组 → 插一行表头（`kind:"group"`：回车/←→ 展开收起）
+		if (d.group !== lastGroup) {
+			lastGroup = d.group;
+			out.push({ key: `__group:${d.group}`, label: d.group, value: "", kind: "group" });
+		}
+		out.push({
+			key: d.key,
+			// 分组已经当表头显示过了 → 子行**不再重复前缀**（省地方，也免得 20 字被截断）
+			label: d.label,
+			value: fieldValue(d),
+			kind: d.kind === "action" ? "action" : d.kind === "bool" ? "bool" : d.kind === "enum" ? "enum" : "text",
+			options: d.kind === "enum" ? d.options : undefined,
+			hint: fieldHint(d),
+		});
+	}
+	return out;
 }
 
 /** 表单文本 → 真实值（数字夹范围、列表切分、enum 映射回真实值） */
@@ -233,16 +238,36 @@ export async function openSettings(ctx: ExtensionContext): Promise<void> {
 	const fields = settingsFields(defs);
 	const r = await showForm(
 		ctx,
-		"⚙ ai-configure 配置（所有可配置项）",
+		"⚙ ai-configure 配置 / 命令（按分类折叠，回车展开）",
 		fields,
 		[],
 		undefined,
 		(f) => {
+			// 分组表头：告诉它有项，以及怎么打开
+			if (f.kind === "group") {
+				const n = defs.filter((d) => d.group === f.label).length;
+				return `「${f.label}」共 ${n} 项 —— 回车（或 ←→）展开 / 收起`;
+			}
 			const d = byKey.get(f.key);
 			return d ? fieldDetail(d) : "";
 		},
 	);
 	if (!r) return; // esc = 取消，什么都不改
+
+	// 「命令」分组里是按**行动**不是配置：选中即立即执行，不写值。
+	if (r.actionKey) {
+		const d = byKey.get(r.actionKey);
+		// 先把同一面板里其它真的改了的项落地（用户可能一边改配置一边点了命令）
+		applySettingsValues(r.values, defs);
+		try {
+			d?.set(""); // action 行的 set 就是“跑起来”
+			ctx.ui.notify(`▶ 执行：${d?.label ?? r.actionKey}`, "info");
+		} catch (e) {
+			ctx.ui.notify(`✗ 执行失败：${e instanceof Error ? e.message : String(e)}`, "error");
+		}
+		return;
+	}
+
 	const { applied, failed } = applySettingsValues(r.values, defs);
 	const msg = applied.length ? `⚙ 已保存 ${applied.length} 项：${applied.slice(0, 6).join("、")}${applied.length > 6 ? "…" : ""}` : "没有改动";
 	ctx.ui.notify(failed.length ? `${msg}（${failed.length} 项没改成功：${failed.join("、")}）` : msg, failed.length ? "warning" : "info");

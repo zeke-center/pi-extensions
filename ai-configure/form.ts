@@ -26,6 +26,46 @@ export interface PickItem {
 	checked: boolean;
 }
 
+/** 列宽（标签列） */
+const LABEL_W = 16;
+
+/**
+ * 折起来的组（**模块级**：同一会话里再打开面板，上次收起的状态还在）。
+ *
+ * 语义是「展开表」而不是「收起表」—— 默认**全部收起**：`/aihelp` 有 37 行，
+ * 一屏平铺根本找不着东西（用户原话：“内容太多了”）。分组表头永远可见。
+ */
+const expandedGroups = new Set<string>();
+
+/** 这一行属于哪个组（往上找最近的 group 行）；不在任何组里 = undefined */
+function ownerGroup(fields: FormField[], i: number): string | undefined {
+	if (fields[i]?.kind === "group") return fields[i].key;
+	for (let j = i - 1; j >= 0; j--) if (fields[j].kind === "group") return fields[j].key;
+	return undefined;
+}
+
+/** 这一行现在是不是被藏起来了（它的组收着，且它自己不是表头） */
+function isHiddenRow(fields: FormField[], i: number): boolean {
+	if (fields[i]?.kind === "group") return false; // 表头永远可见
+	const g = ownerGroup(fields, i);
+	return g !== undefined && !expandedGroups.has(g);
+}
+
+/** 某个组下面有几项（表头上显示 `(8)`） */
+function countInGroup(fields: FormField[], groupKey: string): number {
+	let n = 0;
+	let inGroup = false;
+	for (const f of fields) {
+		if (f.kind === "group") {
+			if (inGroup) break;
+			inGroup = f.key === groupKey;
+			continue;
+		}
+		if (inGroup) n++;
+	}
+	return n;
+}
+
 /** 右补空格到 w 列（按终端可见宽度算，中文算 2 列） */
 function padRight(s: string, w: number): string {
 	const vw = visibleWidth(s);
@@ -45,8 +85,9 @@ export interface FormField {
 	 * enum   回车展开候选（options）
 	 * mcp    回车展开多选（用 showForm 的 mcp 参数）
 	 * action 回车 = 立刻保存并置 openBody（给「去编辑正文」这种按钮用）
+	 * group  **分组表头**：回车 / ←→ 展开收起（它自己不是一项配置）
 	 */
-	kind: "text" | "bool" | "enum" | "mcp" | "action";
+	kind: "text" | "bool" | "enum" | "mcp" | "action" | "group";
 	options?: string[];
 	readonly?: boolean;
 	/** 值后面那句灰字 */
@@ -58,6 +99,8 @@ export interface FormResult {
 	values: Record<string, string>;
 	/** 用户按了那个 action 行（= 关掉面板后打开编辑器） */
 	openBody: boolean;
+	/** **按下的那一行 action 的 key**（命令总目录用它：选中 = 直接执行） */
+	actionKey?: string;
 }
 
 export class MultiSelect implements Focusable {
@@ -131,6 +174,8 @@ export class FormPane implements Focusable {
 	private enumSel = 0;
 	private mcpSel = 0;
 	private openBody = false;
+	/** 按下的 action 行的 key（kind="action"） */
+	private actionKey: string | undefined = undefined;
 
 	constructor(
 		private theme: Theme,
@@ -144,8 +189,39 @@ export class FormPane implements Focusable {
 	) {
 		if (focusKey) {
 			const i = fields.findIndex((f) => f.key === focusKey);
-			if (i >= 0) this.sel = i;
+			if (i >= 0) {
+				this.sel = i;
+				// 指定要看的那一行，它的组得先打开（否则光标落在看不见的行上）
+				const g = ownerGroup(fields, i);
+				if (g) expandedGroups.add(g);
+			}
 		}
+	}
+
+	/** ↑↓ 移动，**跳过收起的组里的行** */
+	private move(d: number): void {
+		const n = this.fields.length;
+		if (!n) return;
+		let i = this.sel;
+		for (let k = 0; k < n; k++) {
+			i = (i + d + n) % n;
+			if (!isHiddenRow(this.fields, i)) {
+				this.sel = i;
+				return;
+			}
+		}
+	}
+
+	/**
+	 * 收起之后把光标拉回来。
+	 * 不这么做的话光标会停在**已经被藏起来的那一行**上 → 界面上看不出选中在哪（实测踩到）。
+	 */
+	private fixCursor(): void {
+		if (!isHiddenRow(this.fields, this.sel)) return;
+		const g = ownerGroup(this.fields, this.sel);
+		if (!g) return;
+		const i = this.fields.findIndex((f) => f.key === g);
+		if (i >= 0) this.sel = i;
 	}
 
 	private cur(): FormField | undefined {
@@ -159,7 +235,7 @@ export class FormPane implements Focusable {
 	private finish(): void {
 		const values: Record<string, string> = {};
 		for (const f of this.fields) values[f.key] = f.kind === "mcp" ? this.mcpValue() : f.value;
-		this.done({ values, openBody: this.openBody });
+		this.done({ values, openBody: this.openBody, ...(this.actionKey ? { actionKey: this.actionKey } : {}) });
 	}
 
 	handleInput(data: string): void {
@@ -251,10 +327,18 @@ export class FormPane implements Focusable {
 				this.cursor = this.buf.length;
 				return;
 			}
+			// 粘进来的内容：pi-tui 会把粘贴内容**重新包一层括号粘贴标记**（`\x1b[200~…\x1b[201~`）
+			// 再交给组件（pi-tui 源码原话：pasted data will always contain `\x1b[200~`）。
+			// 首字符是 ESC(27) → 会被下面「>= 32」的守卫**整段吃掉**，所以这里必须先剥包装。
+			// 顺带把换行去掉：本编辑器是单行的，而粘贴常常带个尾部换行。
+			let text = data;
+			if (text.includes("\x1b[200~")) {
+				text = text.replace(/\x1b\[20[01]~/g, "").replace(/[\r\n]+/g, "");
+			}
 			// 可打印字符（含一次粘进来的整串）；转义序列首字符是 \x1b < 空格，会被排除
-			if (data && data.charCodeAt(0) >= 32) {
-				this.buf = this.buf.slice(0, this.cursor) + data + this.buf.slice(this.cursor);
-				this.cursor += data.length;
+			if (text && text.charCodeAt(0) >= 32) {
+				this.buf = this.buf.slice(0, this.cursor) + text + this.buf.slice(this.cursor);
+				this.cursor += text.length;
 			}
 			return;
 		}
@@ -264,15 +348,34 @@ export class FormPane implements Focusable {
 			this.done(null);
 			return;
 		}
-		if (matchesKey(data, "up") && this.fields.length) {
-			this.sel = (this.sel - 1 + this.fields.length) % this.fields.length;
+		if (matchesKey(data, "up")) {
+			this.move(-1);
 			return;
 		}
-		if (matchesKey(data, "down") && this.fields.length) {
-			this.sel = (this.sel + 1) % this.fields.length;
+		if (matchesKey(data, "down")) {
+			this.move(1);
+			return;
+		}
+		// ←→ = 收起 / 展开当前这一组（跟文件树的习惯一样）
+		if (matchesKey(data, "left") || matchesKey(data, "right")) {
+			const g = ownerGroup(this.fields, this.sel);
+			if (g) {
+				if (matchesKey(data, "left")) {
+					expandedGroups.delete(g);
+					this.fixCursor(); // 光标可能正在这一组里 → 拉回表头
+				} else expandedGroups.add(g);
+			}
 			return;
 		}
 		if (matchesKey(data, "return")) {
+			// 分组表头：回车 = 展开/收起（**不关面板、也不是改值**）
+			if (f?.kind === "group") {
+				if (expandedGroups.has(f.key)) {
+					expandedGroups.delete(f.key);
+					this.fixCursor();
+				} else expandedGroups.add(f.key);
+				return;
+			}
 			if (!f || f.readonly) return;
 			if (f.kind === "bool") {
 				f.value = f.value === "是" ? "否" : "是";
@@ -290,6 +393,7 @@ export class FormPane implements Focusable {
 			}
 			if (f.kind === "action") {
 				this.openBody = true;
+				this.actionKey = f.key;
 				this.finish();
 				return;
 			}
@@ -312,8 +416,21 @@ export class FormPane implements Focusable {
 		out.push(b(`├${"─".repeat(inner)}┤`));
 
 		this.fields.forEach((f, i) => {
+			if (isHiddenRow(this.fields, i)) return; // 收起的组里的行不画
 			const isSel = i === this.sel;
-			const label = padRight(f.label, 16);
+
+			// 分组表头：折剪头**兼任选中标记**（两个三角挤在一起太丑）
+			if (f.kind === "group") {
+				const open = expandedGroups.has(f.key);
+				const n = countInGroup(this.fields, f.key);
+				const arrow = t.fg(isSel ? "accent" : "muted", open ? "▾" : "▸");
+				const row = ` ${arrow} ${t.fg("accent", t.bold(f.label))} ${t.fg("dim", `(${n})`)}`;
+				out.push(line(row));
+				return;
+			}
+
+			const indent = ownerGroup(this.fields, i) ? "  " : "";
+			const label = padRight(indent + f.label, LABEL_W);
 			let val: string;
 			if (f.kind === "mcp") {
 				const names = this.mcp.filter((x) => x.checked).map((x) => x.value);
@@ -338,6 +455,7 @@ export class FormPane implements Focusable {
 		}
 
 		out.push(b(`├${"─".repeat(inner)}┤`));
+		const groupSel = this.cur()?.kind === "group";
 		const help =
 			this.mode === "mcp"
 				? "↑↓ 移动 · 空格 勾选 · 回车 收起 · ctrl+s 保存"
@@ -345,7 +463,9 @@ export class FormPane implements Focusable {
 					? "↑↓ 选 · 回车 确定 · esc 返回"
 					: this.mode === "edit"
 						? "输入 · 回车 确定 · esc 放弃本行"
-						: "↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消";
+						: groupSel
+							? "↑↓ 移动 · 回车/←→ 展开收起 · ctrl+s 保存 · esc 取消"
+							: "↑↓ 选行 · 回车 改 · ←→ 收起/展开分组 · ctrl+s 保存 · esc 取消";
 		out.push(line(` ${t.fg("dim", help)}`));
 
 		if (this.mode === "mcp") {
