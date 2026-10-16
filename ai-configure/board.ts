@@ -25,7 +25,7 @@ import { onGateApply } from "./gate";
 import { guardCtx } from "./shared";
 import { cardNotify } from "./notify";
 import { registerSettings } from "./settings";
-import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk } from "./shared";
+import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk, setAskOutcome } from "./shared";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1062,9 +1062,47 @@ export function setupBoard(api: ExtensionAPI): void {
 				const needAsk = params.skipConfirm !== true && !bgTurn && ctx?.hasUI;
 				let choice: string | undefined = "✅ 按这个执行";
 				if (needAsk) {
+					// ⚠ 终端那个选择框**必须能被别人关掉**：
+					//   以前只靠 `Promise.race` 选赢家 —— 手机/剪贴板先答了，agent 确实继续跑了，
+					//   但 `ctx.ui.select` 那个浮层**没人去关** → 一直挂在屏幕上等你按（用户实测反馈）。
+					//   pi 的 `ui.select` 支持 `signal`（原话：“AbortSignal to programmatically dismiss the dialog”）。
+					const termAc = new AbortController();
 					const tuiAsk = ctx.ui.select(
 						`开始执行这个方案？${pendingTitle ? `（${pendingTitle}）` : ""} · 共 ${pending.length} 步`,
 						["✅ 按这个执行", "✏️ 我要改（输入意见）", "⛔ 先别做"],
+						{ signal: termAc.signal },
+					);
+					// “谁先答算谁”——用**幂等的 pick**，不用 Promise.race。
+					// 为什么：abort 会让 select 以 `undefined` 结束，如果跑 race，这个 undefined 可能
+					// **抢先**把 race 定成“取消了”，反而把手机那个真实的答复吞了。
+					let picked = false;
+					let resolveChoice!: (v: string | undefined) => void;
+					const choicePromise = new Promise<string | undefined>((r) => {
+						resolveChoice = r;
+					});
+					const pick = (v: string | undefined, src: "tui" | "remote" | "timeout") => {
+						if (picked) return;
+						picked = true;
+						termAc.abort(); // 先把终端那个框关掉（自己答的话它已经关了，这是无操作）
+						// 终端/超时答的 → 也告诉手机一声（手机那张卡会照这个文案追加一行）
+						if (src !== "remote") {
+							setAskOutcome(
+								src === "timeout"
+									? "⏰ 电脑端超时，已按默认处理"
+									: v === "✅ 按这个执行"
+										? "✅ 已在电脑端选择：按这个执行"
+										: v && v.startsWith("⛔")
+											? "⛔ 已在电脑端选择：先别做"
+											: v && v.startsWith("✏️")
+												? "✏️ 已在电脑端选择：我要改"
+												: "✔ 已在电脑端答复了",
+							);
+						}
+						resolveChoice(v);
+					};
+					void tuiAsk.then(
+						(v) => pick(v, "tui"),
+						() => pick(undefined, "tui"),
 					);
 					const pasteAsk = new Promise<string | undefined>((res) => {
 						openPlanAsk(pendingTitle, stepTexts, (a, note) => {
@@ -1074,6 +1112,10 @@ export function setupBoard(api: ExtensionAPI): void {
 							else res(undefined);
 						});
 					});
+					void pasteAsk.then(
+						(v) => pick(v, "remote"),
+						() => pick(undefined, "remote"),
+					);
 					const timeoutAsk =
 						pcfg.timeoutSec > 0
 							? new Promise<string | undefined>((res) => {
@@ -1081,7 +1123,8 @@ export function setupBoard(api: ExtensionAPI): void {
 									t.unref?.();
 								})
 							: undefined;
-					choice = await Promise.race(timeoutAsk ? [tuiAsk, pasteAsk, timeoutAsk] : [tuiAsk, pasteAsk]);
+					if (timeoutAsk) void timeoutAsk.then((v) => pick(v, "timeout"));
+					choice = await choicePromise;
 					closePlanAsk(); // 谁先答都要把挂起状态清掉（否则下一轮计划会被误应答）
 				} else if (bgTurn) {
 					ctx.ui.notify(`📋 剪贴板投递的计划（${pending.length} 步）→ 默认开始执行：${pendingTitle || ""}`, "info");

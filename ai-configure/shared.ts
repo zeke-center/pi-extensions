@@ -83,6 +83,52 @@ type PendingAsk = {
 
 let pendingAsk: PendingAsk | undefined;
 
+/**
+ * 计划的**提问 / 收工**要通知谁？（`remote.ts` 用：把那个确认框同步到手机）
+ *
+ * 为什么做在 shared 里：状态本来就住在这儿，加一个监听比让 board 和 remote 互相认识干净。
+ * 为什么是**纯增量**：没有监听者时行为跟以前一模一样（一行不改 board.ts）。
+ */
+type PlanAskListener = (ask: { title: string; steps: string[] } | undefined) => void;
+const planAskListeners = new Set<PlanAskListener>();
+
+export function onPlanAskChange(fn: PlanAskListener): () => void {
+	planAskListeners.add(fn);
+	return () => {
+		planAskListeners.delete(fn);
+	};
+}
+
+/**
+ * 电脑端（终端选择框 / 超时）刚答了什么 —— 让**手机那张卡也能照原话追加一行**。
+ * 为什么不用参数传：当时是在 `closePlanAsk()` 里一次性通知（钩子不带具体选择），
+ * 这样两边说的话就一致了（“已答复” vs “已在电脑端选择：先别做”）。
+ */
+let askOutcome: string | undefined;
+
+export function setAskOutcome(text: string): void {
+	askOutcome = text;
+}
+
+/** 取走（读后即清，免得泄漏到下一条计划） */
+export function takeAskOutcome(): string | undefined {
+	const v = askOutcome;
+	askOutcome = undefined;
+	return v;
+}
+
+function emitPlanAsk(): void {
+	const info = pendingAsk ? { title: pendingAsk.title, steps: pendingAsk.steps.slice() } : undefined;
+	for (const fn of planAskListeners) {
+		// 一个监听者炸了不能影响别的监听者，更不能影响 board 挂问题本身
+		try {
+			fn(info);
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
 export function hasPendingPlanAsk(): boolean {
 	return pendingAsk !== undefined;
 }
@@ -95,6 +141,7 @@ export function openPlanAsk(title: string, steps: string[], resolve: PendingAsk[
 		old.resolve(undefined);
 	}
 	pendingAsk = { title, steps, resolve };
+	emitPlanAsk();
 }
 
 /** 外部（voice：粘贴进来的一句话）答复。返回 true = 确实处理了一个挂起的问题 */
@@ -102,14 +149,20 @@ export function answerPlanAsk(a: PlanAnswer, note?: string): boolean {
 	const p = pendingAsk;
 	if (!p) return false;
 	pendingAsk = undefined;
+	emitPlanAsk();
 	p.resolve(a, note);
 	return true;
 }
 
 /** board 自己收工（超时/终端弹窗先答了）→ 清掉挂起状态 */
 export function closePlanAsk(): void {
+	if (!pendingAsk) return; // 没挂着的就别乱发通知（否则会去打一堆已经没用的卡）
 	pendingAsk = undefined;
+	emitPlanAsk();
 }
+
+/** 兼容导出：`takeAskOutcome` 名字太长，内部用短名 */
+export const planAskOutcome = takeAskOutcome;
 
 // ======================= 这一轮是不是"后台投递"来的 =======================
 
