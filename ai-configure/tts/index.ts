@@ -164,18 +164,19 @@ export class TtsRouter {
 		if (st.engine === "doubao") {
 			const dcfg = doubaoConfigFromEnv(this.settings.doubao ?? {})!;
 			const cli = await this.rawClient();
-			const r = await cli.say(text, {
-				tone: opts?.tone,
-				cloud: {
-					key: dcfg.apiKey ?? dcfg.token,
-					speaker: dcfg.voice,
-					sampleRate: 24000,
-					resourceId: process.env.DOUBAO_TTS_RESOURCE || "seed-tts-2.0",
-					speechRate: Math.round((this.settings.speed - 1) * 50),
-				},
-				onFirst,
-			});
-			return { engine: "doubao", firstMs: r.firstMs };
+			try {
+				return await this.sayDoubao(cli, dcfg, text, onFirst, opts);
+			} catch (e) {
+				// 云端挂了就地回退本地（有模型才回退），别让整轮静音
+				this.lastError = `豆包失败（${e instanceof Error ? e.message : String(e)}），已回退本地`;
+				this.invalidate();
+				if (installedModels(this.dir).length) {
+					this.settings.mode = "local";
+					const r = await this.local!.say(text, { sid: this.settings.sid, speed: this.settings.speed, model: this.settings.model, onFirst });
+					return { engine: "local", firstMs: r.firstMs };
+				}
+				throw e;
+			}
 		}
 		if (st.engine === "local") {
 			if (!this.local) throw new Error("本地引擎未就绪");
@@ -200,6 +201,28 @@ export class TtsRouter {
 			return { engine: "sapi", firstMs: 0 };
 		}
 		throw new Error("api 引擎尚未实现（可先选 local 或 sapi）");
+	}
+
+	/** 豆包云端播报（单句/多句由 worker 处理） */
+	private async sayDoubao(
+		cli: LocalTtsClient,
+		dcfg: { apiKey?: string; token: string; voice: string },
+		text: string,
+		onFirst?: (ms: number) => void,
+		opts?: { tone?: string },
+	): Promise<{ engine: EngineName; firstMs: number }> {
+		const r = await cli.say(text, {
+			tone: opts?.tone,
+			cloud: {
+				key: dcfg.apiKey ?? dcfg.token,
+				speaker: dcfg.voice,
+				sampleRate: 24000,
+				resourceId: process.env.DOUBAO_TTS_RESOURCE || "seed-tts-2.0",
+				speechRate: Math.round((this.settings.speed - 1) * 50),
+			},
+			onFirst,
+		});
+		return { engine: "doubao", firstMs: r.firstMs };
 	}
 
 	async stop(): Promise<void> {

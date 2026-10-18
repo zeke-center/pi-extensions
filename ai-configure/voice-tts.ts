@@ -14,10 +14,10 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isExtDisabled, onGateApply } from "./gate";
-import { isRemoteTurn } from "./remote";
+import { endRemoteTurn, isRemoteTurn } from "./remote";
 import { registerSettings, type SettingDef } from "./settings";
 import { onPlanAskChange } from "./shared";
 import { Speaker } from "./speaker";
@@ -141,8 +141,9 @@ function sendToPhone(): boolean {
 	const r = (c.voiceRoute ?? "auto") as "auto" | "both" | "pc" | "phone";
 	if (r === "pc") return false;
 	if (r === "both" || r === "phone") return true;
-	if (!c.voiceSendPhone) return false; // auto 下还要用户显式开"发回手机"
-	return isRemoteTurn();
+	// auto：手机发起的一轮**必须**发回手机（否则你在外面就彻底没声音了）
+	if (isRemoteTurn()) return true;
+	return false;
 }
 
 /** 把这段口播合成语音条发回手机（豆包 ogg_opus；没有豆包就发 wav 文件） */
@@ -186,6 +187,17 @@ function ensureSpeech(): { router: TtsRouter; speaker: Speaker } | null {
 			agentDir,
 			router,
 			enabled: () => readCfg().voiceTts === true,
+			log: (msg: string) => {
+				try {
+					const dir = join(getAgentDir(), "narration");
+					mkdirSync(dir, { recursive: true });
+					const d = new Date();
+					const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+					appendFileSync(join(dir, `${day}.jsonl`), JSON.stringify({ at: d.toISOString(), event: "note", msg }) + String.fromCharCode(10), "utf8");
+				} catch {
+					/* 记不上就算了 */
+				}
+			},
 
 		});
 	}
@@ -692,6 +704,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 		}
 		speakResult();
 		refreshUsage();
+		endRemoteTurn(); // 本轮结束，别把"手机轮"状态带到下一轮
 	});
 
 	// 长任务占位播报（工具跑了 8 秒还没完 → 一句"还在跑"，20 秒后过期丢弃）

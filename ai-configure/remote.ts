@@ -606,16 +606,27 @@ let pendingAmbiguous: { chatId: number; who: string; text: string; mid?: number;
 let ambiguousWho = "";
 
 /** 投递给 pi 的入口（手机消息正文、审计条目、来源前缀都在这里，只此一处） */
-/** 最近一次"从手机发进来的消息"的时间戳（给语音路由用：在手机端就别在电脑上念） */
+/**
+ * "这一轮是不是手机发起的"——按**轮**记，不用时间窗口。
+ *
+ * 之前用"最近 3 分钟"判断，长任务（跑测试/下载模型）超过 3 分钟后，
+ * 结论播报就会被当成"电脑轮"→ 在电脑上念（而你人不在）→ 手机什么都没收到。
+ */
+let remoteTurnActive = false;
 let lastRemoteMsgAt = 0;
 
 export function markRemoteMessage(): void {
+	remoteTurnActive = true;
 	lastRemoteMsgAt = Date.now();
 }
 
-/** 这一轮是不是来自手机（默认看最近 3 分钟，够覆盖一轮长任务） */
-export function isRemoteTurn(windowMs = 180_000): boolean {
-	return Date.now() - lastRemoteMsgAt < windowMs;
+/** 一轮结束（agent_settled）时清掉，避免影响下一轮 */
+export function endRemoteTurn(): void {
+	remoteTurnActive = false;
+}
+
+export function isRemoteTurn(): boolean {
+	return remoteTurnActive;
 }
 
 async function deliverToPi(chatId: number, who: string, text: string): Promise<void> {
@@ -1603,7 +1614,7 @@ async function doDrop(): Promise<void> {
 }
 
 /** 插件版本：优先读**自己旁边**的 package.json（真值），读不到就退回下面这个手写常量 */
-const PLUGIN_VER_FALLBACK = "1.34.0";
+const PLUGIN_VER_FALLBACK = "1.35.0";
 
 /**
  * `/status` 里会显示它 —— 用途很具体：**一眼确认"我到底 reload 上了没"**。
