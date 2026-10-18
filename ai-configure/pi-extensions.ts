@@ -32,6 +32,7 @@ import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
 import { isExtDisabled, setupGate } from "./gate";
 import { setupVoice } from "./voice";
+import { setupVoiceTts } from "./voice-tts";
 import { setupRemote } from "./remote";
 import { openSettings } from "./settings";
 import { healthLine, markFail, markOk } from "./health";
@@ -53,6 +54,7 @@ export function setupAll(api: ExtensionAPI): void {
 		["delegate", setupDelegate],
 		["voice", setupVoice],
 		["remote", setupRemote],
+		["voice-tts", setupVoiceTts],
 		["doctor", setupDoctor],
 	];
 	for (const [name, setup] of parts) {

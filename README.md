@@ -554,7 +554,7 @@ pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 
 
 ### ④ 配置面板 `/aihelp`（表单式，和 `/assistants` 一个外观）
 
-配置项太多了（**37 项 + 8 个可点执行的命令**），靠子命令记不住 —— 所以 `/aihelp` 是个**表单弹窗**（复用 `form.ts` 的 FormPane）。**v1.15.0** 起它是一棵**可折叠的分类树**：
+配置项太多了（**47 项 + 12 个可点执行的命令**），靠子命令记不住 —— 所以 `/aihelp` 是个**表单弹窗**（复用 `form.ts` 的 FormPane）。**v1.15.0** 起它是一棵**可折叠的分类树**：
 
 ```
 ╭───────────────────────────────────────────────────────────────────────╮
@@ -1409,6 +1409,37 @@ Windows toast。语音那条跑完还会再弹一下「答完了，回来看一�
 | `form.ts` | 面板组件（`FormPane`/`showForm`）；`action` 行 = 回车即执行 · **`group` 行 = 分类表头（回车/←→ 展开收起）**|
 
 ---
+
+## 模块 7 · voice-tts.ts（语音播报：事件 → 口播稿 → 队列 → 引擎 · **v1.17.0** 起）
+
+给"用耳朵写代码"用的输出侧。**默认关闭**（`voiceTts=false`），装上模型也不会自动开。
+
+```
+agent_settled / tool_execution_end / 计划确认
+        ↓  事件（不是整段 markdown）
+speech.ts      口播稿：1~2 句、结论先行、不念代码和路径（brief / normal / full）
+        ↓
+speaker.ts     唯一出口：优先级 · 抢占 · ttl 过期 · 可打断 + 写 narration/YYYY-MM-DD.jsonl
+        ↓
+tts/index.ts   引擎探测与回退：local（离线模型）→ sapi（系统语音）→ off
+        ↓
+runtime/tts_worker.py   常驻子进程：sherpa-onnx 合成 + 播放；**stdin EOF 即自杀**（不留孤儿）
+```
+
+**模型不进 git**：清单在 `ai-configure/tts/manifest.json`，本体下载到
+`~/.pi/agent/models/tts/<model-id>/`（Kokoro 384MB / MeloTTS 183MB），删目录即可卸载。
+
+| 命令 | 作用 |
+|---|---|
+| `/tts status` | 用了哪档引擎、模型在不在、为什么不可用 |
+| `/tts test` | 念测试句（含 GitHub / CI / TypeScript / diff 这些难点词） |
+| `/tts install` | 下载 + sha256 校验 + 解压（断点续传、GitHub↔hf-mirror 双镜像） |
+| `/tts rm` | 删模型（引擎自动回退系统语音） |
+| `/tts on` / `off` | 开关播报 |
+| `/tts voice 50` / `/tts speed 0.92` | 音色 / 语速（默认 1.0） |
+
+**为什么不吃 token**：口播稿只走 Speaker + jsonl，**不进对话历史**（`appendEntry` 的 custom 条目也不进上下文）；
+规则模板 0 次模型调用。实测本机：首句出声 0.4~0.6s，一句 10 秒音频合成约 3 秒（CPU）。
 
 ## 上下文成本实测
 
