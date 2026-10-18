@@ -177,17 +177,56 @@ async function sendPhoneVoice(text: string): Promise<void> {
 			if (!msg?.ok) note(`语音条合成失败：${msg?.error ?? "未知"}`);
 			if (msg?.ok && msg.file) {
 				const { sendVoiceToPhone } = await import("./remote");
-				const n = await sendVoiceToPhone(msg.file, { caption: text.slice(0, 200) });
+				let n = await sendVoiceToPhone(msg.file, { caption: text.slice(0, 200) });
+				if (!n) {
+					// remote 那条路静默失败过（拿不到 token/chats 或请求异常）→ 自己再发一次
+					note("remote 发送返回 0，走兜底直发");
+					n = await sendVoiceDirect(msg.file);
+				}
 				if (n) {
 					refreshUsage();
 					note(`语音条已发送：${n} 个会话，${(msg.bytes / 1024).toFixed(0)}KB`);
 				} else {
-					note(`语音条发送失败：没有绑定会话或 Telegram 拒绝`);
+					note("语音条发送失败（两条路径都没成功）");
 				}
 			}
 		}
 	} catch (e) {
 		note(`语音条异常：${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
+/** 兜底直发：直接读配置里的 telegram.token/chats 发语音条（不依赖 remote 的内部状态） */
+async function sendVoiceDirect(file: string): Promise<number> {
+	try {
+		const raw = JSON.parse(readFileSync(join(getAgentDir(), "ai-extensions.json"), "utf8")) as Record<string, any>;
+		const tg = (raw.telegram ?? {}) as { token?: string; chats?: { chatId?: number }[] };
+		const token = tg.token;
+		const chats = (tg.chats ?? []).filter((c) => c.chatId);
+		if (!token || !chats.length) {
+			note(`兜底发送跳过：token=${Boolean(token)} chats=${chats.length}`);
+			return 0;
+		}
+		const data = readFileSync(file);
+		let ok = 0;
+		let lastErr = "";
+		for (const c of chats) {
+			try {
+				const form = new FormData();
+				form.append("chat_id", String(c.chatId));
+				form.append("voice", new Blob([data]), file.split(/[\/]/).pop() ?? "voice.ogg");
+				const res = await fetch(`https://api.telegram.org/bot${token}/sendVoice`, { method: "POST", body: form });
+				if (res.ok) ok += 1;
+				else lastErr = `${res.status} ${(await res.text()).slice(0, 120)}`;
+			} catch (e) {
+				lastErr = e instanceof Error ? e.message : String(e);
+			}
+		}
+		if (!ok) note(`兜底发送失败：${lastErr || "未知"}`);
+		return ok;
+	} catch (e) {
+		note(`兜底发送异常：${e instanceof Error ? e.message : String(e)}`);
+		return 0;
 	}
 }
 
