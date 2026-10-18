@@ -174,11 +174,16 @@ async function sendPhoneVoice(text: string): Promise<void> {
 					tone: c.voiceTone === "auto" ? "请用沉稳、清晰的语气，像向同事当面汇报工作。" : undefined,
 				},
 			});
+			if (!msg?.ok) note(`语音条合成失败：${msg?.error ?? "未知"}`);
 			if (msg?.ok && msg.file) {
 				const { sendVoiceToPhone } = await import("./remote");
 				const n = await sendVoiceToPhone(msg.file, { caption: text.slice(0, 200) });
-				if (n) refreshUsage();
-				else note(`语音条发送失败：没有绑定会话或 Telegram 拒绝`);
+				if (n) {
+					refreshUsage();
+					note(`语音条已发送：${n} 个会话，${(msg.bytes / 1024).toFixed(0)}KB`);
+				} else {
+					note(`语音条发送失败：没有绑定会话或 Telegram 拒绝`);
+				}
 			}
 		}
 	} catch (e) {
@@ -270,7 +275,7 @@ function speakResult(): void {
 		note("结论未播：口播稿渲染为空");
 		return;
 	}
-	note(`结论分发：电脑=${playLocally()} 手机=${sendToPhone()} 长度=${u.text.length}`);
+	note(`结论分发：电脑=${playLocally()} 手机=${sendToPhone()} 来源=${turnRemote ? "手机" : "电脑"} 长度=${u.text.length}`);
 	if (playLocally()) s.speaker.say(u);
 	if (sendToPhone()) void sendPhoneVoice(u.text).catch(() => {});
 }
