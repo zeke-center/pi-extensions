@@ -38,6 +38,11 @@ interface Cfg {
 	voiceTtsVoice?: string;
 	voiceTtsRate?: number;
 	voiceTtsVolume?: number;
+	/** 豆包（火山引擎）在线语音：不填就走本地 */
+	voiceDoubaoAppId?: string;
+	voiceDoubaoToken?: string;
+	voiceDoubaoCluster?: string;
+	voiceDoubaoVoice?: string;
 }
 
 let curCtx: ExtensionContext | undefined;
@@ -93,6 +98,12 @@ function settingsOf(c: Cfg = readCfg()) {
 		sapiVoice: typeof c.voiceTtsVoice === "string" ? c.voiceTtsVoice : undefined,
 		sapiRate: num(c.voiceTtsRate, 0, -10, 10),
 		sapiVolume: num(c.voiceTtsVolume, 100, 0, 100),
+		doubao: {
+			appId: typeof c.voiceDoubaoAppId === "string" ? c.voiceDoubaoAppId : undefined,
+			token: typeof c.voiceDoubaoToken === "string" ? c.voiceDoubaoToken : undefined,
+			cluster: typeof c.voiceDoubaoCluster === "string" ? c.voiceDoubaoCluster : undefined,
+			voice: typeof c.voiceDoubaoVoice === "string" ? c.voiceDoubaoVoice : undefined,
+		},
 	};
 }
 
@@ -168,8 +179,8 @@ function speechSettings(): SettingDef[] {
 			label: "引擎",
 			desc: "auto = 有本地模型就用本地，否则回退系统语音；local = 强制本地（不可用也回退）；off = 静音。装完模型不会自动打开播报。",
 			kind: "enum",
-			options: ["auto", "local", "sapi", "off"],
-			values: ["auto", "local", "sapi", "off"],
+			options: ["auto", "doubao", "local", "sapi", "off"],
+			values: ["auto", "doubao", "local", "sapi", "off"],
 			def: "auto",
 			get: () => readCfg().voiceEngine ?? "auto",
 			set: (v) => {
@@ -207,6 +218,36 @@ function speechSettings(): SettingDef[] {
 				patchCfg({ voiceLocalModel: String(v) });
 				router?.invalidate();
 			},
+		},
+		{
+			key: "voiceDoubaoAppId",
+			group: GROUP,
+			label: "豆包 AppID",
+			desc: "火山引擎「语音合成」控制台 → 创建应用后拿到的 APP ID。填了它 + Token 且引擎选 doubao 才会走在线语音；环境变量 DOUBAO_TTS_APPID 优先。",
+			kind: "text",
+			def: "",
+			get: () => readCfg().voiceDoubaoAppId ?? "",
+			set: (v) => patchCfg({ voiceDoubaoAppId: String(v || "").trim() }),
+		},
+		{
+			key: "voiceDoubaoToken",
+			group: GROUP,
+			label: "豆包 Access Token",
+			desc: "同一个应用里的 Access Token（可重置）。**建议用环境变量 DOUBAO_TTS_TOKEN**，别写进配置文件更安全。",
+			kind: "text",
+			def: "",
+			get: () => readCfg().voiceDoubaoToken ?? "",
+			set: (v) => patchCfg({ voiceDoubaoToken: String(v || "").trim() }),
+		},
+		{
+			key: "voiceDoubaoVoice",
+			group: GROUP,
+			label: "豆包音色",
+			desc: "控制台「音色列表」里试听后复制的 voice_type（如 BV001_streaming）。留空用默认。",
+			kind: "text",
+			def: "",
+			get: () => readCfg().voiceDoubaoVoice ?? "",
+			set: (v) => patchCfg({ voiceDoubaoVoice: String(v || "").trim(), ...{ voiceDoubaoCluster: readCfg().voiceDoubaoCluster } }),
 		},
 		{
 			key: "voiceLocalVoice",

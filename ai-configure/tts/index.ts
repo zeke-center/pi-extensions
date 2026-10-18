@@ -11,9 +11,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { installedModels, LocalTtsClient, modelsDir, pythonCandidates, type LocalInfo } from "./local";
 import { sapiAvailable, speakSapi, stopSapi } from "./sapi";
+import { DoubaoClient, doubaoConfigFromEnv } from "./doubao";
 
-export type EngineMode = "auto" | "local" | "sapi" | "api" | "off";
-export type EngineName = "off" | "sapi" | "local" | "api";
+export type EngineMode = "auto" | "doubao" | "local" | "sapi" | "api" | "off";
+export type EngineName = "off" | "doubao" | "sapi" | "local" | "api";
 
 export interface TtsSettings {
 	mode: EngineMode;
@@ -26,6 +27,8 @@ export interface TtsSettings {
 	sapiVolume?: number;
 	/** api 档（默认不启用；留好位子） */
 	apiVoice?: string;
+	/** 豆包（火山引擎）在线语音：没配 appid/token 就自动跳过这一档 */
+	doubao?: { appId?: string; token?: string; cluster?: string; voice?: string };
 }
 
 export interface TtsStatus {
@@ -47,6 +50,7 @@ const PROBE_TTL_MS = 10 * 60 * 1000;
 
 export class TtsRouter {
 	private local: LocalTtsClient | null = null;
+	private doubao: DoubaoClient | null = null;
 	private probeCache: { at: number; info: LocalInfo | null; reason?: string } | null = null;
 
 	constructor(
@@ -104,6 +108,15 @@ export class TtsRouter {
 			installed: this.installed,
 		};
 		if (this.settings.mode === "off") return { ...base, engine: "off", ok: false, reason: "已静音" };
+		// 豆包：配了凭据就用（auto 档也优先，音质更好）；没配就跳过，绝不报错
+		const cfg = doubaoConfigFromEnv(this.settings.doubao ?? {});
+		if (cfg && (this.settings.mode === "auto" || this.settings.mode === "doubao")) {
+			this.doubao = this.doubao ?? new DoubaoClient(cfg);
+			return { ...base, engine: "doubao", ok: true, model: `doubao:${cfg.voice}`, sampleRate: cfg.rate, kind: "cloud" };
+		}
+		if (this.settings.mode === "doubao") {
+			return { ...base, engine: sapiAvailable() ? "sapi" : "off", ok: sapiAvailable(), reason: "豆包未配置 appid/token（环境变量 DOUBAO_TTS_APPID / DOUBAO_TTS_TOKEN）" };
+		}
 		if (this.settings.mode === "sapi" || this.settings.mode === "api") {
 			const ok = this.settings.mode === "sapi" ? sapiAvailable() : Boolean(this.settings.apiVoice);
 			return {
@@ -147,6 +160,11 @@ export class TtsRouter {
 	): Promise<{ engine: EngineName; firstMs: number }> {
 		const st = await this.status();
 		if (!st.ok) throw new Error(st.reason || "没有可用引擎");
+		if (st.engine === "doubao") {
+			if (!this.doubao) throw new Error("豆包引擎未就绪");
+			const r = await this.doubao.say(text, { onFirst });
+			return { engine: "doubao", firstMs: r.firstMs };
+		}
 		if (st.engine === "local") {
 			if (!this.local) throw new Error("本地引擎未就绪");
 			const r = await this.local.say(text, {
@@ -172,6 +190,7 @@ export class TtsRouter {
 	}
 
 	async stop(): Promise<void> {
+		this.doubao?.stop();
 		if (this.local) await this.local.stop();
 		stopSapi();
 	}
@@ -191,6 +210,8 @@ export class TtsRouter {
 	}
 
 	close(): void {
+		this.doubao?.close();
+		this.doubao = null;
 		if (this.local) this.local.close();
 		this.local = null;
 		stopSapi();
