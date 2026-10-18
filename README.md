@@ -1699,7 +1699,7 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 
 - **默认关闭**：`telemetryUpload=false` 时不采集、不落盘、不联网。
 - **必须有密钥**：后端 `MASTER_KEY`（请求头 `X-Brain-Token`），否则开关会自己回弹。
-  优先级：`PI_TELEMETRY_KEY` → `CENTER_MASTER_KEY` → `MASTER_KEY` 环境变量 → 配置里的 `telemetryKey`。
+  优先级：`PI_TELEMETRY_KEY` → `CENTER_TOKEN` → `CENTER_MASTER_KEY` → `MASTER_KEY` 环境变量 → 配置里的 `telemetryKey`。
   变量名可在设置里改；`/telemetry` 会显示密钥来源（`env:MASTER_KEY` / `file`），不打印值。
 - 首次开启弹确认框，逐条列出采集内容并声明**数据可能用于迭代本项目**；改声明版本会强制重新确认。
 - 命令：
@@ -1711,7 +1711,7 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 | `/telemetry off` | 停止上传并清空本地队列 |
 | `/telemetry flush` | 立即上报 |
 
-- 设置面板 → **数据与隐私**：开关、密钥、上报地址、粒度（`meta` / `full`）、查看声明。
+- 设置面板 → **数据与隐私**：开关、密钥、上报地址（默认取 `CENTER_API`）、粒度（`meta` / `full`）、查看声明。
 - 采集的事件与字段：`ai-configure/EVENTS.md`；隐私声明：`PRIVACY.md`。
 - 失败不打扰：攒批 20 条 / 5 秒，失败落 `~/.pi/agent/telemetry-queue.jsonl`，最多重试 3 次；401 自动关开关。
 - 单日上限 20MB（超了停传并提示），服务端再限单批 500 条 / 2MB，原始事件保留 180 天。

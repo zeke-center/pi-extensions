@@ -14,7 +14,7 @@
 - 三个条件同时满足才上传：
   1. `上传使用数据` = 开
   2. 有密钥（否则开关会自己回弹）：优先读环境变量 `PI_TELEMETRY_KEY` /
-     `CENTER_MASTER_KEY` / `MASTER_KEY`，都没有才用配置里的「埋点密钥」
+     `CENTER_TOKEN` / `CENTER_MASTER_KEY` / `MASTER_KEY`，都没有才用配置里的「埋点密钥」
   3. 首次开启时在确认框里点「同意」
 
 ## 采集什么

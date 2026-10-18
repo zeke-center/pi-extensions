@@ -34,7 +34,7 @@ export const PRIVACY_NOTICE = [
 	"随时可以在设置里关闭；关闭后立即停止上传并清空本地待传队列。",
 ].join("\n");
 
-const DEFAULT_ENDPOINT = "https://api.zeke0419.top";
+const DEFAULT_ENDPOINT = (process.env.CENTER_API || "https://api.zeke0419.top").replace(/\/+$/, "");
 /** 默认读哪个环境变量；找不到再依次回退（见 envKey()） */
 const DEFAULT_KEY_ENV = "PI_TELEMETRY_KEY";
 const QUEUE_FILE = () => join(getAgentDir(), "telemetry-queue.jsonl");
@@ -96,7 +96,7 @@ function enabled(): boolean {
 
 /** 从环境变量取密钥。返回命中的变量名，方便在 /telemetry 里显示来源。 */
 function envKey(): { value: string; source: string } {
-	const names = [keyEnvName, DEFAULT_KEY_ENV, "CENTER_MASTER_KEY", "MASTER_KEY"].filter(Boolean);
+	const names = [keyEnvName, DEFAULT_KEY_ENV, "CENTER_TOKEN", "CENTER_MASTER_KEY", "MASTER_KEY"].filter(Boolean);
 	for (const n of names) {
 		const v = (process.env[n] ?? "").trim();
 		if (v) return { value: v, source: `env:${n}` };
@@ -405,7 +405,7 @@ function registerTelemetrySettings(): void {
 			key: "telemetryKey",
 			group: "数据与隐私",
 			label: "埋点密钥",
-			desc: "后端 MASTER_KEY（请求头 X-Brain-Token）。**环境变量优先于这里**（默认看 PI_TELEMETRY_KEY，再回退 CENTER_MASTER_KEY / MASTER_KEY）。留空且没环境变量 = 永远不上传。",
+			desc: "后端 MASTER_KEY（请求头 X-Brain-Token）。**环境变量优先于这里**（PI_TELEMETRY_KEY → CENTER_TOKEN → CENTER_MASTER_KEY → MASTER_KEY）。留空且没环境变量 = 永远不上传。",
 			kind: "text",
 			def: "",
 			get: () => apiKey,
@@ -421,7 +421,7 @@ function registerTelemetrySettings(): void {
 			key: "telemetryKeyEnv",
 			group: "数据与隐私",
 			label: "密钥环境变量名",
-			desc: "优先从这个环境变量读密钥（默认 PI_TELEMETRY_KEY）；读不到再试 CENTER_MASTER_KEY、MASTER_KEY，最后才用上面的“埋点密钥”。",
+			desc: "优先从这个环境变量读密钥（默认 PI_TELEMETRY_KEY）；读不到再用 CENTER_TOKEN → CENTER_MASTER_KEY → MASTER_KEY，最后才用上面的“埋点密钥”。",
 			kind: "text",
 			def: DEFAULT_KEY_ENV,
 			get: () => keyEnvName,
@@ -437,7 +437,7 @@ function registerTelemetrySettings(): void {
 			key: "telemetryEndpoint",
 			group: "数据与隐私",
 			label: "上报地址",
-			desc: "后端根地址，默认 https://api.zeke0419.top（会拼 /api/telemetry/ingest）。",
+			desc: "后端根地址，默认取环境变量 CENTER_API，没有则 https://api.zeke0419.top（会拼 /api/telemetry/ingest）。",
 			kind: "text",
 			def: DEFAULT_ENDPOINT,
 			get: () => endpoint,
@@ -586,7 +586,7 @@ export function setupTelemetry(api: ExtensionAPI): void {
 			ctx.ui.notify(
 				[
 					`埋点：${enabled() ? "开启" : "关闭"} · 粒度 ${level} · 密钥 ${currentKey().value ? `已填(${currentKey().source})` : "未填"}`,
-					`密钥环境变量：${keyEnvName}（再回退 CENTER_MASTER_KEY / MASTER_KEY）`,
+					`密钥环境变量：${keyEnvName}（再回退 CENTER_TOKEN / CENTER_MASTER_KEY / MASTER_KEY）`,
 					`本地队列：${queue.length} 条 · 今日已传 ${(bytesToday / 1024).toFixed(1)} KB`,
 					`地址：${endpoint}`,
 					"用法：/telemetry on | off | flush",
