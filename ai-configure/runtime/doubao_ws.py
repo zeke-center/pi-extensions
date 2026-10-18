@@ -336,3 +336,136 @@ def synth_many(api_key, jobs, resource_id="seed-tts-2.0", log=None, on_done=None
             sock.close()
         except Exception:
             pass
+
+
+class CloudConn:
+    """**常驻**的豆包连接：握手只做一次，之后每句只发 StartSession/TaskRequest。
+
+    为什么必须常驻：实测握手+建会话要 3.2~3.4 秒（跟句子长短无关），
+    每句都重连就等于每句话前都顿一下 —— 用户听到的就是"漏点/断断续续"。
+    """
+
+    def __init__(self, api_key, resource_id="seed-tts-2.0"):
+        self.api_key = api_key
+        self.resource_id = resource_id
+        self.sock = None
+        self.rd = None
+        self.dead = False
+
+    def _open(self):
+        self.sock, rest = ws_connect(self.api_key, self.resource_id)
+        self.sock.settimeout(30)
+        self.rd = Reader(self.sock, rest)
+        ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["StartConnection"], b"{}"))
+        deadline = time.time() + 20
+        while True:
+            if time.time() > deadline:
+                raise RuntimeError("连豆包超时")
+            op, d = self.rd.frame()
+            if op == 0x9:
+                ws_send(self.sock, d, opcode=0xA)
+                continue
+            if op != 0x2:
+                continue
+            _, ev, _, _ = unpack(d)
+            if ev == EV["ConnectionStarted"]:
+                return
+            if ev == EV["ConnectionFailed"]:
+                raise RuntimeError("建连失败")
+
+    def ensure(self):
+        if self.sock is None or self.dead:
+            self.close()
+            self._open()
+            self.dead = False
+        return self
+
+    def synth(self, text, speaker, out_path, sample_rate=24000, speech_rate=0):
+        """合成一句到 wav。失败时把连接标记为坏、下次重连。"""
+        self.ensure()
+        sid = str(uuid.uuid4())
+        try:
+            body = json.dumps({
+                "event": EV["StartSession"],
+                "req_params": {"speaker": speaker,
+                               "audio_params": {"format": "pcm", "sample_rate": sample_rate,
+                                                "speech_rate": speech_rate or 0}},
+            }).encode()
+            ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["StartSession"], body, session_id=sid))
+            while True:
+                op, d = self.rd.frame()
+                if op == 0x9:
+                    ws_send(self.sock, d, opcode=0xA)
+                    continue
+                if op != 0x2:
+                    continue
+                _, ev, _, _ = unpack(d)
+                if ev == EV["SessionStarted"]:
+                    break
+                if ev in (EV["SessionFailed"], EV["ConnectionFailed"]):
+                    raise RuntimeError("会话启动失败")
+
+            body = json.dumps({"event": EV["TaskRequest"], "req_params": {"text": text}}).encode()
+            ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["TaskRequest"], body, session_id=sid))
+            ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["FinishSession"], b"{}", session_id=sid))
+
+            pcm = bytearray()
+            while True:
+                op, d = self.rd.frame()
+                if op == 0x9:
+                    ws_send(self.sock, d, opcode=0xA)
+                    continue
+                if op != 0x2:
+                    continue
+                t, ev, seq, payload = unpack(d)
+                if t == MSG_AUDIO_ONLY:
+                    pcm += payload
+                elif ev in (EV["SessionFinished"], EV["SessionFailed"], EV["SessionCanceled"]):
+                    break
+            if not pcm:
+                raise RuntimeError("豆包没有返回音频")
+            with wave.open(out_path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes(bytes(pcm))
+            return out_path
+        except Exception:
+            self.dead = True
+            raise
+
+    def close(self):
+        try:
+            if self.sock is not None:
+                ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["FinishConnection"], b"{}"))
+        except Exception:
+            pass
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        self.rd = None
+
+
+_CONNS = {}
+
+
+def get_conn(api_key, resource_id="seed-tts-2.0"):
+    """拿（或建）一条常驻连接。按 key+resource 复用，不同凭据互不干扰。"""
+    k = (api_key, resource_id)
+    c = _CONNS.get(k)
+    if c is None:
+        c = CloudConn(api_key, resource_id)
+        _CONNS[k] = c
+    return c
+
+
+def close_all():
+    for c in list(_CONNS.values()):
+        try:
+            c.close()
+        except Exception:
+            pass
+    _CONNS.clear()
