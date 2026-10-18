@@ -19,3 +19,7 @@ Thumbs.db
 
 # 删掉的旧代码备份（留本地做参照，不入库）
 attic/
+
+# Python 编译缓存（runtime 里 import 过就会生成）
+__pycache__/
+*.pyc

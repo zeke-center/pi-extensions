@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（里面 10 个模块）**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 9 个模块，另有 `speech` / `speaker` / `tts/` 等支撑文件）** · 当前版本 **v1.40.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -24,7 +24,7 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 
 ```text
 pi-extensions/
-├── ai-configure/        # 一个插件，10 个模块
+├── ai-configure/        # 一个插件，入口装配 9 个模块
 │   ├── package.json     # 内层清单：显式声明入口（显示名 = pi-extensions，不叫 index）
 │   ├── pi-extensions.ts # 入口：装配下面九个 + 注册 /aihelp；各模块独立 try/catch
 │   ├── config.ts        # 连接台账 → MCP（/ai）
@@ -118,6 +118,12 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `clear` | 清空任务列表 |
 | | `above` \| `below` | 面板放输入框上方 / 下方 |
 | | `right` \| `mid` | 显示 / 隐藏右区（MCP / 插件 / 助理）/ 中栏 |
+| **`/tts`** | `on` \| `off` | **语音播报开关**（总闸 `voiceTts`；默认关）。关掉不影响结果卡片 |
+| | `status` | 用了哪档引擎、模型在不在、为什么不可用、今天花了多少钱 |
+| | `test` \| `demo` | 念测试句（GitHub / CI / TypeScript / diff 这些难点词）/ 演示整档效果 |
+| | `install` \| `rm` | 下载离线模型（断点续传 + sha256 + 双镜像）/ 删模型 |
+| | `voice <号>` \| `voices` | 换音色 / 列出所有音色（豆包：45-48 女声、**49-52 男声**） |
+| | `speed 0.92` | 语速（0.5~2.0，默认 1.0） |
 | **`/usage`** | — | **全局 token 账**：本会话 + 所有子代理（按助理列明细）。中栏只显示合计，要明细敲这个 |
 | **`/assistants`** | — | 列出所有助理模板（分「可派发 / 基础模板 / 示例模板」三组） |
 | | `show <key>` | 展开全部字段 + 继承链 + 提示词正文 |
@@ -1385,6 +1391,11 @@ Windows toast。语音那条跑完还会再弹一下「答完了，回来看一�
 | `runTimeoutMs` | 白名单命令超时（默认 60000，上限 600000）|
 | `offset` | 轮询游标（自动维护）|
 
+### 语音条回传（v1.31.0 起）
+
+手机发起的**那一轮**，结论会额外合成一条 Telegram **语音条**推回手机（见模块 7 的 `voiceRoute=auto`）——
+走路/开车时不用盯屏幕。判定按**轮**（消息到达那一刻定格），不按时间窗口。
+
 ### 踩过的坑（都是实测）
 
 - **IPv6 间歇性 ECONNRESET**：本机 DNS 会返回 AAAA 而到 Telegram 的 IPv6 路由不通；`curl` 自带 happy-eyeballs 会回退所以「curl 能通、Node 不通」。→ 加载时就 `setDefaultResultOrder("ipv4first")` + `tgFetch` 重试 4 次。
@@ -1410,36 +1421,113 @@ Windows toast。语音那条跑完还会再弹一下「答完了，回来看一�
 
 ---
 
-## 模块 7 · voice-tts.ts（语音播报：事件 → 口播稿 → 队列 → 引擎 · **v1.17.0** 起）
+## 模块 7 · voice-tts.ts（语音播报：事件 → 口播稿 → 队列 → 引擎 → 电脑/手机 · **v1.17.0** 起，**v1.40.0** 现状）
 
-给"用耳朵写代码"用的输出侧。**默认关闭**（`voiceTts=false`），装上模型也不会自动开。
+给「用耳朵写代码」用的输出侧。**默认关闭**（`voiceTts=false`），装上模型也不会自动开。
 
 ```
-agent_settled / tool_execution_end / 计划确认
+agent_settled / tool_execution_end / 计划确认 / 用户消息
         ↓  事件（不是整段 markdown）
-speech.ts      口播稿：1~2 句、结论先行、不念代码和路径（brief / normal / full）
+speech.ts      口播稿：结论先行、不念代码和路径；`[口播]` 段优先，没有就用要点兜底
         ↓
 speaker.ts     唯一出口：优先级 · 抢占 · ttl 过期 · 可打断 + 写 narration/YYYY-MM-DD.jsonl
         ↓
-tts/index.ts   引擎探测与回退：local（离线模型）→ sapi（系统语音）→ off
+tts/index.ts   引擎路由：doubao（云端）→ local（离线模型）→ sapi（系统语音）→ off
         ↓
-runtime/tts_worker.py   常驻子进程：sherpa-onnx 合成 + 播放；**stdin EOF 即自杀**（不留孤儿）
+runtime/tts_worker.py   常驻子进程：离线合成播放 / 云端合成（WebSocket）/ 导出 ogg 语音条
+        ↓
+电脑扬声器  ／  Telegram 语音条（手机）
 ```
 
-**模型不进 git**：清单在 `ai-configure/tts/manifest.json`，本体下载到
-`~/.pi/agent/models/tts/<model-id>/`（Kokoro 384MB / MeloTTS 183MB），删目录即可卸载。
+三条硬约束（改代码前先记住）：
+
+1. **播报与主流程完全解耦**：不 `await`、整段 `try/catch`、异常静默、三道熔断
+   （连续 3 次失败停播 / 节流 ≥6s / 一轮最多 5~6 句）、独立子进程。
+   播不出来绝不能影响回答本身。
+2. **口播稿不进对话历史**：只走 `Speaker` + `narration/*.jsonl`（`appendEntry` 的 custom 条目也不进上下文），
+   规则模板 **0 次模型调用**。
+3. **粒度按「阶段」不按工具调用**：每个工具都念一遍太吵。
+
+### 引擎（`voiceEngine`：`auto` / `doubao` / `local` / `sapi`）
+
+| 引擎 | 说明 | 代价 |
+|---|---|---|
+| `doubao` | 火山豆包语音（v3 双向流 WebSocket，`seed-tts-2.0`），男声可选多；**只当「嘴」不当「脑子」** | 按字符计费（默认 1.0 元/万字符），本机实测约 0.5~2 元/天 |
+| `local` | 离线 sherpa-onnx 模型（默认 `kokoro-multi-lang-v1_1`，另可选 `vits-zh-aishell3`、`melotts`），下载到 `~/.pi/agent/models/tts/` | 0 元，CPU 合成一句 10 秒音频约 3 秒 |
+| `sapi` | 系统自带语音（Windows `System.Speech` / macOS `say` / Linux `spd-say`） | 0 元、零安装，音质最差 |
+| `off` | 不播 | — |
+
+**模型不进 git**：清单在 `ai-configure/tts/manifest.json`，本体下载到 `~/.pi/agent/models/tts/<model-id>/`，删目录即可卸载。
+
+### 播什么（`voiceLevel`）
+
+| 档 | 念什么 |
+|---|---|
+| `brief` | 只念结论 1~2 句 |
+| `normal` | 结论 + 风险/待办 |
+| `full` | 400 字以内整段（不插「以下省略」） |
+| `steps`（默认） | **阶段**：开工应答（「收到，我看一下」）+ 长任务过渡台词 + 结论 |
+| `chatty` | `steps` + 工具失败时的安慰句（节流 10 秒、一轮最多 6 句） |
+
+- **口播稿谁写**：我自己写 —— 回答里带 `[口播]…[/口播]` 段（优先用它），工具前写 `<step>…</step>` 行（≤20 字）；
+  规则模板只兜底（`keyPoints` → 「第一…第二…」）。
+- **语气**（`voiceTone`，默认 `off`）：`off` 不加 / `auto` 按场景 / 也可在 `<step tone="calm">` 里指定；
+  走豆包的 `context_texts`（**不计费**）。
+- **英文术语**（`voiceTerms`，默认 `en`）：保留原词（GitHub / API / TypeScript 不会被念成「G H U B」），
+  `zh` 才转中文。
+- **口播不截断**：上限 1500 字，只在句读处收口。
+
+### 发到哪（`voiceRoute`：`auto` / `both` / `pc` / `phone`）
+
+| 档 | 电脑 | 手机 |
+|---|---|---|
+| `auto`（默认） | 电脑发起的一轮就电脑念 | 手机发起的一轮就发语音条，**电脑完全静音**（连「收到」都不念） |
+| `both` | ✅ | ✅ |
+| `pc` | ✅ | ❌ |
+| `phone` | ❌ | ✅ |
+
+- **按「轮」判定来源，不用时间窗口**：消息到达那一刻定格 `turnRemote`，整轮不再变。
+  早期用「最近 3 分钟」窗口 → 长任务（>3 分钟）会被判成电脑轮，人在外面就彻底没声音。
+- 手机语音条：worker 合成 ogg_opus（48k）→ Telegram `sendVoice`（文件名非 `.ogg` 时降级 `sendDocument`）。
+- **发送有兜底**：主路径（`remote.sendVoiceToPhone`）返回 0 时自动走**直发**（自己读配置里的 token/chats 调
+  `sendVoice`），还失败就把 HTTP 状态码 + Telegram 返回体写进 `narration`。
+
+### 命令
 
 | 命令 | 作用 |
 |---|---|
-| `/tts status` | 用了哪档引擎、模型在不在、为什么不可用 |
-| `/tts test` | 念测试句（含 GitHub / CI / TypeScript / diff 这些难点词） |
-| `/tts install` | 下载 + sha256 校验 + 解压（断点续传、GitHub↔hf-mirror 双镜像） |
-| `/tts rm` | 删模型（引擎自动回退系统语音） |
+| `/tts status` | 用了哪档引擎、模型在不在、为什么不可用、今天花了多少钱 |
+| `/tts test` / `demo` | 念测试句（含 GitHub / CI / TypeScript / diff 这些难点词）/ 演示播报效果 |
+| `/tts install` / `rm` | 下载（断点续传、GitHub↔hf-mirror 双镜像、sha256 校验）/ 删模型 |
 | `/tts on` / `off` | 开关播报 |
-| `/tts voice 50` / `/tts speed 0.92` | 音色 / 语速（默认 1.0） |
+| `/tts voice 49` / `voices` | 换音色 / 列出所有音色 |
+| `/tts speed 0.92` | 语速（默认 1.0；真旋钮是 `length_scale = 1/speed`） |
 
-**为什么不吃 token**：口播稿只走 Speaker + jsonl，**不进对话历史**（`appendEntry` 的 custom 条目也不进上下文）；
-规则模板 0 次模型调用。实测本机：首句出声 0.4~0.6s，一句 10 秒音频合成约 3 秒（CPU）。
+### 用量与费用
+
+- `<agentDir>/narration/usage.json`：`{日期: {words, cached, calls, local}}`，只留 14 天。
+- 状态栏一行：`🔊 豆包 1,240 字 ¥0.12 · 缓存免单 800 字`（`voicePrice` 默认 1.0 元/万字符）。
+- 音频缓存 `<agentDir>/models/tts/.cloud-cache/`：键含 `text|speaker|sr|rid|speed|tone`，
+  换任何一项必 miss；200MB / 7 天自动清理。**同样的句子第二次念不花钱。**
+
+### 踩过的坑（都是真机实测，改这块之前先看）
+
+| 现象 | 真因 |
+|---|---|
+| 长稿只念第一句 | 后台合成没完就报 `done` → 加 `pending` 计数，`say()` 等 `done` 取总时长 |
+| 换音色没效果 | `ensure_engine()` 建好即 return，`say` 的 sid 从未应用 → 抽出 `apply_voice()`（换 sid 只改属性，换 speed 重建） |
+| 音色编号对不上 | 官方表 45-48 中文女声、**49-52 中文男声**（49 `zm_yunjian` 沉稳，默认）；早期误用 50 |
+| 语音条收到了但**没声音** | 云端音频帧解包时 seq 字段位置写死，吃掉每帧前 4 字节 → 容器头毁。改用**长度自校验**定位 payload |
+| 突然 `RuntimeError: 连接关闭` | 豆包常驻连接被服务端回收（省握手 3.2~3.4s 的代价）→ `cloud_call()` 作废连接 + **重建重试一次**（+3s） |
+| 手机上永远收不到 | ① 遗留守卫 `if (!c.voiceSendPhone) return;` 让函数第一步就返回 ② 判定用的全局标记被上一轮清掉 → 改成按轮定格 |
+| 方舟（ark）的 key 调不动语音 | 方舟 ≠ 语音技术，鉴权体系不同：v3 `X-Api-Key` → 401 `Invalid X-Api-Key`；Bearer → 400 `app key not found in header` |
+| `seed-audio-1.0` 特别慢 | 生成式音频模型（固定 ~37s 开销，与文本长度无关），**不是实时 TTS**；实时要 `seed-tts-2.0` |
+
+### 为什么不吃 token
+
+口播稿由我自己顺手写（`[口播]` 段约 60~150 字 ≈ 100 token），规则模板 0 次模型调用，
+音频合成在**独立子进程**里跑，不占对话上下文。
+实测本机：首句出声 0.4~0.6s（离线）/ 1.0~1.6s（云端，连接常驻后），一句 10 秒音频合成约 3 秒。
 
 ## 上下文成本实测
 
@@ -1572,6 +1660,21 @@ pi remove git:github.com/zeke-center/pi-extensions
 ```
 
 删完重启 pi（或 `/reload`）。`install.ps1` 现在会**自动检测**包通道并拒绝重复同步扩展（红字提示），除非显式 `-ForceExtensions`。
+
+### 语音不播 / 手机收不到语音条
+
+先看 `<agentDir>/narration/YYYY-MM-DD.jsonl`（**UTC 时间**），结论那一轮会有明确记录：
+
+| 日志 | 意思 | 怎么办 |
+|---|---|---|
+| `结论分发：电脑=false 手机=true 来源=手机 长度=268` | 决策正常 | 看下一行 |
+| `语音条合成失败：RuntimeError: 连接关闭` | 豆包常驻连接被回收 | v1.40.0 起会自动重建重试；仍失败看 key |
+| `语音条已发送：1 个会话，412KB` | **成功** | — |
+| `兜底发送失败：<HTTP码> <返回体>` | Telegram 侧拒绝 | 看返回体（常见 400 chat not found / 413 太大） |
+| `结论未播：voiceTts 关着` / `语音模块没初始化` | 开关或环境问题 | `/tts on`、`/tts status` |
+| 完全没有 `结论分发` 一行 | `agent_settled` 没跑到 | 看有没有别的异常日志 |
+
+其它常见点：电脑上不念 → 看 `voiceRoute` 是不是 `phone`；`/tts status` 里引擎是 `off` → 模型没装好且没有系统语音。
 
 ### 启动报 `Ignored settings` / MCP 字段不生效
 
