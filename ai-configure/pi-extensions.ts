@@ -33,6 +33,7 @@ import { setupDoctor } from "./doctor";
 import { isExtDisabled, setupGate } from "./gate";
 import { setupVoice } from "./voice";
 import { setupVoiceTts } from "./voice-tts";
+import { setupTelemetry } from "./telemetry";
 import { setupRemote } from "./remote";
 import { openSettings } from "./settings";
 import { healthLine, markFail, markOk } from "./health";
@@ -48,6 +49,7 @@ export function setupAll(api: ExtensionAPI): void {
 	//            ② panel 必须在 board 之前（widget 按注册顺序从上往下排）。
 	const parts: Array<[string, (a: ExtensionAPI) => void]> = [
 		["gate", setupGate],
+		["telemetry", setupTelemetry],
 		["config", setupConfig],
 		["panel", setupPanel],
 		["board", setupBoard],

@@ -23,6 +23,7 @@ import { onPlanAskChange } from "./shared";
 import { Speaker } from "./speaker";
 import { render, sanitizeForSpeech, type SpeechLevel, type TermMode } from "./speech";
 import { TtsRouter, type EngineMode } from "./tts/index";
+import { track } from "./telemetry";
 import { installModel, loadManifest, modelStatus, uninstallModel } from "./tts/models";
 
 const GROUP = "语音播报";
@@ -314,6 +315,11 @@ function speakResult(): void {
 		note("结论未播：口播稿渲染为空");
 		return;
 	}
+	track("tts_generated", {
+		chars: u.text.length,
+		tier: (c.voiceLevel ?? "brief") as string,
+		has_code: lastAssistantText.includes("```"),
+	});
 	note(`结论分发：电脑=${playLocally()} 手机=${sendToPhone()} 来源=${turnRemote ? "手机" : "电脑"} 长度=${u.text.length}`);
 	if (playLocally()) s.speaker.say(u);
 	if (sendToPhone()) void sendPhoneVoice(u.text).catch(() => {});

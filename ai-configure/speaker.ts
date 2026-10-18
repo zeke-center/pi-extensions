@@ -17,6 +17,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Utterance } from "./speech";
 import type { TtsRouter } from "./tts/index";
+import { track } from "./telemetry";
 
 export interface SpeakerOpts {
 	agentDir: string;
@@ -135,6 +136,11 @@ export class Speaker {
 					this.opts.log?.(`播报失败：${e instanceof Error ? e.message : String(e)}`);
 				}
 				next.endedAt = Date.now();
+				track(
+					"tts_play",
+					{ engine: next.engine ?? "", kind: next.kind, chars: next.text.length },
+					{ ok: next.status === "done", duration_ms: (next.endedAt ?? 0) - (next.startedAt ?? 0) },
+				);
 				try {
 					if (next.status === "done") this.opts.onSpoken?.({ kind: next.kind, text: next.text });
 				} catch {

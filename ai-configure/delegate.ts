@@ -45,6 +45,7 @@ import { Type } from "typebox";
 import { type FormResult, type FormField, showForm, type PickItem } from "./form";
 import { guardCtx } from "./shared";
 import { registerSettings } from "./settings";
+import { track } from "./telemetry";
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
@@ -2636,6 +2637,13 @@ export function setupDelegate(api: ExtensionAPI): void {
 			const main = mainName(ctx);
 			rememberCurrentSession(ctx); // 刷新本会话身份（异步回投靠它认领）
 			const running = `${list.length > 1 ? `×${list.length} ` : ""}`;
+			const _d0 = Date.now();
+			track("delegate_dispatch", {
+				assistant: tpl.key,
+				tasks_count: list.length,
+				mode: wait ? "sync" : "async",
+				resumed: Boolean(resumeId),
+			});
 
 			// 建影子 agentDir：只放进本模板声明的那些 MCP（真正的「按需给」）
 			const pool = loadMcpPool(tpl.cwd);
@@ -2744,6 +2752,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 						shadowDir: shadow.dir,
 						sessionDir: ensureAssistantSessionDir(tpl.key),
 						onSettle: (r) => {
+							track(
+								"delegate_result",
+								{ assistant: tpl.key, outcome: r.outcome, card_bytes: renderCard(r).length },
+								{ ok: r.outcome === "done", duration_ms: Date.now() - _d0 },
+							);
 							const prev = readBgTask(bgId) ?? {
 								id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
 								startedAt: Date.now(), status: "running" as const,
@@ -2778,6 +2791,15 @@ export function setupDelegate(api: ExtensionAPI): void {
 			const sep = `\n\n${"─".repeat(48)}\n\n`;
 			const text = results.map(renderCard).join(sep);
 			const ok = results.every((r) => r.outcome === "done");
+			track(
+				"delegate_result",
+				{
+					assistant: tpl.key,
+					outcome: results.map((r) => r.outcome).join(","),
+					card_bytes: text.length,
+				},
+				{ ok, duration_ms: Date.now() - _d0 },
+			);
 
 			return {
 				content: [{ type: "text" as const, text }],

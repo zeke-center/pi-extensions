@@ -23,6 +23,7 @@ import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
 import { cardNotify } from "./notify";
+import { track } from "./telemetry";
 import { registerSettings } from "./settings";
 import { guardCtx, readExtCfg, patchExtCfg } from "./shared";
 import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk, setAskOutcome } from "./shared";
@@ -1115,6 +1116,7 @@ export function setupBoard(api: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			lastCtx = ctx;
+			const _t0 = Date.now();
 			resetProgressWatch(); // 任何 progress() 调用都算“有更新”
 
 			// 停用态：工具理论已被撤下，这里再兜一道（防「撤下前已在飞」的调用）
@@ -1123,6 +1125,7 @@ export function setupBoard(api: ExtensionAPI): void {
 			}
 
 			if (params.action === "clear") {
+				track("plan_clear", { done: steps.filter((s) => s.status === "done").length, total: steps.length, duration_ms: Date.now() - _t0 });
 				title = "";
 				steps = [];
 				blocker = undefined;
@@ -1163,6 +1166,13 @@ export function setupBoard(api: ExtensionAPI): void {
 				//   · 你在终端亲手派的计划 → 照旧弹终端确认（要改就先改）
 				// 另外「粘贴一句话」和「超时兜底」两条通道仍然管用（谁先答算谁）
 				const stepTexts = pending.map((x) => x.text);
+				track("plan_declared", {
+					title: pendingTitle,
+					steps: stepTexts,
+					steps_count: stepTexts.length,
+					skip_confirm: params.skipConfirm === true,
+				});
+				const _askedAt = Date.now();
 				const bgTurn = isBackgroundTurn();
 				const pcfg = getPlanCfg();
 				const needAsk = params.skipConfirm !== true && !bgTurn && ctx?.hasUI;
@@ -1231,8 +1241,15 @@ export function setupBoard(api: ExtensionAPI): void {
 							: undefined;
 					if (timeoutAsk) void timeoutAsk.then((v) => pick(v, "timeout"));
 					choice = await choicePromise;
+					const answer = !choice || choice.startsWith("⛔") ? "no" : choice.startsWith("✏️") ? "edit" : "yes";
+					track("plan_answer", {
+						answer,
+						wait_ms: Date.now() - _askedAt,
+						edit_text: choice.includes("|") ? choice.split("|").slice(1).join("|").trim() : undefined,
+					});
 					closePlanAsk(); // 谁先答都要把挂起状态清掉（否则下一轮计划会被误应答）
 				} else if (bgTurn) {
+					track("plan_answer", { answer: "auto", wait_ms: 0 });
 					ctx.ui.notify(`📋 剪贴板投递的计划（${pending.length} 步）→ 默认开始执行：${pendingTitle || ""}`, "info");
 				}					if (choice && choice.startsWith("✏️") && choice.includes("|")) {
 						// 粘贴通道带来的修改意见：直接当"我要改"处理（不用再弹输入框）
@@ -1305,6 +1322,7 @@ export function setupBoard(api: ExtensionAPI): void {
 
 			if (params.action === "block") {
 				blocker = params.text ?? "遇到问题";
+				track("plan_block", { text: blocker, index: steps.findIndex((s) => s.status === "doing") + 1, total: steps.length });
 				lastProgressTurn = turnNo;
 				refresh();
 				persist();
@@ -1322,6 +1340,7 @@ export function setupBoard(api: ExtensionAPI): void {
 				}
 				const st = params.status ?? "doing";
 				steps[idx]!.status = st;
+				track("plan_step", { index: idx + 1, status: st, total: steps.length, done: steps.filter((s) => s.status === "done").length });
 				if (st === "done" && blocker) blocker = undefined;
 				lastProgressTurn = turnNo;
 				refresh();

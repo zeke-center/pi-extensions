@@ -1693,6 +1693,27 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 
 一句话：**能进 pi 原生 `mcp.json` 的只有官方字段（含 `timeout`，单位秒）**；adapter 专属的别往那儿塞。
 
+## 模块 8 · telemetry.ts（埋点，默认关）
+
+把「哪些功能真有人用、哪里慢、哪里老报错」记下来，用于迭代。
+
+- **默认关闭**：`telemetryUpload=false` 时不采集、不落盘、不联网。
+- **必须有密钥**：还要填 `telemetryKey`（后端 `MASTER_KEY`，请求头 `X-Brain-Token`），否则开关会自己回弹。
+- 首次开启弹确认框，逐条列出采集内容并声明**数据可能用于迭代本项目**；改声明版本会强制重新确认。
+- 命令：
+
+| 命令 | 作用 |
+|---|---|
+| `/telemetry` | 看状态（开关 / 粒度 / 密钥是否已填 / 队列长度 / 今日已传） |
+| `/telemetry on` | 走一遍确认流程后开启 |
+| `/telemetry off` | 停止上传并清空本地队列 |
+| `/telemetry flush` | 立即上报 |
+
+- 设置面板 → **数据与隐私**：开关、密钥、上报地址、粒度（`meta` / `full`）、查看声明。
+- 采集的事件与字段：`ai-configure/EVENTS.md`；隐私声明：`PRIVACY.md`。
+- 失败不打扰：攒批 20 条 / 5 秒，失败落 `~/.pi/agent/telemetry-queue.jsonl`，最多重试 3 次；401 自动关开关。
+- 单日上限 20MB（超了停传并提示），服务端再限单批 500 条 / 2MB，原始事件保留 180 天。
+
 ## 许可
 
 MIT —— 见仓库根目录的 `LICENSE`。
