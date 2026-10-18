@@ -34,6 +34,7 @@ interface Cfg {
 	voiceLocalModel?: string;
 	voiceLocalVoice?: number;
 	voiceTerms?: TermMode;
+	voiceTone?: "off" | "auto";
 	voiceLevel?: SpeechLevel;
 	voiceTtsVoice?: string;
 	voiceTtsRate?: number;
@@ -156,7 +157,7 @@ function speakResult(): void {
 	const c = readCfg();
 	const u = render(
 		{ kind: "result", full: lastAssistantText, text: firstSentence(lastAssistantText), ref: "turn" },
-		{ level: (c.voiceLevel ?? "brief") as SpeechLevel, terms: (c.voiceTerms ?? "en") as TermMode },
+		{ level: (c.voiceLevel ?? "brief") as SpeechLevel, terms: (c.voiceTerms ?? "en") as TermMode, toneMode: (c.voiceTone ?? "off") as "off" | "auto" },
 	);
 	if (u) s.speaker.say(u);
 }
@@ -298,6 +299,18 @@ function speechSettings(): SettingDef[] {
 			def: true,
 			get: () => readCfg().voiceAck ?? true,
 			set: (v) => patchCfg({ voiceAck: v }),
+		},
+		{
+			key: "voiceTone",
+			group: GROUP,
+			label: "语气（豆包）",
+			desc: "off = 自然语气（默认，推荐）；auto = 按场景自动加语气（结论沉稳汇报、报错提醒、提问征询）。豆包的语气指令不计费。",
+			kind: "enum",
+			options: ["off", "auto"],
+			values: ["off", "auto"],
+			def: "off",
+			get: () => (readCfg().voiceTone ?? "off") as "off" | "auto",
+			set: (v) => patchCfg({ voiceTone: v as "off" | "auto" }),
 		},
 		{
 			key: "voiceLevel",
@@ -564,7 +577,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 		const s = ensureSpeech();
 		const u = render(
 			{ kind: "progress", text: "还在跑，大概还要一会儿。", ref: "tool" },
-			{ level: "brief", terms: (readCfg().voiceTerms ?? "en") as TermMode },
+			{ level: "brief", terms: (readCfg().voiceTerms ?? "en") as TermMode, toneMode: (readCfg().voiceTone ?? "off") as "off" | "auto" },
 		);
 		if (s && u) s.speaker.say(u);
 	});
@@ -575,7 +588,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 		const s = ensureSpeech();
 		const u = render(
 			{ kind: "ask", question: `计划准备好了：${ask.title}`, ref: "plan" },
-			{ level: "brief", terms: (readCfg().voiceTerms ?? "en") as TermMode },
+			{ level: "brief", terms: (readCfg().voiceTerms ?? "en") as TermMode, toneMode: (readCfg().voiceTone ?? "off") as "off" | "auto" },
 		);
 		if (s && u) s.speaker.say(u);
 	});

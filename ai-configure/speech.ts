@@ -61,7 +61,14 @@ export const TONE_ALIAS: Record<string, string> = {
 	curious: "请用好奇、请教的语气说。",
 };
 
-export function toneFor(kind: string, named?: string | null): string | undefined {
+export type ToneMode = "off" | "auto";
+
+/**
+ * 语气只在 voiceTone=auto 时才下发（默认 off = 自然语气）。
+ * 用户明确要求"默认正常说话就行"，所以别自作主张加语气指令。
+ */
+export function toneFor(kind: string, named?: string | null, mode: ToneMode = "off"): string | undefined {
+	if (mode !== "auto") return undefined;
 	if (named && TONE_ALIAS[named]) return TONE_ALIAS[named];
 	return TONE_BY_KIND[kind];
 }
@@ -142,7 +149,7 @@ export function trimForSpeech(text: string, maxChars = 220): string {
  * 完整播报专用：**绝不说"详情见上文"**，只在句读处收口。
  * 口播稿本来就该一次说完（用户明确要求：别念一半让他去看屏幕）。
  */
-export function completeForSpeech(text: string, maxChars = 600): string {
+export function completeForSpeech(text: string, maxChars = 1500): string {
 	const t = sanitizeForSpeech(text);
 	if (t.length <= maxChars) return t;
 	const cut = t.slice(0, maxChars);
@@ -200,9 +207,10 @@ export function composePoints(points: string[], lead = "这轮做完了"): strin
 
 export function render(
 	e: SpeechEvent,
-	opts: { level: SpeechLevel; terms: TermMode; maxFiles?: number },
+	opts: { level: SpeechLevel; terms: TermMode; maxFiles?: number; toneMode?: ToneMode },
 ): Utterance | null {
 	const level = opts.level;
+	const toneMode = opts.toneMode ?? "off";
 	const post = (s: string) => sanitizeForSpeech(applyTerms(s, opts.terms));
 	const base = { ref: e.ref };
 
@@ -210,46 +218,46 @@ export function render(
 		// 只有 steps / chatty 档才播阶段进展（brief 保持安静）
 		if (level !== "steps" && level !== "chatty") return null;
 		const text = trimForSpeech(e.text || "继续下一步。", 28);
-		return { ...base, kind: "step", prio: PRIO.step, text, ttl: 12, tone: toneFor("step", e.tone) };
+		return { ...base, kind: "step", prio: PRIO.step, text, ttl: 12, tone: toneFor("step", e.tone, toneMode) };
 	}
 	if (e.kind === "progress") {
 		const text = post(e.text || "还在跑，稍等一下。");
-		return { ...base, tone: toneFor("progress"), kind: "progress", prio: PRIO.progress, ttl: 20, text };
+		return { ...base, tone: toneFor("progress", null, toneMode), kind: "progress", prio: PRIO.progress, ttl: 20, text };
 	}
 
 	if (e.kind === "error") {
 		const text = post(`卡住了：${e.reason || "原因不明"}。我停在原地等你。`);
-		return { ...base, tone: toneFor("error"), kind: "error", prio: PRIO.error, text, interrupt: true };
+		return { ...base, tone: toneFor("error", null, toneMode), kind: "error", prio: PRIO.error, text, interrupt: true };
 	}
 
 	if (e.kind === "ask") {
 		const text = post(`${e.question || "需要你拍板"} 十秒内说停，我就先不动。`);
-		return { ...base, tone: toneFor("ask"), kind: "ask", prio: PRIO.ask, text };
+		return { ...base, tone: toneFor("ask", null, toneMode), kind: "ask", prio: PRIO.ask, text };
 	}
 
 	// result
 	const whole = e.full || e.text || "";
 	if (level === "full") {
 		const spoken = extractSpoken(whole);
-		const text = completeForSpeech(spoken || whole || "改完了。", 600);
-		return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result"), text, interrupt: true };
+		const text = completeForSpeech(spoken || whole || "改完了。");
+		return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result", null, toneMode), text, interrupt: true };
 	}
 
 	// 1) 主模型自己写的口播稿（最自然，优先用）
 	const spoken = extractSpoken(whole);
 	if (spoken) {
 		// 我自己写的口播稿 = 已经为耳朵准备过 → **整段念完**（最多 600 字保护）
-		const text = completeForSpeech(spoken, 600);
-		return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result"), text: applyTerms(text, opts.terms), interrupt: true };
+		const text = completeForSpeech(spoken);
+		return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result", null, toneMode), text: applyTerms(text, opts.terms), interrupt: true };
 	}
 
 	// 2) 兜底：从标题/列表抽 2~4 条，念成"第一…第二…第三…"
-	const maxPoints = level === "normal" ? 4 : 3;
+	const maxPoints = 8; // 逐条列出来的必须念完，不再砍到 3 条
 	const points = keyPoints(whole, maxPoints);
 	if (points.length) {
 		let text = post(composePoints(points));
 		if (level === "normal" && e.risk) text = post(`${composePoints(points)}另外要留意，${e.risk}。`);
-		return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result"), text, interrupt: true };
+		return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result", null, toneMode), text, interrupt: true };
 	}
 
 	// 3) 最后兜底：摘要一句话
@@ -260,7 +268,7 @@ export function render(
 				? `改完了，动了 ${e.files} 个文件。`
 				: trimForSpeech(whole || "这轮做完了。", 120);
 	const text = post(head + (level === "normal" && e.risk ? `另外要留意，${e.risk}。` : ""));
-	return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result"), text, interrupt: true };
+	return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result", null, toneMode), text, interrupt: true };
 }
 
 /** 兜底规则：按工具名 + 入参猜一句"我现在干什么"（≤20 字，播报用） */
