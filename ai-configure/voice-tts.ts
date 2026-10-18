@@ -64,6 +64,8 @@ let progressSent = false;
 let lastStepAt = 0;
 let stepsThisTurn = 0;
 let lastStepText = "";
+let turnStartAt = 0;
+let lastRetryAt = 0;
 let voiceFailures = 0; // 连续失败计数 → 熔断，绝不拖累主流程
 let disposeAsk: (() => void) | null = null;
 
@@ -115,6 +117,14 @@ function settingsOf(c: Cfg = readCfg()) {
 			voice: typeof c.voiceDoubaoVoice === "string" ? c.voiceDoubaoVoice : undefined,
 		},
 	};
+}
+
+/** 本轮进行到哪了（台词按这个换说法：刚开工 / 跑了一阵 / 快收尾） */
+function phaseOf(): "early" | "mid" | "late" {
+	const ms = turnStartAt ? Date.now() - turnStartAt : 0;
+	if (ms < 60_000) return "early";
+	if (ms < 180_000) return "mid";
+	return "late";
 }
 
 /** 要不要在电脑上念（auto 时按"这一轮是不是手机发起的"判断） */
@@ -624,6 +634,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 	api.on("session_start", async (_e, ctx) => {
 		curCtx = ctx;
 		lastAssistantText = "";
+		turnStartAt = Date.now();
 		refreshUsage(ctx);
 		// 预热：豆包握手 3~4 秒，趁用户还在打字先做掉（失败静默，绝不影响主流程）
 		try {
@@ -644,6 +655,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 				if (speaker && stepsOn) void speaker.stopAll().catch(() => {});
 				lastAssistantText = "";
 				lastStepText = "";
+				turnStartAt = Date.now();
 				refreshUsage();
 				stepsThisTurn = 0;
 				lastStepAt = 0;
@@ -701,7 +713,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			let mine = extractStep(lastAssistantText);
 			if (mine && mine === lastStepText) mine = null; // 同一句话不重复念
 			const u = render(
-				{ kind: "step", text: mine ?? stepTextFor(tool, ev.input ?? ev.args ?? ev.parameters), ref: mine ? "step" : tool },
+				{ kind: "step", text: mine ?? stepTextFor(tool, ev.input ?? ev.args ?? ev.parameters, phaseOf()), ref: mine ? "step" : tool },
 				{ level, terms: (readCfg().voiceTerms ?? "en") as TermMode },
 			);
 			if (!u) return;
@@ -715,9 +727,32 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			voiceFailures += 1; // 静默失败，主流程不受影响
 		}
 	});
-	api.on("tool_execution_end", async () => {
+	api.on("tool_execution_end", async (event) => {
 		const secs = toolStartAt ? (Date.now() - toolStartAt) / 1000 : 0;
 		toolStartAt = 0;
+		// 工具失败 → 说一句"这里报错了"（不做技术解释，只让人知道卡住了）
+		try {
+			const ev = event as Record<string, any>;
+			const failed =
+				Boolean(ev.isError) ||
+				Boolean(ev.error) ||
+				ev.result?.isError === true ||
+				(typeof ev.result?.exitCode === "number" && ev.result.exitCode !== 0) ||
+				(typeof ev.result?.metadata?.exitCode === "number" && ev.result.metadata.exitCode !== 0);
+			const level = (readCfg().voiceLevel ?? "brief") as SpeechLevel;
+			if (failed && playLocally() && enabled() && !isExtDisabled() && voiceFailures < 3 && (level === "steps" || level === "chatty")) {
+				if (Date.now() - lastRetryAt > 10_000 && stepsThisTurn < 6) {
+					lastRetryAt = Date.now();
+					stepsThisTurn += 1;
+					const sp = ensureSpeech();
+					const u = render({ kind: "step", text: phraseFor("retry"), ref: "retry" },
+						{ level, terms: (readCfg().voiceTerms ?? "en") as TermMode, toneMode: (readCfg().voiceTone ?? "off") as "off" | "auto" });
+					if (sp && u) sp.speaker.say(u);
+				}
+			}
+		} catch {
+			voiceFailures += 1;
+		}
 		if (secs < 8 || progressSent || !enabled() || isExtDisabled()) return;
 		progressSent = true;
 		const s = ensureSpeech();

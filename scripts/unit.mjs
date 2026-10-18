@@ -216,7 +216,8 @@ let allOk = true;
 bundle("board.ts", "board.mjs");
 allOk =
 	runSuite("board：MCP 栏表头与连接标记", join(tmp, "board.mjs"), [
-					'ok("看板费用：价格默认值 2/8/0.5", (() => { const p = price(); return p.in === 2 && p.out === 8 && p.cache === 0.5; })());',
+			'ok("看板费用：价格默认值 2/8/0.5", (() => { const p = price(); return p.in === 2 && p.out === 8 && p.cache === 0.5; })());',
+			'ok("看板费用：价格默认值 2/8/0.5", (() => { const p = price(); return p.in === 2 && p.out === 8 && p.cache === 0.5; })());',
 			'ok("看板费用：100万入+10万出+5000万缓存 = 2+0.8+25 元", (() => { const c = costOf(1_000_000, 100_000, 50_000_000); return Math.abs(c - 27.8) < 0.001; })());',
 			'ok("看板费用：小额显示 ¥<0.01", fmtCost(0.001) === "¥<0.01");',
 			'ok("表头：没全连上时补 ●n", JSON.stringify(mcpHeaderParts(7, 2)) === JSON.stringify([" MCP 7", " ●2"]));',
@@ -1140,6 +1141,11 @@ allOk =
 			'ok("语气：<step tone=calm> 能覆盖默认", (() => { const r = extractStepFull("<step tone=calm>收到</step>"); return !!r && r.tone === "calm" && toneFor("step", r.tone, "auto").indexOf("沉稳") >= 0; })());',
 			'ok("要点：列了五条就念五条（不砍到三条）", (() => { const md = ["## 做完了","- 第一条说明","- 第二条说明","- 第三条说明","- 第四条说明","- 第五条说明"].join(String.fromCharCode(10)); const u = render({ kind: "result", full: md }, { level: "brief", terms: "en" }); return !!u && ["第一","第二","第三","第四","第五"].every((n) => u.text.indexOf(n) >= 0); })());',
 			'ok("要点：结尾不出现「省略/详情见」", (() => { const md = ["- 甲项说明","- 乙项说明"].join(String.fromCharCode(10)); const u = render({ kind: "result", full: md }, { level: "brief", terms: "en" }); return !!u && !/省略|详情见|屏幕/.test(u.text); })());',
+			'ok("台词：池子够大（≥60 句，缓存命中后边际成本 0）", Object.values(PHRASES).reduce((n, a) => n + a.length, 0) >= 60);',
+			'ok("台词：时间感有 early/mid/late 三池", !!PHRASES["wait.early"] && !!PHRASES["wait.mid"] && !!PHRASES["wait.late"]);',
+			'ok("台词：每句 ≤16 字且不空", Object.values(PHRASES).every((a) => a.every((x) => x.length > 1 && x.length <= 16)));',
+			'ok("台词：同一类连抽 20 次不会连续重复", (() => { for (let i = 0; i < 20; i++) { const a = phraseFor("read"); const b = phraseFor("read"); if (a === b) return false; } return true; })());',
+			'ok("台词：报错句子都带失败的意味", PHRASES.retry.every((x) => /报错|没过|问题|挂了|重试|日志/.test(x)));',
 		],
 	) && allOk;
 
