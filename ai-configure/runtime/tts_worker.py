@@ -397,7 +397,12 @@ def main() -> None:
 				st["sid"] = eng.sid
 
 	def do_cloud_say(req: dict, cloud: dict) -> None:
-		"""豆包 TTS 2.0 双向流式：合成到 wav 缓存 → 复用现有播放状态机。"""
+		"""豆包 TTS 2.0（双向流式合成，整段一次连接）。
+
+		取舍：整段先合成完再开播 —— 没有句间空档（听起来是连续的），
+		代价是首音 = 合成耗时（实测 ~0.31x 实时，150 字约 2~4 秒）。
+		真流式播放（边收边播）要自己写增量播放器，留作后续优化。
+		"""
 		import doubao_ws
 
 		sents = split_sentences(str(req.get("text") or ""))
@@ -409,47 +414,87 @@ def main() -> None:
 		sr = int(cloud.get("sampleRate") or 24000)
 		rid = str(cloud.get("resourceId") or "seed-tts-2.0")
 		speed = cloud.get("speechRate")
+		CLOUD_DIR.mkdir(parents=True, exist_ok=True)
 
-		def make(sent: str) -> Path:
-			p = cloud_wav(sent, sent, speaker, sr, rid, speed)
-			if p.exists() and p.stat().st_size > 1000:
-				return p
-			tmp = CLOUD_DIR / (p.stem + ".part.wav")
-			doubao_ws.synth(key, sent, speaker, str(tmp), sr, rid, speed or 0)
-			tmp.replace(p)
-			return p
+		def target(sent: str) -> Path:
+			return cloud_wav(sent, sent, speaker, sr, rid, speed)
 
-		def wav_dur(p: Path) -> float:
+		def dur_of(p: Path) -> float:
 			with wave.open(str(p)) as w:
 				return w.getnframes() / w.getframerate()
 
+		def batch_of(texts):
+			"""返回 (jobs, tmp->final 映射)"""
+			jobs, mapping = [], {}
+			for sent in texts:
+				p = target(sent)
+				if p.exists() and p.stat().st_size > 1000:
+					continue
+				tmp = str(CLOUD_DIR / (p.stem + ".part.wav"))
+				jobs.append((sent, speaker, tmp, sr, speed or 0))
+				mapping[tmp] = p
+			return jobs, mapping
+
 		t0 = time.perf_counter()
-		first = make(sents[0])
-		d0 = wav_dur(first)
+		# 1) 只等第一句：立刻开播
+		jobs, mapping = batch_of([sents[0]])
+		if jobs:
+			doubao_ws.synth_many(key, [jobs[0]], rid)
+			tmp_p = Path(jobs[0][2])
+			if tmp_p.exists():
+				tmp_p.replace(mapping[jobs[0][2]])
+		first = target(sents[0])
+		if not (first.exists() and first.stat().st_size > 1000):
+			raise RuntimeError("豆包没有返回音频")
+		d0 = dur_of(first)
 		st["id"] = req.get("id")
 		st["total"] = d0
 		st["first_ms"] = (time.perf_counter() - t0) * 1000
-		play(first, blocking=False)
-		st["until"] = time.time() + d0
+		st["plan"] = []
 		rest = sents[1:]
 		st["pending"] = len(rest)
-		total_ref = st
+		play(first, blocking=False)
+		st["until"] = time.time() + d0
+		reply({"id": st["id"], "ok": True, "cloud": True,
+		       "first_ms": round(st["first_ms"]), "dur": round(d0, 2)})
 
-		def synth_rest() -> None:
-			for sent in rest:
-				try:
-					p = make(sent)
-					d = wav_dur(p)
-					total_ref["plan"].append((p, d))
-					total_ref["total"] += d
-				except Exception:
-					pass
-				finally:
-					total_ref["pending"] = max(0, total_ref["pending"] - 1)
-
-		reply({"id": st["id"], "ok": True, "cloud": True, "first_ms": round(st["first_ms"]), "dur": round(d0, 2)})
+		# 2) 其余句子：一条连接流水线合成，**每句就绪立刻入队**（边播边合，不留空档）
 		if rest:
-			threading.Thread(target=synth_rest, daemon=True).start()
+			ref = st
+
+			def pipeline() -> None:
+				jobs, mapping = batch_of(rest)
+				pending = {t for t in rest}
+				def on_done(path_str: str) -> None:
+					try:
+						p = Path(path_str)
+						final = mapping.get(path_str, p)
+						if p.exists() and final != p:
+							p.replace(final)
+						d = dur_of(final)
+						ref["plan"].append((final, d))
+						ref["total"] += d
+					except Exception:
+						pass
+					finally:
+						ref["pending"] = max(0, ref["pending"] - 1)
+				# 已缓存的先入队
+				for sent in rest:
+					p = target(sent)
+					if p.exists() and p.stat().st_size > 1000:
+						try:
+							ref["plan"].append((p, dur_of(p)))
+							ref["total"] += dur_of(p)
+						except Exception:
+							pass
+						ref["pending"] = max(0, ref["pending"] - 1)
+				if jobs:
+					try:
+						doubao_ws.synth_many(key, jobs, rid, on_done=on_done)
+					except Exception:
+						ref["pending"] = 0
+
+			threading.Thread(target=pipeline, daemon=True).start()
 
 	def start_next() -> None:
 		"""推进播放状态机：播下一句 / 收尾。"""

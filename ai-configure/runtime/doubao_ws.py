@@ -249,3 +249,90 @@ def synth(api_key, text, speaker, out_path, sample_rate=24000, resource_id="seed
             pass
 
 
+def synth_many(api_key, jobs, resource_id="seed-tts-2.0", log=None, on_done=None):
+    """一条连接合成多句（省掉每句重新握手的 1~2 秒）。
+
+    jobs: [(text, speaker, out_path, sample_rate, speech_rate), ...]
+    """
+    sock, rest = ws_connect(api_key, resource_id)
+    sock.settimeout(30)
+    rd = Reader(sock, rest)
+    out = []
+    try:
+        ws_send(sock, pack(MSG_FULL_CLIENT, EV["StartConnection"], b"{}"))
+        deadline = time.time() + 25
+        while True:
+            if time.time() > deadline:
+                raise RuntimeError("连豆包超时")
+            op, d = rd.frame()
+            if op == 0x9:
+                ws_send(sock, d, opcode=0xA)
+                continue
+            if op != 0x2:
+                continue
+            _, ev, _, _ = unpack(d)
+            if ev == EV["ConnectionStarted"]:
+                break
+            if ev == EV["ConnectionFailed"]:
+                raise RuntimeError("建连失败")
+
+        for text, speaker, out_path, sample_rate, speech_rate in jobs:
+            sid = str(uuid.uuid4())
+            body = json.dumps({
+                "event": EV["StartSession"],
+                "req_params": {"speaker": speaker,
+                               "audio_params": {"format": "pcm", "sample_rate": sample_rate,
+                                                "speech_rate": speech_rate or 0}},
+            }).encode()
+            ws_send(sock, pack(MSG_FULL_CLIENT, EV["StartSession"], body, session_id=sid))
+            while True:
+                op, d = rd.frame()
+                if op == 0x9:
+                    ws_send(sock, d, opcode=0xA)
+                    continue
+                if op != 0x2:
+                    continue
+                _, ev, _, _ = unpack(d)
+                if ev == EV["SessionStarted"]:
+                    break
+                if ev in (EV["SessionFailed"], EV["ConnectionFailed"]):
+                    raise RuntimeError("会话启动失败")
+
+            t0 = time.time()
+            body = json.dumps({"event": EV["TaskRequest"], "req_params": {"text": text}}).encode()
+            ws_send(sock, pack(MSG_FULL_CLIENT, EV["TaskRequest"], body, session_id=sid))
+            ws_send(sock, pack(MSG_FULL_CLIENT, EV["FinishSession"], b"{}", session_id=sid))
+
+            pcm = bytearray()
+            while True:
+                op, d = rd.frame()
+                if op == 0x9:
+                    ws_send(sock, d, opcode=0xA)
+                    continue
+                if op != 0x2:
+                    continue
+                t, ev, seq, payload = unpack(d)
+                if t == MSG_AUDIO_ONLY:
+                    pcm += payload
+                elif ev in (EV["SessionFinished"], EV["SessionFailed"], EV["SessionCanceled"]):
+                    break
+            with wave.open(out_path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes(bytes(pcm))
+            if log:
+                log(f"  句 {len(text)} 字 → {len(pcm)/2/sample_rate:.1f}s 音频，用时 {time.time()-t0:.2f}s")
+            out.append(out_path)
+            if on_done:
+                on_done(out_path)   # 每合成好一句就通知调用方，边播边合，不留空档
+        return out
+    finally:
+        try:
+            ws_send(sock, pack(MSG_FULL_CLIENT, EV["FinishConnection"], b"{}"))
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
