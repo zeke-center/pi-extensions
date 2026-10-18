@@ -401,6 +401,46 @@ function textOf(m: any): string {
 // ======================= 手机能执行的**白名单**命令 =======================
 
 /** 一条白名单命令（写在 `telegram.phoneCommands` 里） */
+/**
+ * 给语音模块用：把一段音频当**语音条**发到已绑定的手机（失败静默，绝不影响播报）。
+ *
+ * - Telegram 的 voice 只收 OGG/OPUS；传 wav 会被拒
+ * - 所以调用方要么给 ogg，要么走 sendDocument（wav 也能在客户端直接播）
+ * - 返回成功发出的会话数
+ */
+export async function sendVoiceToPhone(
+	filePath: string,
+	opts: { caption?: string; asDocument?: boolean } = {},
+): Promise<number> {
+	const token = cfg().token;
+	const chats = cfg().chats ?? [];
+	if (!token || !chats.length) return 0;
+	let { readFile } = await import("node:fs/promises");
+	let data: Buffer;
+	try {
+		data = await readFile(filePath);
+	} catch {
+		return 0;
+	}
+	const isOgg = /\.ogg$/i.test(filePath);
+	const method = opts.asDocument || !isOgg ? "sendDocument" : "sendVoice";
+	const field = opts.asDocument || !isOgg ? "document" : "voice";
+	let ok = 0;
+	for (const c of chats) {
+		try {
+			const form = new FormData();
+			form.append("chat_id", String(c.chatId));
+			if (opts.caption) form.append("caption", opts.caption.slice(0, 900));
+			form.append(field, new Blob([data]), filePath.split(/[\/]/).pop() || "voice.ogg");
+			const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: "POST", body: form });
+			if (res.ok) ok += 1;
+		} catch {
+			/* 静默 */
+		}
+	}
+	return ok;
+}
+
 export type PhoneCmd = {
 	/** 手机上敲的名字（`/run <name>`） */
 	name: string;
@@ -1550,7 +1590,7 @@ async function doDrop(): Promise<void> {
 }
 
 /** 插件版本：优先读**自己旁边**的 package.json（真值），读不到就退回下面这个手写常量 */
-const PLUGIN_VER_FALLBACK = "1.30.0";
+const PLUGIN_VER_FALLBACK = "1.31.0";
 
 /**
  * `/status` 里会显示它 —— 用途很具体：**一眼确认"我到底 reload 上了没"**。

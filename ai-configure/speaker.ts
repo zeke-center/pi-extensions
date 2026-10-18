@@ -22,6 +22,8 @@ export interface SpeakerOpts {
 	agentDir: string;
 	router: TtsRouter;
 	enabled: () => boolean;
+	/** 一条播报播完后回调（用于把结论生成语音条发回手机；实现方需自行 try/catch） */
+	onSpoken?: (u: { kind: string; text: string }) => void;
 	log?: (msg: string) => void;
 }
 
@@ -133,6 +135,11 @@ export class Speaker {
 					this.opts.log?.(`播报失败：${e instanceof Error ? e.message : String(e)}`);
 				}
 				next.endedAt = Date.now();
+				try {
+					if (next.status === "done") this.opts.onSpoken?.({ kind: next.kind, text: next.text });
+				} catch {
+					/* 回调失败不影响播报 */
+				}
 				this.log({
 					event: next.status,
 					kind: next.kind,

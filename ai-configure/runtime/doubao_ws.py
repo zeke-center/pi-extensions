@@ -380,7 +380,7 @@ class CloudConn:
             self.dead = False
         return self
 
-    def synth(self, text, speaker, out_path, sample_rate=24000, speech_rate=0, tone=None):
+    def synth(self, text, speaker, out_path, sample_rate=24000, speech_rate=0, tone=None, fmt="pcm"):
         """合成一句到 wav。失败时把连接标记为坏、下次重连。"""
         self.ensure()
         sid = str(uuid.uuid4())
@@ -388,7 +388,7 @@ class CloudConn:
             body = json.dumps({
                 "event": EV["StartSession"],
                 "req_params": {"speaker": speaker,
-                               "audio_params": {"format": "pcm", "sample_rate": sample_rate,
+                               "audio_params": {"format": fmt, "sample_rate": sample_rate,
                                                 "speech_rate": speech_rate or 0}},
             }).encode()
             ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["StartSession"], body, session_id=sid))
@@ -431,11 +431,15 @@ class CloudConn:
                     break
             if not pcm:
                 raise RuntimeError("豆包没有返回音频")
-            with wave.open(out_path, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(sample_rate)
-                w.writeframes(bytes(pcm))
+            if fmt == "pcm":
+                with wave.open(out_path, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(sample_rate)
+                    w.writeframes(bytes(pcm))
+            else:
+                with open(out_path, "wb") as f:   # ogg_opus / mp3：原始字节直接落盘
+                    f.write(bytes(pcm))
             return {"path": out_path, "words": words}
         except Exception:
             self.dead = True

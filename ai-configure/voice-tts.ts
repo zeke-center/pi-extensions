@@ -37,6 +37,8 @@ interface Cfg {
 	voiceTone?: "off" | "auto";
 	/** 豆包单价：元/万字符（用于状态栏估算） */
 	voicePrice?: number;
+	/** 把每轮结论的口播生成语音条发回手机（Telegram） */
+	voiceSendPhone?: boolean;
 	voiceLevel?: SpeechLevel;
 	voiceTtsVoice?: string;
 	voiceTtsRate?: number;
@@ -112,6 +114,39 @@ function settingsOf(c: Cfg = readCfg()) {
 	};
 }
 
+/** 把这段口播合成语音条发回手机（豆包 ogg_opus；没有豆包就发 wav 文件） */
+async function sendPhoneVoice(text: string): Promise<void> {
+	try {
+		const c = readCfg();
+		if (!c.voiceSendPhone) return;
+		const key = String(c.voiceDoubaoKey ?? "").trim();
+		const speaker = String(c.voiceDoubaoVoice ?? "").trim();
+		if (key && speaker) {
+			const cli = await router?.rawClient();
+			if (!cli) return;
+			const { msg } = await (cli as any).requestWithId({
+				cmd: "cloud_file",
+				text,
+				format: "ogg_opus",
+				cloud: {
+					key,
+					speaker,
+					sampleRate: 48000,
+					resourceId: process.env.DOUBAO_TTS_RESOURCE || "seed-tts-2.0",
+					tone: c.voiceTone === "auto" ? "请用沉稳、清晰的语气，像向同事当面汇报工作。" : undefined,
+				},
+			});
+			if (msg?.ok && msg.file) {
+				const { sendVoiceToPhone } = await import("./remote");
+				const n = await sendVoiceToPhone(msg.file, { caption: text.slice(0, 200) });
+				if (n) refreshUsage();
+			}
+		}
+	} catch {
+		/* 发不出去就算了，绝不打扰主流程 */
+	}
+}
+
 function ensureSpeech(): { router: TtsRouter; speaker: Speaker } | null {
 	if (!agentDir) return null;
 	if (!router) router = new TtsRouter(agentDir, settingsOf(), () => {});
@@ -120,6 +155,11 @@ function ensureSpeech(): { router: TtsRouter; speaker: Speaker } | null {
 			agentDir,
 			router,
 			enabled: () => readCfg().voiceTts === true,
+			// 结论播完 → optional 语音条回手机（fire-and-forget，失败静默）
+			onSpoken: (u) => {
+				if (u.kind !== "result") return;
+				void sendPhoneVoice(u.text).catch(() => {});
+			},
 		});
 	}
 	return { router, speaker };
@@ -301,6 +341,16 @@ function speechSettings(): SettingDef[] {
 			def: true,
 			get: () => readCfg().voiceAck ?? true,
 			set: (v) => patchCfg({ voiceAck: v }),
+		},
+		{
+			key: "voiceSendPhone",
+			group: GROUP,
+			label: "口播发回手机",
+			desc: "每轮结论播完后，再把这段口播合成一条语音条发到已绑定的手机（Telegram）。代价：这一句会**再合成一次**（约 +0.02 元/轮），Telegram 传文件本身免费。",
+			kind: "bool",
+			def: false,
+			get: () => readCfg().voiceSendPhone ?? false,
+			set: (v) => patchCfg({ voiceSendPhone: v }),
 		},
 		{
 			key: "voicePrice",

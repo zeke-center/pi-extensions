@@ -654,6 +654,25 @@ def main() -> None:
 
 				if rest:
 					threading.Thread(target=synth_rest, daemon=True).start()
+			elif cmd == "cloud_file":
+				# 给"发回手机"用：整段合成一个 ogg_opus 语音条
+				cl = req.get("cloud") or {}
+				if not (cl.get("key") and cl.get("speaker")):
+					reply({"id": req.get("id"), "ok": False, "error": "no cloud config"})
+					continue
+				import doubao_ws
+				text = str(req.get("text") or "")
+				fmt = str(req.get("format") or "ogg_opus")
+				sr = int(req.get("sampleRate") or (48000 if fmt == "ogg_opus" else 24000))
+				out = CLOUD_DIR / ("voice-" + hashlib.sha1((text + str(time.time())).encode()).hexdigest()[:12] + "." + ("ogg" if fmt == "ogg_opus" else fmt))
+				CLOUD_DIR.mkdir(parents=True, exist_ok=True)
+				conn = doubao_ws.get_conn(str(cl["key"]), str(cl.get("resourceId") or "seed-tts-2.0"))
+				r = conn.synth(text, str(cl["speaker"]), str(out), sr, cl.get("speechRate") or 0, cl.get("tone") or "", fmt)
+				try:
+					record_usage(int((r or {}).get("words") or 0))
+				except Exception:
+					pass
+				reply({"id": req.get("id"), "ok": True, "file": str(out), "bytes": out.stat().st_size})
 			elif cmd == "warmup":
 				# 预热豆包连接：握手一次（3~4 秒），之后首句几乎不用等
 				cl = req.get("cloud") or {}
