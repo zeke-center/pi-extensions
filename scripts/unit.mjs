@@ -216,7 +216,10 @@ let allOk = true;
 bundle("board.ts", "board.mjs");
 allOk =
 	runSuite("board：MCP 栏表头与连接标记", join(tmp, "board.mjs"), [
-		'ok("表头：没全连上时补 ●n", JSON.stringify(mcpHeaderParts(7, 2)) === JSON.stringify([" MCP 7", " ●2"]));',
+					'ok("看板费用：价格默认值 2/8/0.5", (() => { const p = price(); return p.in === 2 && p.out === 8 && p.cache === 0.5; })());',
+			'ok("看板费用：100万入+10万出+5000万缓存 = 2+0.8+25 元", (() => { const c = costOf(1_000_000, 100_000, 50_000_000); return Math.abs(c - 27.8) < 0.001; })());',
+			'ok("看板费用：小额显示 ¥<0.01", fmtCost(0.001) === "¥<0.01");',
+			'ok("表头：没全连上时补 ●n", JSON.stringify(mcpHeaderParts(7, 2)) === JSON.stringify([" MCP 7", " ●2"]));',
 		'ok("表头：全连上就不补", JSON.stringify(mcpHeaderParts(3, 3)) === JSON.stringify([" MCP 3", ""]));',
 		'ok("表头：0 个也不补", JSON.stringify(mcpHeaderParts(0, 0)) === JSON.stringify([" MCP 0", ""]));',
 		'ok("表头：一个都没连上 → ●0", JSON.stringify(mcpHeaderParts(4, 0)) === JSON.stringify([" MCP 4", " ●0"]));',

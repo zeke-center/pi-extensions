@@ -22,9 +22,9 @@ import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
-import { guardCtx } from "./shared";
 import { cardNotify } from "./notify";
 import { registerSettings } from "./settings";
+import { guardCtx, readExtCfg, patchExtCfg } from "./shared";
 import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk, setAskOutcome } from "./shared";
 
 const WIDGET_KEY = "task-board";
@@ -119,6 +119,60 @@ let charsPerToken = 2.0; // 字符→token 比值（中文约 2；首次响应�
 
 // 会话累计 token（与 pi footer 同源：遍历 session entries，缓存避免每 300ms 重算）
 let sessTok = { input: 0, output: 0, cacheRead: 0 };
+
+/** 单价（元/百万 token）—— 只用于看板估算，改这里或面板都能生效 */
+const PRICE_DEFAULT = { in: 2.0, out: 8.0, cache: 0.5 };
+function price(): { in: number; out: number; cache: number } {
+	try {
+		const c = readExtCfg();
+		const n = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : d);
+		return {
+			in: n(c.boardPriceIn, PRICE_DEFAULT.in),
+			out: n(c.boardPriceOut, PRICE_DEFAULT.out),
+			cache: n(c.boardPriceCache, PRICE_DEFAULT.cache),
+		};
+	} catch {
+		return { ...PRICE_DEFAULT };
+	}
+}
+
+// ---- 语音（豆包 TTS）用量：字数 + 估算花费 ----
+let voiceCache = { at: 0, words: 0, cached: 0, local: 0, calls: 0 };
+function voiceUsage(): typeof voiceCache {
+	if (Date.now() - voiceCache.at < 2000) return voiceCache;
+	let words = 0;
+	let cached = 0;
+	let local = 0;
+	let calls = 0;
+	try {
+		const f = join(getAgentDir(), "narration", "usage.json");
+		const all = JSON.parse(readFileSync(f, "utf8") || "{}") as Record<string, any>;
+		const d = new Date();
+		const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+		const v = all[k] || {};
+		words = Number(v.words ?? 0);
+		cached = Number(v.cached ?? 0);
+		local = Number(v.local ?? 0);
+		calls = Number(v.calls ?? 0);
+	} catch {
+		/* 没播过就没有 */
+	}
+	voiceCache = { at: Date.now(), words, cached, local, calls };
+	return voiceCache;
+}
+
+/** token 用量 → 估算花费（元） */
+function costOf(input: number, output: number, cacheRead: number): number {
+	const p = price();
+	return (input / 1e6) * p.in + (output / 1e6) * p.out + (cacheRead / 1e6) * p.cache;
+}
+
+function fmtCost(yuan: number): string {
+	if (!yuan) return "";
+	if (yuan < 0.01) return "¥<0.01";
+	if (yuan < 10) return `¥${yuan.toFixed(2)}`;
+	return `¥${yuan.toFixed(1)}`;
+}
 
 // 子代理用量 —— delegate 的返回值【不含用量】，子代理的消耗记在它自己的会话文件里，
 // 主会话 footer / getSessionStats 都看不到。想算全局账只能自己扫 assistant-sessions/。
@@ -410,7 +464,8 @@ function midLines(theme: Theme): string[] {
 			` ${t.fg("muted", "本轮")} ${t.fg("text", fmtDur(turnMs()))}` +
 				t.fg("text", ` ↑${fmtTok(runTokIn)}`) +
 				t.fg("accent", ` ↓${fmtTok(runTokOut)}`) +
-				t.fg("dim", ` R${fmtTok(runTokCache)}`),
+				t.fg("dim", ` R${fmtTok(runTokCache)}`) +
+				t.fg("muted", ` ${fmtCost(costOf(runTokIn, runTokOut, runTokCache))}`),
 		);
 	}
 
@@ -419,8 +474,23 @@ function midLines(theme: Theme): string[] {
 		` ${t.fg("muted", "会话")} ${t.fg("text", fmtDur(sessionActiveMs()))}` +
 			t.fg("text", ` ↑${fmtTok(sessTok.input)}`) +
 			t.fg("accent", ` ↓${fmtTok(sessTok.output)}`) +
-			t.fg("dim", ` R${fmtTok(sessTok.cacheRead)}`),
+			t.fg("dim", ` R${fmtTok(sessTok.cacheRead)}`) +
+			t.fg("muted", ` ${fmtCost(costOf(sessTok.input, sessTok.output, sessTok.cacheRead))}`),
 	);
+
+	// ── 语音（豆包 TTS：按字符计费，不是 token）──
+	{
+		const v = voiceUsage();
+		const price = (readExtCfg().voicePrice as number) ?? 1.0;
+		const yuan = (v.words / 10000) * price;
+		if (v.words || v.local || v.cached) {
+			const bits = [` ${t.fg("muted", "语音")}`];
+			if (v.words) bits.push(t.fg("text", `${fmtTok(v.words)}字`), t.fg("accent", fmtCost(yuan)));
+			if (v.local) bits.push(t.fg("dim", ` 本地${fmtTok(v.local)}字`));
+			if (v.cached) bits.push(t.fg("dim", ` 免单${fmtTok(v.cached)}`));
+			out.push(bits.join(""));
+		}
+	}
 
 	// ── 子代理（delegate 的账，主会话看不到，得自己扫）──
 	if (subTok.sessions > 0) {
@@ -957,6 +1027,42 @@ export function boardSnapshot(): {
 /** 注册到 /aihelp 配置面板（会话级项：重启 pi 就复位） */
 function registerBoardSettings(): void {
 	registerSettings([
+		{
+			key: "boardPriceIn",
+			group: "配置项（落盘）",
+			label: "输入单价（元/百万 token）",
+			desc: "用于看板估算花费，不影响实际计费。默认 2.0。",
+			kind: "number",
+			min: 0,
+			max: 1000,
+			def: PRICE_DEFAULT.in,
+			get: () => price().in,
+			set: (v) => patchExtCfg({ boardPriceIn: Number(v) || 0 }),
+		},
+		{
+			key: "boardPriceOut",
+			group: "配置项（落盘）",
+			label: "输出单价（元/百万 token）",
+			desc: "输出单价，默认 8.0 元/百万 token。",
+			kind: "number",
+			min: 0,
+			max: 1000,
+			def: PRICE_DEFAULT.out,
+			get: () => price().out,
+			set: (v) => patchExtCfg({ boardPriceOut: Number(v) || 0 }),
+		},
+		{
+			key: "boardPriceCache",
+			group: "配置项（落盘）",
+			label: "缓存读单价（元/百万 token）",
+			desc: "默认 0.5。你的缓存读占比很大，这项影响最明显。",
+			kind: "number",
+			min: 0,
+			max: 1000,
+			def: PRICE_DEFAULT.cache,
+			get: () => price().cache,
+			set: (v) => patchExtCfg({ boardPriceCache: Number(v) || 0 }),
+		},
 		{
 			key: "boardOff",
 			group: "会话级（重启复位）",

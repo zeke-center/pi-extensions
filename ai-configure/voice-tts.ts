@@ -17,6 +17,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isExtDisabled, onGateApply } from "./gate";
+import { isRemoteTurn } from "./remote";
 import { registerSettings, type SettingDef } from "./settings";
 import { onPlanAskChange } from "./shared";
 import { Speaker } from "./speaker";
@@ -39,6 +40,8 @@ interface Cfg {
 	voicePrice?: number;
 	/** 把每轮结论的口播生成语音条发回手机（Telegram） */
 	voiceSendPhone?: boolean;
+	/** 播报去处：auto=按来源设备自动 / both=电脑+手机 / pc=只电脑 / phone=只手机 */
+	voiceRoute?: "auto" | "both" | "pc" | "phone";
 	voiceLevel?: SpeechLevel;
 	voiceTtsVoice?: string;
 	voiceTtsRate?: number;
@@ -114,6 +117,24 @@ function settingsOf(c: Cfg = readCfg()) {
 	};
 }
 
+/** 要不要在电脑上念（auto 时按"这一轮是不是手机发起的"判断） */
+function playLocally(): boolean {
+	const r = (readCfg().voiceRoute ?? "auto") as "auto" | "both" | "pc" | "phone";
+	if (r === "pc" || r === "both") return true;
+	if (r === "phone") return false;
+	return !isRemoteTurn();
+}
+
+/** 要不要把这条发到手机（auto 时手机发起才发；both 恒发；phone 恒发） */
+function sendToPhone(): boolean {
+	const c = readCfg();
+	const r = (c.voiceRoute ?? "auto") as "auto" | "both" | "pc" | "phone";
+	if (r === "pc") return false;
+	if (r === "both" || r === "phone") return true;
+	if (!c.voiceSendPhone) return false; // auto 下还要用户显式开"发回手机"
+	return isRemoteTurn();
+}
+
 /** 把这段口播合成语音条发回手机（豆包 ogg_opus；没有豆包就发 wav 文件） */
 async function sendPhoneVoice(text: string): Promise<void> {
 	try {
@@ -155,11 +176,7 @@ function ensureSpeech(): { router: TtsRouter; speaker: Speaker } | null {
 			agentDir,
 			router,
 			enabled: () => readCfg().voiceTts === true,
-			// 结论播完 → optional 语音条回手机（fire-and-forget，失败静默）
-			onSpoken: (u) => {
-				if (u.kind !== "result") return;
-				void sendPhoneVoice(u.text).catch(() => {});
-			},
+
 		});
 	}
 	return { router, speaker };
@@ -201,7 +218,9 @@ function speakResult(): void {
 		{ kind: "result", full: lastAssistantText, text: firstSentence(lastAssistantText), ref: "turn" },
 		{ level: (c.voiceLevel ?? "brief") as SpeechLevel, terms: (c.voiceTerms ?? "en") as TermMode, toneMode: (c.voiceTone ?? "off") as "off" | "auto" },
 	);
-	if (u) s.speaker.say(u);
+	if (!u) return;
+	if (playLocally()) s.speaker.say(u);
+	if (sendToPhone()) void sendPhoneVoice(u.text).catch(() => {});
 }
 
 // --------------------------------------------------------------------------- #
@@ -341,6 +360,20 @@ function speechSettings(): SettingDef[] {
 			def: true,
 			get: () => readCfg().voiceAck ?? true,
 			set: (v) => patchCfg({ voiceAck: v }),
+		},
+		{
+			key: "voiceRoute",
+			group: GROUP,
+			label: "播报去哪儿",
+			desc:
+				"auto = 你在手机上发消息就只发回手机（电脑不念），在电脑前就直接念（默认）；" +
+				"both = 两边都出；pc = 只念电脑；phone = 只发手机。",
+			kind: "enum",
+			options: ["auto", "both", "pc", "phone"],
+			values: ["auto", "both", "pc", "phone"],
+			def: "auto",
+			get: () => (readCfg().voiceRoute ?? "auto") as "auto" | "both" | "pc" | "phone",
+			set: (v) => patchCfg({ voiceRoute: v as "auto" | "both" | "pc" | "phone" }),
 		},
 		{
 			key: "voiceSendPhone",
@@ -675,6 +708,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			lastStepAt = now;
 			stepsThisTurn += 1;
 			if (mine) lastStepText = mine;
+			if (!playLocally()) return;
 			const sp = ensureSpeech();
 			if (sp) sp.speaker.say(u);
 		} catch {
@@ -691,7 +725,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			{ kind: "progress", text: "还在跑，大概还要一会儿。", ref: "tool" },
 			{ level: "brief", terms: (readCfg().voiceTerms ?? "en") as TermMode, toneMode: (readCfg().voiceTone ?? "off") as "off" | "auto" },
 		);
-		if (s && u) s.speaker.say(u);
+		if (s && u && playLocally()) s.speaker.say(u);
 	});
 
 	// 计划确认 → 播"要你拍板"（不打断正在念的结论）
@@ -702,7 +736,9 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			{ kind: "ask", question: `计划准备好了：${ask.title}`, ref: "plan" },
 			{ level: "brief", terms: (readCfg().voiceTerms ?? "en") as TermMode, toneMode: (readCfg().voiceTone ?? "off") as "off" | "auto" },
 		);
-		if (s && u) s.speaker.say(u);
+		if (!u) return;
+		if (playLocally() && s) s.speaker.say(u);
+		if (sendToPhone()) void sendPhoneVoice(u.text).catch(() => {});
 	});
 
 	// 会话结束/插件停用 → 一定要释放 worker（不留孤儿进程）

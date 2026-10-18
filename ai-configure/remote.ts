@@ -606,8 +606,21 @@ let pendingAmbiguous: { chatId: number; who: string; text: string; mid?: number;
 let ambiguousWho = "";
 
 /** 投递给 pi 的入口（手机消息正文、审计条目、来源前缀都在这里，只此一处） */
+/** 最近一次"从手机发进来的消息"的时间戳（给语音路由用：在手机端就别在电脑上念） */
+let lastRemoteMsgAt = 0;
+
+export function markRemoteMessage(): void {
+	lastRemoteMsgAt = Date.now();
+}
+
+/** 这一轮是不是来自手机（默认看最近 3 分钟，够覆盖一轮长任务） */
+export function isRemoteTurn(windowMs = 180_000): boolean {
+	return Date.now() - lastRemoteMsgAt < windowMs;
+}
+
 async function deliverToPi(chatId: number, who: string, text: string): Promise<void> {
 	if (!isOn) return;
+	markRemoteMessage();
 	typing(chatId);
 	// 记一条**审计条目**：落盘、可回顾，不进模型上下文 —— 不再只是 UI 上闪一行
 	try {
@@ -1590,7 +1603,7 @@ async function doDrop(): Promise<void> {
 }
 
 /** 插件版本：优先读**自己旁边**的 package.json（真值），读不到就退回下面这个手写常量 */
-const PLUGIN_VER_FALLBACK = "1.31.0";
+const PLUGIN_VER_FALLBACK = "1.32.0";
 
 /**
  * `/status` 里会显示它 —— 用途很具体：**一眼确认"我到底 reload 上了没"**。

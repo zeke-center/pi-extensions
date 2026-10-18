@@ -149,9 +149,28 @@ def unpack(data: bytes):
     off += idlen
     seq = None
     if msg_type == MSG_AUDIO_ONLY:
-        seq = int.from_bytes(data[off:off + 4], "big")
-        off += 4
-    size = int.from_bytes(data[off:off + 4], "big")
+        # 音频帧里 seq 字段的位置各家版本不一致（有/没有、在 id 前或在 id 后）。
+        # 用**长度自校验**定位：谁能让 size == 剩余字节数，谁就是对的。
+        # （之前固定按"id 后跟 seq"解析，导致每帧前 4 字节被吃掉——
+        #   pcm 只是开头几毫秒的杂音，ogg/mp3 却是容器头被毁 → 手机上播放没声音）
+        cand = []
+        for skip_seq in (4, 0, 8):
+            o = off + skip_seq
+            if o + 4 > len(data):
+                continue
+            n = int.from_bytes(data[o:o + 4], "big")
+            if o + 4 + n == len(data):
+                cand.append((skip_seq, n))
+        if cand:
+            skip, size = cand[0]
+            seq = int.from_bytes(data[off:off + 4], "big") if skip else None
+            off += skip
+        else:
+            size = int.from_bytes(data[off + 4:off + 8], "big")
+            seq = int.from_bytes(data[off:off + 4], "big")
+            off += 4
+    else:
+        size = int.from_bytes(data[off:off + 4], "big")
     off += 4
     payload = data[off:off + size]
     if (b2 & 0x0F) == 1:
