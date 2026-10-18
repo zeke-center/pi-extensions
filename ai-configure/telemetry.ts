@@ -35,6 +35,8 @@ export const PRIVACY_NOTICE = [
 ].join("\n");
 
 const DEFAULT_ENDPOINT = "https://api.zeke0419.top";
+/** 默认读哪个环境变量；找不到再依次回退（见 envKey()） */
+const DEFAULT_KEY_ENV = "PI_TELEMETRY_KEY";
 const QUEUE_FILE = () => join(getAgentDir(), "telemetry-queue.jsonl");
 const MAX_QUEUE = 2000;
 const BATCH = 20;
@@ -63,6 +65,7 @@ interface TeleEvent {
 let upload = false;
 let level: Level = "meta";
 let apiKey = "";
+let keyEnvName = DEFAULT_KEY_ENV;
 let endpoint = DEFAULT_ENDPOINT;
 let consentVersion = 0;
 let consentAt = "";
@@ -88,7 +91,24 @@ let sessErrors = 0;
 // ======================= 工具函数 =======================
 
 function enabled(): boolean {
-	return upload && apiKey.length > 0;
+	return upload && currentKey().value.length > 0;
+}
+
+/** 从环境变量取密钥。返回命中的变量名，方便在 /telemetry 里显示来源。 */
+function envKey(): { value: string; source: string } {
+	const names = [keyEnvName, DEFAULT_KEY_ENV, "CENTER_MASTER_KEY", "MASTER_KEY"].filter(Boolean);
+	for (const n of names) {
+		const v = (process.env[n] ?? "").trim();
+		if (v) return { value: v, source: `env:${n}` };
+	}
+	return { value: "", source: "" };
+}
+
+/** 密钥优先级：环境变量 > ai-extensions.json。 */
+function currentKey(): { value: string; source: string } {
+	const e = envKey();
+	if (e.value) return e;
+	return apiKey ? { value: apiKey, source: "file" } : { value: "", source: "none" };
 }
 
 function notify(text: string, type: "info" | "warning" | "error" = "info"): void {
@@ -110,7 +130,8 @@ export function redact(text: string): string {
 		/\b(?:MASTER_KEY|SECRET_KEY|X-Brain-Token|api[_-]?key|apikey|secret|password|passwd|access[_-]?token|auth[_-]?token)\b\s*[:=]\s*["']?[A-Za-z0-9._\-]{8,}/gi,
 	];
 	for (const re of patterns) out = out.replace(re, (m) => (m.includes("=") || m.includes(":") ? `${m.split(/[:=]/)[0]}=[redacted]` : "[redacted]"));
-	if (apiKey && apiKey.length >= 8) out = out.split(apiKey).join("[redacted]");
+	const k = currentKey().value;
+	if (k && k.length >= 8) out = out.split(k).join("[redacted]");
 	return out;
 }
 
@@ -242,6 +263,7 @@ export async function flush(): Promise<void> {
 	try {
 		while (queue.length > 0 && enabled()) {
 			const batch = queue.slice(0, MAX_BATCH);
+			const sendKey = currentKey().value;
 			const body = JSON.stringify({ schema: 1, install: installPayload(), events: batch });
 			const size = Buffer.byteLength(body);
 			if (bytesToday + size > DAILY_BUDGET) {
@@ -255,7 +277,7 @@ export async function flush(): Promise<void> {
 			try {
 				res = await fetch(url, {
 					method: "POST",
-					headers: { "content-type": "application/json", "X-Brain-Token": apiKey },
+					headers: { "content-type": "application/json", "X-Brain-Token": sendKey },
 					body,
 				});
 			} catch {
@@ -312,6 +334,7 @@ function loadConfig(): void {
 	const cfg = readExtCfg();
 	upload = cfg.telemetryUpload === true;
 	apiKey = typeof cfg.telemetryKey === "string" ? cfg.telemetryKey : "";
+	keyEnvName = typeof cfg.telemetryKeyEnv === "string" && cfg.telemetryKeyEnv ? cfg.telemetryKeyEnv : DEFAULT_KEY_ENV;
 	endpoint = typeof cfg.telemetryEndpoint === "string" && cfg.telemetryEndpoint ? cfg.telemetryEndpoint : DEFAULT_ENDPOINT;
 	level = cfg.telemetryLevel === "full" ? "full" : "meta";
 	consentVersion = typeof cfg.telemetryConsentVersion === "number" ? cfg.telemetryConsentVersion : 0;
@@ -322,8 +345,8 @@ function loadConfig(): void {
 /** 真正开启：先确认，再落配置。返回是否开启成功。 */
 async function enableWithConsent(): Promise<boolean> {
 	ensureInstall();
-	if (!apiKey) {
-		notify("请先在「数据与隐私 → 埋点密钥」里填后端密钥，再打开上传", "warning");
+	if (!currentKey().value) {
+		notify("请先填「埋点密钥」或设置环境变量 " + keyEnvName + "，再打开上传", "warning");
 		return false;
 	}
 	let ok = true;
@@ -382,15 +405,31 @@ function registerTelemetrySettings(): void {
 			key: "telemetryKey",
 			group: "数据与隐私",
 			label: "埋点密钥",
-			desc: "后端 MASTER_KEY（请求头 X-Brain-Token）。留空 = 永远不上传，开关也打不开。",
+			desc: "后端 MASTER_KEY（请求头 X-Brain-Token）。**环境变量优先于这里**（默认看 PI_TELEMETRY_KEY，再回退 CENTER_MASTER_KEY / MASTER_KEY）。留空且没环境变量 = 永远不上传。",
 			kind: "text",
 			def: "",
 			get: () => apiKey,
 			set: (v) => {
 				apiKey = String(v).trim();
 				patchExtCfg({ telemetryKey: apiKey });
-				if (upload && !apiKey) {
+				if (upload && !currentKey().value) {
 					disable("key_cleared");
+				}
+			},
+		},
+		{
+			key: "telemetryKeyEnv",
+			group: "数据与隐私",
+			label: "密钥环境变量名",
+			desc: "优先从这个环境变量读密钥（默认 PI_TELEMETRY_KEY）；读不到再试 CENTER_MASTER_KEY、MASTER_KEY，最后才用上面的“埋点密钥”。",
+			kind: "text",
+			def: DEFAULT_KEY_ENV,
+			get: () => keyEnvName,
+			set: (v) => {
+				keyEnvName = String(v).trim() || DEFAULT_KEY_ENV;
+				patchExtCfg({ telemetryKeyEnv: keyEnvName });
+				if (upload && !currentKey().value) {
+					disable("key_missing");
 				}
 			},
 		},
@@ -420,7 +459,7 @@ function registerTelemetrySettings(): void {
 			set: (v) => {
 				level = v === "full" ? "full" : "meta";
 				patchExtCfg({ telemetryLevel: level });
-				track("telemetry_state", { upload, level, key_set: !!apiKey, reason: "level_changed" });
+				track("telemetry_state", { upload, level, key_set: !!currentKey().value, reason: "level_changed" });
 			},
 		},
 		{
@@ -546,7 +585,8 @@ export function setupTelemetry(api: ExtensionAPI): void {
 			}
 			ctx.ui.notify(
 				[
-					`埋点：${enabled() ? "开启" : "关闭"} · 粒度 ${level} · 密钥 ${apiKey ? "已填" : "未填"}`,
+					`埋点：${enabled() ? "开启" : "关闭"} · 粒度 ${level} · 密钥 ${currentKey().value ? `已填(${currentKey().source})` : "未填"}`,
+					`密钥环境变量：${keyEnvName}（再回退 CENTER_MASTER_KEY / MASTER_KEY）`,
 					`本地队列：${queue.length} 条 · 今日已传 ${(bytesToday / 1024).toFixed(1)} KB`,
 					`地址：${endpoint}`,
 					"用法：/telemetry on | off | flush",

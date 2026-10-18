@@ -1698,7 +1698,9 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 把「哪些功能真有人用、哪里慢、哪里老报错」记下来，用于迭代。
 
 - **默认关闭**：`telemetryUpload=false` 时不采集、不落盘、不联网。
-- **必须有密钥**：还要填 `telemetryKey`（后端 `MASTER_KEY`，请求头 `X-Brain-Token`），否则开关会自己回弹。
+- **必须有密钥**：后端 `MASTER_KEY`（请求头 `X-Brain-Token`），否则开关会自己回弹。
+  优先级：`PI_TELEMETRY_KEY` → `CENTER_MASTER_KEY` → `MASTER_KEY` 环境变量 → 配置里的 `telemetryKey`。
+  变量名可在设置里改；`/telemetry` 会显示密钥来源（`env:MASTER_KEY` / `file`），不打印值。
 - 首次开启弹确认框，逐条列出采集内容并声明**数据可能用于迭代本项目**；改声明版本会强制重新确认。
 - 命令：
 
