@@ -271,26 +271,64 @@ export function render(
 	return { ...base, kind: "result", prio: PRIO.result, tone: toneFor("result", null, toneMode), text, interrupt: true };
 }
 
-/** 兜底规则：按工具名 + 入参猜一句"我现在干什么"（≤20 字，播报用） */
+/**
+ * 过渡台词库（兜底：我没写 <step> 时按工具名猜一句）。
+ *
+ * 设计原则：
+ *  · 每类 3~5 句备选，**随机取且不连续重复**（同一句连着念两遍最出戏）
+ *  · 口语、≤12 字、不带文件名和英文缩写（念出来难听）
+ *  · 按"在干什么"分类，不按工具名分类（用户听不懂 bash/read）
+ */
+export const PHRASES: Record<string, string[]> = {
+	ack: ["收到，我看一下。", "好，我先看下情况。", "行，这就来。", "嗯，我先查一下。"],
+	read: ["我先翻一下代码。", "看下这块怎么写的。", "我读一下这个文件。", "先摸一下现有实现。"],
+	search: ["我搜一下相关代码。", "找找这个函数在哪用。", "先查查有没有现成的。"],
+	edit: ["我改一下这里。", "这段我来动。", "按你说的改。", "开始动手了。"],
+	test: ["跑一下测试。", "测一下看有没有问题。", "跑个测试确认下。", "先看测试过不过。"],
+	run: ["跑条命令看看。", "我执行一下看输出。", "先探一下环境。"],
+	install: ["装一下依赖，稍等。", "先补个包。"],
+	git: ["提交一下。", "推到两个仓库。", "打个标签收尾。"],
+	web: ["上网查一下。", "我查下文档。"],
+	delegate: ["派个助理去跑，我盯着。", "让助理并行查一下。", "这事交给助理，我看结果。"],
+	wait: ["还在跑，稍等。", "这个有点慢，再等等。", "快好了。"],
+	retry: ["咦，这里报错了，我看看。", "第一次没过，我调整下。", "有点问题，我换个思路。"],
+	verify: ["我再确认一下。", "最后跑一遍检查。"],
+};
+
+const lastPick: Record<string, string> = {};
+
+/** 同一池子里别连续抽到同一句 */
+function pick(kind: string): string {
+	const pool = PHRASES[kind] ?? PHRASES.run;
+	if (pool.length === 1) return pool[0];
+	let s = pool[Math.floor(Math.random() * pool.length)];
+	for (let i = 0; i < 6 && s === lastPick[kind]; i++) s = pool[Math.floor(Math.random() * pool.length)];
+	lastPick[kind] = s;
+	return s;
+}
+
 export function stepTextFor(tool: string, input: any): string {
 	const t = String(tool || "").toLowerCase();
 	const a = (input ?? {}) as Record<string, any>;
 	const cmd = String(a.command ?? a.cmd ?? "");
-	const file = String(a.path ?? a.file_path ?? a.file ?? a.filePath ?? "");
-	const base = file ? file.split(/[\/]/).pop() : "";
-	if (t === "delegate") return "派个助理去查，我继续盯着。";
+	if (t === "delegate") return pick("delegate");
 	if (t === "bash" || t === "shell" || t === "exec") {
-		if (/test|vitest|jest|pytest|smoke|unit/i.test(cmd)) return "跑一下测试，稍等。";
-		if (/git (push|commit|tag)/i.test(cmd)) return "提交并推送代码。";
-		if (/install|npm i|pip install/i.test(cmd)) return "装一下依赖。";
-		if (/curl|http/i.test(cmd)) return "查一下线上接口。";
-		return "跑一条命令看看。";
+		if (/test|vitest|jest|pytest|smoke|unit/i.test(cmd)) return pick("test");
+		if (/git (push|commit|tag)/i.test(cmd)) return pick("git");
+		if (/install|npm i|pip install/i.test(cmd)) return pick("install");
+		if (/curl|http/i.test(cmd)) return pick("web");
+		return pick("run");
 	}
-	if (t === "read" || t === "cat") return "看一下这段代码。";
-	if (t === "grep" || t === "rg" || t === "search") return "在代码里搜一下。";
-	if (t === "edit" || t === "write" || t === "patch") return "开始改代码。";
-	if (t === "web_search" || t === "webfetch" || t === "fetch") return "上网查一下资料。";
-	return "继续下一步。";
+	if (t === "read" || t === "cat") return pick("read");
+	if (t === "grep" || t === "rg" || t === "search") return pick("search");
+	if (t === "edit" || t === "write" || t === "patch") return pick("edit");
+	if (t === "web_search" || t === "webfetch" || t === "fetch") return pick("web");
+	return pick("run");
+}
+
+/** 非工具场景（占位/重试/收尾）也能取一句 */
+export function phraseFor(kind: string): string {
+	return pick(kind);
 }
 
 /**
