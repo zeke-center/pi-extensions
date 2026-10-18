@@ -158,6 +158,27 @@ def prune_cloud_cache(max_bytes: int = CLOUD_MAX_BYTES, max_age_days: int = CLOU
 USAGE_FILE = _agent_dir() / "narration" / "usage.json"
 
 
+def cloud_call(key: str, rid: str, fn):
+	"""豆包常驻连接空闲会被服务端关掉（报 RuntimeError: 连接关闭）。
+
+	所以调用失败时**作废这条连接、重建再试一次**——握手 3 秒，
+	总比整条语音条发不出去强。
+	"""
+	import doubao_ws
+	last = None
+	for attempt in range(2):
+		try:
+			return fn(doubao_ws.get_conn(key, rid))
+		except Exception as e:
+			last = e
+			doubao_ws.drop(key, rid)
+			if attempt == 0:
+				if log:
+					log(f"cloud 连接失效，重建重试：{type(e).__name__}: {e}")
+				time.sleep(0.2)
+	raise last
+
+
 def record_usage(words: int, cached: bool = False, chars: int = 0, local: bool = False) -> None:
 	"""记语音用量：豆包按字符计费，本地引擎 0 元但字数照样统计。
 
@@ -500,8 +521,6 @@ def main() -> None:
 		speed = cloud.get("speechRate")
 		tone = str(cloud.get("tone") or "")
 		CLOUD_DIR.mkdir(parents=True, exist_ok=True)
-		conn = doubao_ws.get_conn(key, rid)
-
 		def target(sent: str) -> Path:
 			return cloud_wav(sent, sent, speaker, sr, rid, speed, tone)
 
@@ -515,7 +534,7 @@ def main() -> None:
 				record_usage(0, cached=True, chars=len(sent))   # 命中缓存：不花钱
 				return p
 			tmp = CLOUD_DIR / (p.stem + ".part.wav")
-			r = conn.synth(sent, speaker, str(tmp), sr, speed or 0, tone)
+			r = cloud_call(key, rid, lambda c: c.synth(sent, speaker, str(tmp), sr, speed or 0, tone))
 			tmp.replace(p)
 			record_usage(int((r or {}).get("words") or 0) or len(sent))
 			return p
@@ -666,8 +685,9 @@ def main() -> None:
 				sr = int(req.get("sampleRate") or (48000 if fmt == "ogg_opus" else 24000))
 				out = CLOUD_DIR / ("voice-" + hashlib.sha1((text + str(time.time())).encode()).hexdigest()[:12] + "." + ("ogg" if fmt == "ogg_opus" else fmt))
 				CLOUD_DIR.mkdir(parents=True, exist_ok=True)
-				conn = doubao_ws.get_conn(str(cl["key"]), str(cl.get("resourceId") or "seed-tts-2.0"))
-				r = conn.synth(text, str(cl["speaker"]), str(out), sr, cl.get("speechRate") or 0, cl.get("tone") or "", fmt)
+				_key = str(cl["key"])
+				_rid = str(cl.get("resourceId") or "seed-tts-2.0")
+				r = cloud_call(_key, _rid, lambda c: c.synth(text, str(cl["speaker"]), str(out), sr, cl.get("speechRate") or 0, cl.get("tone") or "", fmt))
 				try:
 					record_usage(int((r or {}).get("words") or 0))
 				except Exception:

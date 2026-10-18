@@ -492,6 +492,17 @@ def get_conn(api_key, resource_id="seed-tts-2.0"):
     return c
 
 
+def drop(api_key, resource_id="seed-tts-2.0"):
+    """把这条连接作废并从池里摘掉（常驻连接会空闲被服务端关掉，必须能重建）。"""
+    k = (api_key, resource_id)
+    c = _CONNS.pop(k, None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
 def close_all():
     for c in list(_CONNS.values()):
         try:
