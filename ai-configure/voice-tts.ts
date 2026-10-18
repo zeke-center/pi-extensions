@@ -151,12 +151,17 @@ function sendToPhone(): boolean {
 async function sendPhoneVoice(text: string): Promise<void> {
 	try {
 		const c = readCfg();
-		if (!c.voiceSendPhone) return;
+		// ⚠️ 这里**不要**再判断 voiceSendPhone：要不要发已经由 sendToPhone() 决定过了。
+		//    v1.31 留的这个守卫让"手机轮必发"直接失效（函数在第一步就 return）。
 		const key = String(c.voiceDoubaoKey ?? "").trim();
 		const speaker = String(c.voiceDoubaoVoice ?? "").trim();
 		if (key && speaker) {
 			const cli = await router?.rawClient();
-			if (!cli) return;
+			if (!cli) {
+				note("语音条跳过：没有可用的 worker 客户端");
+				return;
+			}
+			await (cli as any).ensure?.(true); // 云端合成不需要本地模型，但要有进程
 			const { msg } = await (cli as any).requestWithId({
 				cmd: "cloud_file",
 				text,
