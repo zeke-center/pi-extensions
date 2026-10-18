@@ -140,13 +140,17 @@ export class TtsRouter {
 	}
 
 	/** 播一句；返回实际用的引擎与首句延迟 */
-	async say(text: string, onFirst?: (ms: number) => void): Promise<{ engine: EngineName; firstMs: number }> {
+	async say(
+		text: string,
+		onFirst?: (ms: number) => void,
+		opts?: { sid?: number },
+	): Promise<{ engine: EngineName; firstMs: number }> {
 		const st = await this.status();
 		if (!st.ok) throw new Error(st.reason || "没有可用引擎");
 		if (st.engine === "local") {
 			if (!this.local) throw new Error("本地引擎未就绪");
 			const r = await this.local.say(text, {
-				sid: this.settings.sid,
+				sid: opts?.sid ?? this.settings.sid,
 				speed: this.settings.speed,
 				model: this.settings.model,
 				onFirst,

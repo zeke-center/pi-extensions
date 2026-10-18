@@ -109,6 +109,49 @@ export function trimForSpeech(text: string, maxChars = 220): string {
 	return (lastPunct > 40 ? cut.slice(0, lastPunct + 1) : cut) + "细节在屏幕上。";
 }
 
+/** 优先用主模型自己写的口播稿：`[口播]…[/口播]` 或 `<speak>…</speak>` */
+export function extractSpoken(text: string): string | null {
+	const t = String(text || "");
+	const m = t.match(/\[口播\]([\s\S]*?)\[\/口播\]/i) || t.match(/<speak>([\s\S]*?)<\/speak>/i);
+	if (!m) return null;
+	const body = sanitizeForSpeech(m[1]);
+	return body.length >= 8 ? body : null;
+}
+
+/**
+ * 从回答里抽"要点"（标题 / 列表项）。
+ * 这是**没有口播块时的兜底**：至少能念出"第一…第二…第三…"，而不是只有一句"改完了"。
+ */
+export function keyPoints(text: string, max = 3): string[] {
+	const t = String(text || "")
+		.replace(/\[口播\][\s\S]*?\[\/口播\]/gi, "")
+		.replace(/<speak>[\s\S]*?<\/speak>/gi, "");
+	const lines = t.split(String.fromCharCode(10)).map((x) => x.replace(String.fromCharCode(13), "").trim());
+	// 列表项优先；只有完全没有列表项时才退而用标题（标题多是"做完了三件事"这种，不适合念）
+	const passes = [/^(?:[-*+]|\d+[.)、])\s+(.{4,})$/, /^#{1,5}\s+(.{2,})$/];
+	for (const re of passes) {
+		const out: string[] = [];
+		for (const line of lines) {
+			const m = line.match(re);
+			if (!m) continue;
+			const item = sanitizeForSpeech(m[1]).replace(/[。．.]+$/, "");
+			if (item.length < 4 || out.includes(item)) continue;
+			out.push(item.length > 42 ? `${item.slice(0, 42)}…` : item);
+			if (out.length >= max) break;
+		}
+		if (out.length) return out;
+	}
+	return [];
+}
+
+const NUMS = ["第一", "第二", "第三", "第四", "第五"];
+
+/** 把要点拼成"第一…第二…第三…"的口播句式 */
+export function composePoints(points: string[], lead = "这轮做完了"): string {
+	if (!points.length) return `${lead}。`;
+	return `${lead}。${points.map((p, i) => `${NUMS[i] ?? "另外"}，${p}`).join("。")}。`;
+}
+
 export function render(
 	e: SpeechEvent,
 	opts: { level: SpeechLevel; terms: TermMode; maxFiles?: number },
@@ -133,19 +176,36 @@ export function render(
 	}
 
 	// result
+	const whole = e.full || e.text || "";
 	if (level === "full") {
-		const text = trimForSpeech(e.full || e.text || "改完了。");
+		const spoken = extractSpoken(whole);
+		const text = trimForSpeech(spoken || whole || "改完了。", 400);
 		return { ...base, kind: "result", prio: PRIO.result, text, interrupt: true };
 	}
-	const parts: string[] = [];
-	if (typeof e.tests === "number" && typeof e.files === "number") {
-		parts.push(`改完了，${e.tests} 项测试全过，动了 ${e.files} 个文件。`);
-	} else if (typeof e.files === "number") {
-		parts.push(`改完了，动了 ${e.files} 个文件。`);
-	} else {
-		parts.push(trimForSpeech(e.text || "这轮做完了。", 80));
+
+	// 1) 主模型自己写的口播稿（最自然，优先用）
+	const spoken = extractSpoken(whole);
+	if (spoken) {
+		const text = trimForSpeech(spoken, level === "normal" ? 320 : 240);
+		return { ...base, kind: "result", prio: PRIO.result, text: applyTerms(text, opts.terms), interrupt: true };
 	}
-	if (level === "normal" && e.risk) parts.push(`有个点要留意，${e.risk}。`);
-	const text = post(parts.join(""));
+
+	// 2) 兜底：从标题/列表抽 2~4 条，念成"第一…第二…第三…"
+	const maxPoints = level === "normal" ? 4 : 3;
+	const points = keyPoints(whole, maxPoints);
+	if (points.length) {
+		let text = post(composePoints(points));
+		if (level === "normal" && e.risk) text = post(`${composePoints(points)}另外要留意，${e.risk}。`);
+		return { ...base, kind: "result", prio: PRIO.result, text, interrupt: true };
+	}
+
+	// 3) 最后兜底：摘要一句话
+	const head =
+		typeof e.tests === "number" && typeof e.files === "number"
+			? `改完了，${e.tests} 项测试全过，动了 ${e.files} 个文件。`
+			: typeof e.files === "number"
+				? `改完了，动了 ${e.files} 个文件。`
+				: trimForSpeech(whole || "这轮做完了。", 120);
+	const text = post(head + (level === "normal" && e.risk ? `另外要留意，${e.risk}。` : ""));
 	return { ...base, kind: "result", prio: PRIO.result, text, interrupt: true };
 }

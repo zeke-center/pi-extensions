@@ -457,6 +457,24 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 				await router?.reconfigure({ speed: v });
 				return void ctx.ui.notify(`语速已设为 ${v}`, "info");
 			}
+			if (a.startsWith("voices")) {
+				const s = ensureSpeech();
+				if (!s) return;
+				const only = Number(a.split(/\s+/)[1]);
+				const sids = Number.isFinite(only) ? [only] : [46, 47, 48, 49, 50, 51, 52];
+				const SAMPLE = "这次改动动了三个文件：设置页、GitHub 上的 CI 配置，还有 TypeScript 的类型。";
+				ctx.ui.notify(`试听 ${sids.length} 个音色，每个念一句…（随时 /tts off 可停）`, "info");
+				for (const sid of sids) {
+					ctx.ui.notify(`音色 ${sid}`, "info");
+					try {
+						await s.router.say(SAMPLE, undefined, { sid });
+					} catch (e) {
+						ctx.ui.notify(`音色 ${sid} 失败：${e instanceof Error ? e.message : String(e)}`, "error");
+					}
+				}
+				ctx.ui.notify("试听结束。选中就用 /tts voice <号> 固定下来。", "info");
+				return;
+			}
 			if (a === "models") {
 				const rows = modelStatus(router ?? new TtsRouter(agentDir, settingsOf()));
 				return void ctx.ui.notify(
