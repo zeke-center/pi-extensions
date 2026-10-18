@@ -109,10 +109,11 @@ export class TtsRouter {
 		};
 		if (this.settings.mode === "off") return { ...base, engine: "off", ok: false, reason: "已静音" };
 		// 豆包：配了凭据就用（auto 档也优先，音质更好）；没配就跳过，绝不报错
-		const cfg = doubaoConfigFromEnv(this.settings.doubao ?? {});
-		if (cfg && (this.settings.mode === "auto" || this.settings.mode === "doubao")) {
-			this.doubao = this.doubao ?? new DoubaoClient(cfg);
-			return { ...base, engine: "doubao", ok: true, model: `doubao:${cfg.voice}`, sampleRate: cfg.rate, kind: "cloud" };
+		const dcfg = doubaoConfigFromEnv(this.settings.doubao ?? {});
+		const cloudKey = dcfg?.apiKey ?? dcfg?.token ?? "";
+		const cloudSpeaker = dcfg?.voice ?? "";
+		if (cloudKey && cloudSpeaker && (this.settings.mode === "auto" || this.settings.mode === "doubao")) {
+			return { ...base, engine: "doubao", ok: true, model: `doubao:${cloudSpeaker}`, sampleRate: 24000, kind: "cloud-ws" };
 		}
 		if (this.settings.mode === "doubao") {
 			return { ...base, engine: sapiAvailable() ? "sapi" : "off", ok: sapiAvailable(), reason: "豆包未配置 appid/token（环境变量 DOUBAO_TTS_APPID / DOUBAO_TTS_TOKEN）" };
@@ -161,8 +162,18 @@ export class TtsRouter {
 		const st = await this.status();
 		if (!st.ok) throw new Error(st.reason || "没有可用引擎");
 		if (st.engine === "doubao") {
-			if (!this.doubao) throw new Error("豆包引擎未就绪");
-			const r = await this.doubao.say(text, { onFirst });
+			const dcfg = doubaoConfigFromEnv(this.settings.doubao ?? {})!;
+			const cli = await this.rawClient();
+			const r = await cli.say(text, {
+				cloud: {
+					key: dcfg.apiKey ?? dcfg.token,
+					speaker: dcfg.voice,
+					sampleRate: 24000,
+					resourceId: process.env.DOUBAO_TTS_RESOURCE || "seed-tts-2.0",
+					speechRate: Math.round((this.settings.speed - 1) * 50),
+				},
+				onFirst,
+			});
 			return { engine: "doubao", firstMs: r.firstMs };
 		}
 		if (st.engine === "local") {

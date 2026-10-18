@@ -258,9 +258,16 @@ export class LocalTtsClient {
 	/** 播一句话（worker 内部按句切分，首句最快出声） */
 	async say(
 		text: string,
-		opts?: { sid?: number; speed?: number; model?: string; onFirst?: (firstMs: number) => void },
+		opts?: {
+			sid?: number;
+			speed?: number;
+			model?: string;
+			onFirst?: (firstMs: number) => void;
+			/** 有它就绕开本地模型，直接用豆包在线合成 */
+			cloud?: { key: string; speaker: string; sampleRate?: number; resourceId?: string; speechRate?: number };
+		},
 	): Promise<SayResult> {
-		await this.ensure();
+		await this.ensure(Boolean(opts?.cloud)); // 云端播报不需要本地模型
 		this.touchIdle();
 		const { id, msg } = await this.requestWithId({
 			cmd: "say",
@@ -268,6 +275,7 @@ export class LocalTtsClient {
 			sid: opts?.sid ?? this.opts.sid,
 			speed: opts?.speed ?? this.opts.speed,
 			model: opts?.model ?? this.opts.model,
+			...(opts?.cloud ? { cloud: opts.cloud } : {}),
 		});
 		if (!msg?.ok) throw new Error(msg?.error || "合成失败");
 		const firstMs = Number(msg.first_ms ?? 0);

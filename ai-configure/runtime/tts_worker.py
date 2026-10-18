@@ -98,6 +98,15 @@ def split_sentences(text: str, first_len: int = 14, max_len: int = 40) -> list[s
 # --------------------------------------------------------------------------- #
 # 引擎
 # --------------------------------------------------------------------------- #
+CLOUD_DIR = _agent_dir() / "models" / "tts" / ".cloud-cache"
+
+
+def cloud_wav(name: str, text: str, speaker: str, sr: int, rid: str, speed) -> Path:
+	CLOUD_DIR.mkdir(parents=True, exist_ok=True)
+	h = hashlib.sha1(f"{text}|{speaker}|{sr}|{rid}|{speed}".encode()).hexdigest()[:16]
+	return CLOUD_DIR / f"{h}.wav"
+
+
 def find_model_file(d: Path) -> Path | None:
 	"""模型文件名各家不一样（model.onnx / vits-aishell3.onnx ...），优先非 int8 的。"""
 	exact = d / "model.onnx"
@@ -387,6 +396,61 @@ def main() -> None:
 				st["engine"] = Engine(eng.dir, eng.sid, v)
 				st["sid"] = eng.sid
 
+	def do_cloud_say(req: dict, cloud: dict) -> None:
+		"""豆包 TTS 2.0 双向流式：合成到 wav 缓存 → 复用现有播放状态机。"""
+		import doubao_ws
+
+		sents = split_sentences(str(req.get("text") or ""))
+		if not sents:
+			reply({"id": req.get("id"), "ok": False, "error": "空文本"})
+			return
+		key = str(cloud.get("key") or "")
+		speaker = str(cloud.get("speaker") or "")
+		sr = int(cloud.get("sampleRate") or 24000)
+		rid = str(cloud.get("resourceId") or "seed-tts-2.0")
+		speed = cloud.get("speechRate")
+
+		def make(sent: str) -> Path:
+			p = cloud_wav(sent, sent, speaker, sr, rid, speed)
+			if p.exists() and p.stat().st_size > 1000:
+				return p
+			tmp = CLOUD_DIR / (p.stem + ".part.wav")
+			doubao_ws.synth(key, sent, speaker, str(tmp), sr, rid, speed or 0)
+			tmp.replace(p)
+			return p
+
+		def wav_dur(p: Path) -> float:
+			with wave.open(str(p)) as w:
+				return w.getnframes() / w.getframerate()
+
+		t0 = time.perf_counter()
+		first = make(sents[0])
+		d0 = wav_dur(first)
+		st["id"] = req.get("id")
+		st["total"] = d0
+		st["first_ms"] = (time.perf_counter() - t0) * 1000
+		play(first, blocking=False)
+		st["until"] = time.time() + d0
+		rest = sents[1:]
+		st["pending"] = len(rest)
+		total_ref = st
+
+		def synth_rest() -> None:
+			for sent in rest:
+				try:
+					p = make(sent)
+					d = wav_dur(p)
+					total_ref["plan"].append((p, d))
+					total_ref["total"] += d
+				except Exception:
+					pass
+				finally:
+					total_ref["pending"] = max(0, total_ref["pending"] - 1)
+
+		reply({"id": st["id"], "ok": True, "cloud": True, "first_ms": round(st["first_ms"]), "dur": round(d0, 2)})
+		if rest:
+			threading.Thread(target=synth_rest, daemon=True).start()
+
 	def start_next() -> None:
 		"""推进播放状态机：播下一句 / 收尾。"""
 		if st["until"] and time.time() < st["until"]:
@@ -441,6 +505,10 @@ def main() -> None:
 				       "models_dir": str(MODELS_DIR)})
 			elif cmd == "say":
 				interrupt()  # 新播报抢占旧的（node 侧已按优先级判定过）
+				cl = req.get("cloud") or {}
+				if cl.get("key") and cl.get("speaker"):
+					do_cloud_say(req, cl)
+					continue
 				ensure_engine(req)
 				text = str(req.get("text") or "")
 				sents = split_sentences(text)
