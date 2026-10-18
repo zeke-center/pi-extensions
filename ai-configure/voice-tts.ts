@@ -39,6 +39,7 @@ interface Cfg {
 	voiceTtsRate?: number;
 	voiceTtsVolume?: number;
 	/** 豆包（火山引擎）在线语音：不填就走本地 */
+	voiceDoubaoKey?: string;
 	voiceDoubaoAppId?: string;
 	voiceDoubaoToken?: string;
 	voiceDoubaoCluster?: string;
@@ -99,6 +100,7 @@ function settingsOf(c: Cfg = readCfg()) {
 		sapiRate: num(c.voiceTtsRate, 0, -10, 10),
 		sapiVolume: num(c.voiceTtsVolume, 100, 0, 100),
 		doubao: {
+			apiKey: typeof c.voiceDoubaoKey === "string" ? c.voiceDoubaoKey : undefined,
 			appId: typeof c.voiceDoubaoAppId === "string" ? c.voiceDoubaoAppId : undefined,
 			token: typeof c.voiceDoubaoToken === "string" ? c.voiceDoubaoToken : undefined,
 			cluster: typeof c.voiceDoubaoCluster === "string" ? c.voiceDoubaoCluster : undefined,
@@ -218,6 +220,16 @@ function speechSettings(): SettingDef[] {
 				patchCfg({ voiceLocalModel: String(v) });
 				router?.invalidate();
 			},
+		},
+		{
+			key: "voiceDoubaoKey",
+			group: GROUP,
+			label: "豆包 API Key（新版·推荐）",
+			desc: "语音技术控制台 → API Key 管理 生成的 key（走 v3 端点，直接出 wav，支持用自然语言描述音色语气）。注意：**方舟的 ark- key 不能用**。环境变量 DOUBAO_TTS_KEY 优先。",
+			kind: "text",
+			def: "",
+			get: () => readCfg().voiceDoubaoKey ?? "",
+			set: (v) => patchCfg({ voiceDoubaoKey: String(v || "").trim() }),
 		},
 		{
 			key: "voiceDoubaoAppId",

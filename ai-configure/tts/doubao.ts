@@ -24,6 +24,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export interface DoubaoConfig {
+	/** 新版控制台的 API Key（X-Api-Key 单头鉴权，走 v3 端点） */
+	apiKey?: string;
+	/** v3 模型：seed-audio-1.0（音频生成，支持用自然语言描述音色/语气） */
+	model?: string;
 	appId: string;
 	token: string;
 	/** 控制台里应用对应的 cluster，语音合成大模型通常是 volcano_tts */
@@ -41,10 +45,14 @@ export interface DoubaoConfig {
 
 export function doubaoConfigFromEnv(over: Partial<DoubaoConfig> = {}): DoubaoConfig | null {
 	const pick = (k: string, d?: string) => process.env[k] ?? d ?? "";
+	const apiKey = pick("DOUBAO_TTS_KEY", over.apiKey);
 	const appId = pick("DOUBAO_TTS_APPID", over.appId);
 	const token = pick("DOUBAO_TTS_TOKEN", over.token);
-	if (!appId || !token) return null;
+	// v3（只要 API Key）或 v1（要 appid+token）任意一套齐了就可用
+	if (!apiKey && !(appId && token)) return null;
 	return {
+		apiKey: apiKey || undefined,
+		model: pick("DOUBAO_TTS_MODEL", over.model) || "seed-audio-1.0",
 		appId,
 		token,
 		cluster: pick("DOUBAO_TTS_CLUSTER", over.cluster) || "volcano_tts",
@@ -89,8 +97,53 @@ export class DoubaoClient {
 		}
 	}
 
+	/** v3（新版控制台）：X-Api-Key 单头鉴权，直接给 wav，支持自然语言描述音色/语气 */
+	private async synthV3(text: string): Promise<string> {
+		const reqid = randomUUID();
+		const body = {
+			model: this.cfg.model || "seed-audio-1.0",
+			text_prompt: text,
+			audio_config: {
+				format: "wav",
+				sample_rate: this.cfg.rate,
+				speech_rate: Math.round((this.cfg.speed - 1) * 50), // v3 是 -50~100 的百分比
+				pitch_rate: 0,
+				loudness_rate: 0,
+			},
+			watermark: {},
+		};
+		const ac = new AbortController();
+		const timer = setTimeout(() => ac.abort(), this.cfg.timeoutMs);
+		timer.unref?.();
+		let resp: Response;
+		try {
+			resp = await fetch("https://openspeech.bytedance.com/api/v3/tts/create", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "X-Api-Key": this.cfg.apiKey ?? "", "X-Api-Request-Id": reqid },
+				body: JSON.stringify(body),
+				signal: ac.signal,
+			});
+		} finally {
+			clearTimeout(timer);
+		}
+		const raw = await resp.text();
+		let json: { code?: number; message?: string; audio?: string; duration?: number } = {};
+		try {
+			json = JSON.parse(raw);
+		} catch {
+			throw new Error(`豆包 v3 返回不是 JSON（HTTP ${resp.status}）`);
+		}
+		if (!resp.ok || !json.audio) {
+			throw new Error(`豆包 v3 失败 HTTP ${resp.status} code=${json.code ?? "?"} ${json.message ?? ""}`.trim());
+		}
+		const file = join(this.cacheDir, `${reqid}.wav`);
+		writeFileSync(file, Buffer.from(json.audio, "base64"));
+		return file;
+	}
+
 	/** 合成一句 → 返回 wav 路径（不播放） */
 	async synth(text: string): Promise<string> {
+		if (this.cfg.apiKey) return this.synthV3(text);
 		const reqid = randomUUID();
 		const body = {
 			app: { appid: this.cfg.appId, token: this.cfg.token, cluster: this.cfg.cluster },
