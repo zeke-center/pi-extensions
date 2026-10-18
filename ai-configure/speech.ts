@@ -10,8 +10,8 @@
  *   full   原文（给"我要听完整"的场景，会被截断到 ~60s）
  */
 
-export type UtteranceKind = "progress" | "result" | "error" | "ask";
-export type SpeechLevel = "brief" | "normal" | "full";
+export type UtteranceKind = "step" | "progress" | "result" | "error" | "ask";
+export type SpeechLevel = "brief" | "steps" | "chatty" | "normal" | "full";
 export type TermMode = "cn" | "en" | "off";
 
 export interface Utterance {
@@ -37,7 +37,7 @@ export interface SpeechEvent {
 	full?: string;
 }
 
-const PRIO: Record<UtteranceKind, number> = { progress: 0, result: 1, error: 2, ask: 3 };
+const PRIO: Record<UtteranceKind, number> = { progress: 0, step: 1, result: 2, error: 3, ask: 4 };
 
 /** 英文术语 → 中文说法（cn 模式用；en 模式保留原词） */
 const TERMS: Record<string, string> = {
@@ -160,6 +160,12 @@ export function render(
 	const post = (s: string) => sanitizeForSpeech(applyTerms(s, opts.terms));
 	const base = { ref: e.ref };
 
+	if (e.kind === "step") {
+		// 只有 steps / chatty 档才播阶段进展（brief 保持安静）
+		if (level !== "steps" && level !== "chatty") return null;
+		const text = trimForSpeech(e.text || "继续下一步。", 28);
+		return { ...base, kind: "step", prio: PRIO.step, text, ttl: 12 };
+	}
 	if (e.kind === "progress") {
 		const text = post(e.text || "还在跑，稍等一下。");
 		return { ...base, kind: "progress", prio: PRIO.progress, ttl: 20, text };
@@ -208,4 +214,26 @@ export function render(
 				: trimForSpeech(whole || "这轮做完了。", 120);
 	const text = post(head + (level === "normal" && e.risk ? `另外要留意，${e.risk}。` : ""));
 	return { ...base, kind: "result", prio: PRIO.result, text, interrupt: true };
+}
+
+/** 兜底规则：按工具名 + 入参猜一句"我现在干什么"（≤20 字，播报用） */
+export function stepTextFor(tool: string, input: any): string {
+	const t = String(tool || "").toLowerCase();
+	const a = (input ?? {}) as Record<string, any>;
+	const cmd = String(a.command ?? a.cmd ?? "");
+	const file = String(a.path ?? a.file_path ?? a.file ?? a.filePath ?? "");
+	const base = file ? file.split(/[\/]/).pop() : "";
+	if (t === "delegate") return "派个助理去查，我继续盯着。";
+	if (t === "bash" || t === "shell" || t === "exec") {
+		if (/test|vitest|jest|pytest|smoke|unit/i.test(cmd)) return "跑一下测试，稍等。";
+		if (/git (push|commit|tag)/i.test(cmd)) return "提交并推送代码。";
+		if (/install|npm i|pip install/i.test(cmd)) return "装一下依赖。";
+		if (/curl|http/i.test(cmd)) return "查一下线上接口。";
+		return "跑一条命令看看。";
+	}
+	if (t === "read" || t === "cat") return "看一下这段代码。";
+	if (t === "grep" || t === "rg" || t === "search") return "在代码里搜一下。";
+	if (t === "edit" || t === "write" || t === "patch") return "开始改代码。";
+	if (t === "web_search" || t === "webfetch" || t === "fetch") return "上网查一下资料。";
+	return "继续下一步。";
 }

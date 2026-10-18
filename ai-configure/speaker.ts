@@ -72,7 +72,11 @@ export class Speaker {
 		// 抢占判定
 		const cur = this.current;
 		if (cur && cur.status === "playing") {
-			const can = Boolean(q.interrupt) || (cur.kind === "progress" && q.prio > cur.prio);
+			const can =
+				Boolean(q.interrupt) ||
+				(cur.kind === "progress" && q.prio > cur.prio) ||
+				// 阶段播报是"实时进展"，新的直接顶掉旧的（不然会排队积压、说完就过时了）
+				(cur.kind === "step" && q.kind === "step");
 			if (can) {
 				this.preempt = true;
 				void this.opts.router.stop().catch(() => {});

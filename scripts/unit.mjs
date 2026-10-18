@@ -1113,6 +1113,22 @@ console.log("PASS  静态：共享桥 shared.ts 完整且 board/voice 都接上�
 }
 if (!allOk) console.log(String.fromCharCode(10) + "❌ 静态检查失败");
 
+bundle("speech.ts", "speech1.mjs");
+allOk =
+	runSuite(
+		"speech：阶段播报（steps 档）",
+		join(tmp, "speech1.mjs"),
+		[
+			'ok("阶段：brief 档不播", render({ kind: "step", text: "看一下代码" }, { level: "brief", terms: "en" }) === null);',
+			'ok("阶段：steps 档播且带 ttl=12", (() => { const u = render({ kind: "step", text: "看一下代码" }, { level: "steps", terms: "en" }); return !!u && u.kind === "step" && u.ttl === 12; })());',
+			'ok("阶段：优先级低于结论（不抢话）", (() => { const a = render({ kind: "step", text: "看代码" }, { level: "steps", terms: "en" }); const b = render({ kind: "result", text: "第一，做完了一件事", full: "第一，做完了一件事" }, { level: "steps", terms: "en" }); return !!a && !!b && a.prio < b.prio; })());',
+			'ok("阶段：bash 跑测试 → 说人话", /测试/.test(stepTextFor("bash", { command: "npm run test" })));',
+			'ok("阶段：read 不念文件名", (() => { const t = stepTextFor("read", { path: "src/a/b.ts" }); return t.indexOf("b.ts") < 0 && t.length <= 20; })());',
+			'ok("阶段：delegate → 派助理", /助理/.test(stepTextFor("delegate", {})));',
+			'ok("阶段：未知工具也有兜底句", stepTextFor("mystery_tool", {}).length > 2);',
+		],
+	) && allOk;
+
 rmSync(tmp, { recursive: true, force: true });
 
 if (allOk) {

@@ -47,6 +47,9 @@ let agentDir = "";
 let lastAssistantText = "";
 let toolStartAt = 0;
 let progressSent = false;
+let lastStepAt = 0;
+let stepsThisTurn = 0;
+let voiceFailures = 0; // 连续失败计数 → 熔断，绝不拖累主流程
 let disposeAsk: (() => void) | null = null;
 
 // --------------------------------------------------------------------------- #
@@ -236,10 +239,12 @@ function speechSettings(): SettingDef[] {
 			key: "voiceLevel",
 			group: GROUP,
 			label: "播报级别",
-			desc: "brief = 只播结论/卡点/要你拍板（默认）；normal = ＋风险；full = 念完整回答（超 220 字截断，细节留在屏幕上）。",
+			desc:
+				"brief = 只播结论/卡点/要你拍板（默认）；steps = ＋阶段进展（我先去看代码 → 开始改 → 跑测试）；" +
+				"chatty = ＋慢动作也播；normal = ＋风险；full = 念完整回答（超 220 字截断，细节留在屏幕上）。",
 			kind: "enum",
-			options: ["brief", "normal", "full"],
-			values: ["brief", "normal", "full"],
+			options: ["brief", "steps", "chatty", "normal", "full"],
+			values: ["brief", "steps", "chatty", "normal", "full"],
 			def: "brief",
 			get: () => readCfg().voiceLevel ?? "brief",
 			set: (v) => patchCfg({ voiceLevel: v as SpeechLevel }),
@@ -376,13 +381,39 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 	// 一轮结束 → 播结论（这就是"答完就播"）
 	api.on("agent_settled", async () => {
 		progressSent = false;
+		stepsThisTurn = 0;
+		lastStepAt = 0;
 		if (isExtDisabled()) return;
 		speakResult();
 	});
 
 	// 长任务占位播报（工具跑了 8 秒还没完 → 一句"还在跑"，20 秒后过期丢弃）
-	api.on("tool_execution_start", async () => {
+	api.on("tool_execution_start", async (event) => {
 		toolStartAt = Date.now();
+		// 阶段播报：只在 steps/chatty 档；节流 ≥6s、一轮最多 5 句；任何异常都静默
+		try {
+			const level = (readCfg().voiceLevel ?? "brief") as SpeechLevel;
+			if (level !== "steps" && level !== "chatty") return;
+			if (isExtDisabled() || !enabled()) return;
+			const now = Date.now();
+			if (now - lastStepAt < 6000) return;
+			if (stepsThisTurn >= 5) return;
+			if (voiceFailures >= 3) return; // 熔断：出过 3 次问题就别再试了
+			const ev = event as Record<string, any>;
+			const tool = String(ev.toolName ?? ev.name ?? ev.tool?.name ?? "");
+			if (!tool) return;
+			const u = render(
+				{ kind: "step", text: stepTextFor(tool, ev.input ?? ev.args ?? ev.parameters), ref: tool },
+				{ level, terms: (readCfg().voiceTerms ?? "en") as TermMode },
+			);
+			if (!u) return;
+			lastStepAt = now;
+			stepsThisTurn += 1;
+			const sp = ensureSpeech();
+			if (sp) sp.speaker.say(u);
+		} catch {
+			voiceFailures += 1; // 静默失败，主流程不受影响
+		}
 	});
 	api.on("tool_execution_end", async () => {
 		const secs = toolStartAt ? (Date.now() - toolStartAt) / 1000 : 0;
