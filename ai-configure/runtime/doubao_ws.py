@@ -278,12 +278,12 @@ def synth_many(api_key, jobs, resource_id="seed-tts-2.0", log=None, on_done=None
 
         for text, speaker, out_path, sample_rate, speech_rate in jobs:
             sid = str(uuid.uuid4())
-            body = json.dumps({
-                "event": EV["StartSession"],
-                "req_params": {"speaker": speaker,
-                               "audio_params": {"format": "pcm", "sample_rate": sample_rate,
-                                                "speech_rate": speech_rate or 0}},
-            }).encode()
+            params = {"speaker": speaker,
+                      "audio_params": {"format": "pcm", "sample_rate": sample_rate,
+                                       "speech_rate": speech_rate or 0}}
+            if tone:
+                params["context_texts"] = [tone]   # 语音指令：不计费
+            body = json.dumps({"event": EV["StartSession"], "req_params": params}).encode()
             ws_send(sock, pack(MSG_FULL_CLIENT, EV["StartSession"], body, session_id=sid))
             while True:
                 op, d = rd.frame()
@@ -380,7 +380,7 @@ class CloudConn:
             self.dead = False
         return self
 
-    def synth(self, text, speaker, out_path, sample_rate=24000, speech_rate=0):
+    def synth(self, text, speaker, out_path, sample_rate=24000, speech_rate=0, tone=None):
         """合成一句到 wav。失败时把连接标记为坏、下次重连。"""
         self.ensure()
         sid = str(uuid.uuid4())

@@ -101,10 +101,65 @@ def split_sentences(text: str, first_len: int = 14, max_len: int = 40) -> list[s
 CLOUD_DIR = _agent_dir() / "models" / "tts" / ".cloud-cache"
 
 
-def cloud_wav(name: str, text: str, speaker: str, sr: int, rid: str, speed) -> Path:
+def cloud_wav(name: str, text: str, speaker: str, sr: int, rid: str, speed, tone: str = "") -> Path:
 	CLOUD_DIR.mkdir(parents=True, exist_ok=True)
-	h = hashlib.sha1(f"{text}|{speaker}|{sr}|{rid}|{speed}".encode()).hexdigest()[:16]
+	h = hashlib.sha1(f"{text}|{speaker}|{sr}|{rid}|{speed}|{tone}".encode()).hexdigest()[:16]
 	return CLOUD_DIR / f"{h}.wav"
+
+
+CLOUD_MAX_BYTES = 200 * 1024 * 1024   # 音频缓存上限 200MB
+CLOUD_MAX_AGE_DAYS = 7                 # 超过 7 天没用就清
+
+
+def prune_cloud_cache(max_bytes: int = CLOUD_MAX_BYTES, max_age_days: int = CLOUD_MAX_AGE_DAYS) -> dict:
+	"""清理云端音频缓存：先按时间（超过 7 天），再按总量（超 200MB 从最旧删）。
+
+	为什么要有上限：一句 5 秒的 wav 约 240KB，一天 100 句 ≈ 24MB。
+	不清理的话一年就是几个 G —— 白占你磁盘，也不会让播报变快。
+	"""
+	try:
+		files = [p for p in CLOUD_DIR.glob("*.wav")] if CLOUD_DIR.exists() else []
+	except Exception:
+		return {"removed": 0, "bytes": 0}
+	now = time.time()
+	removed = 0
+	removed_bytes = 0
+	alive = []
+	for p in files:
+		try:
+			st_ = p.stat()
+		except Exception:
+			continue
+		if (now - st_.st_mtime) / 86400 > max_age_days:
+			try:
+				removed_bytes += st_.st_size
+				p.unlink()
+				removed += 1
+			except Exception:
+				pass
+		else:
+			alive.append((st_.st_mtime, st_.st_size, p))
+	total = sum(a[1] for a in alive)
+	if total > max_bytes:
+		alive.sort()  # 最旧优先删
+		for mtime, size, p in alive:
+			if total <= max_bytes:
+				break
+			try:
+				p.unlink()
+				total -= size
+				removed += 1
+				removed_bytes += size
+			except Exception:
+				pass
+	return {"removed": removed, "bytes": removed_bytes, "left": total}
+
+
+def cloud_cache_size() -> int:
+	try:
+		return sum(p.stat().st_size for p in CLOUD_DIR.glob("*.wav"))
+	except Exception:
+		return 0
 
 
 def find_model_file(d: Path) -> Path | None:
@@ -413,11 +468,12 @@ def main() -> None:
 		sr = int(cloud.get("sampleRate") or 24000)
 		rid = str(cloud.get("resourceId") or "seed-tts-2.0")
 		speed = cloud.get("speechRate")
+		tone = str(cloud.get("tone") or "")
 		CLOUD_DIR.mkdir(parents=True, exist_ok=True)
 		conn = doubao_ws.get_conn(key, rid)
 
 		def target(sent: str) -> Path:
-			return cloud_wav(sent, sent, speaker, sr, rid, speed)
+			return cloud_wav(sent, sent, speaker, sr, rid, speed, tone)
 
 		def dur_of(p: Path) -> float:
 			with wave.open(str(p)) as w:
@@ -428,7 +484,7 @@ def main() -> None:
 			if p.exists() and p.stat().st_size > 1000:
 				return p
 			tmp = CLOUD_DIR / (p.stem + ".part.wav")
-			conn.synth(sent, speaker, str(tmp), sr, speed or 0)
+			conn.synth(sent, speaker, str(tmp), sr, speed or 0, tone)
 			tmp.replace(p)
 			return p
 
@@ -517,6 +573,7 @@ def main() -> None:
 				       "sample_rate": eng.sample_rate if eng else None,
 				       "_sr_loaded": bool(eng),
 				       "sid": st["sid"], "speed": st["speed"],
+				       "cloud_cache_bytes": cloud_cache_size(),
 				       "models_dir": str(MODELS_DIR)})
 			elif cmd == "say":
 				interrupt()  # 新播报抢占旧的（node 侧已按优先级判定过）
@@ -561,6 +618,18 @@ def main() -> None:
 
 				if rest:
 					threading.Thread(target=synth_rest, daemon=True).start()
+			elif cmd == "warmup":
+				# 预热豆包连接：握手一次（3~4 秒），之后首句几乎不用等
+				cl = req.get("cloud") or {}
+				if cl.get("key"):
+					try:
+						import doubao_ws
+						doubao_ws.get_conn(str(cl["key"]), str(cl.get("resourceId") or "seed-tts-2.0")).ensure()
+						reply({"id": req.get("id"), "ok": True, "warm": True})
+					except Exception as e:
+						reply({"id": req.get("id"), "ok": False, "error": f"{type(e).__name__}: {e}"})
+				else:
+					reply({"id": req.get("id"), "ok": False, "error": "no key"})
 			elif cmd == "stop":
 				interrupt()
 				reply({"id": req.get("id"), "ok": True, "stopped": True})

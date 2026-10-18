@@ -263,6 +263,8 @@ export class LocalTtsClient {
 			speed?: number;
 			model?: string;
 			onFirst?: (firstMs: number) => void;
+			/** 语气指令（豆包 context_texts，不计费） */
+			tone?: string;
 			/** 有它就绕开本地模型，直接用豆包在线合成 */
 			cloud?: { key: string; speaker: string; sampleRate?: number; resourceId?: string; speechRate?: number };
 		},
@@ -275,7 +277,7 @@ export class LocalTtsClient {
 			sid: opts?.sid ?? this.opts.sid,
 			speed: opts?.speed ?? this.opts.speed,
 			model: opts?.model ?? this.opts.model,
-			...(opts?.cloud ? { cloud: opts.cloud } : {}),
+			...(opts?.cloud ? { cloud: { ...opts.cloud, tone: opts.tone } } : {}),
 		});
 		if (!msg?.ok) throw new Error(msg?.error || "合成失败");
 		const firstMs = Number(msg.first_ms ?? 0);
@@ -290,6 +292,18 @@ export class LocalTtsClient {
 			t.unref?.();
 		});
 		return { firstMs, dur: total || Number(msg.dur ?? 0) };
+	}
+
+	/** 预热云端连接（握手一次，之后首句不用等 3~4 秒） */
+	async warmup(cloud?: { key: string; resourceId?: string }): Promise<boolean> {
+		if (!cloud?.key) return false;
+		try {
+			await this.ensure(true);
+			const { msg } = await this.requestWithId({ cmd: "warmup", cloud });
+			return Boolean(msg?.ok);
+		} catch {
+			return false;
+		}
 	}
 
 	/** 打断当前播报（毫秒级：worker 侧 SND_PURGE） */

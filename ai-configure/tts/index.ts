@@ -157,7 +157,7 @@ export class TtsRouter {
 	async say(
 		text: string,
 		onFirst?: (ms: number) => void,
-		opts?: { sid?: number },
+		opts?: { sid?: number; tone?: string },
 	): Promise<{ engine: EngineName; firstMs: number }> {
 		const st = await this.status();
 		if (!st.ok) throw new Error(st.reason || "没有可用引擎");
@@ -165,6 +165,7 @@ export class TtsRouter {
 			const dcfg = doubaoConfigFromEnv(this.settings.doubao ?? {})!;
 			const cli = await this.rawClient();
 			const r = await cli.say(text, {
+				tone: opts?.tone,
 				cloud: {
 					key: dcfg.apiKey ?? dcfg.token,
 					speaker: dcfg.voice,
@@ -179,6 +180,7 @@ export class TtsRouter {
 		if (st.engine === "local") {
 			if (!this.local) throw new Error("本地引擎未就绪");
 			const r = await this.local.say(text, {
+				tone: opts?.tone,
 				sid: opts?.sid ?? this.settings.sid,
 				speed: this.settings.speed,
 				model: this.settings.model,
@@ -204,6 +206,19 @@ export class TtsRouter {
 		this.doubao?.stop();
 		if (this.local) await this.local.stop();
 		stopSapi();
+	}
+
+	/** 预热云端连接（豆包握手 3~4 秒，提前做掉，首句就快） */
+	async warmup(): Promise<boolean> {
+		const dcfg = doubaoConfigFromEnv(this.settings.doubao ?? {});
+		const key = dcfg?.apiKey ?? dcfg?.token ?? "";
+		if (!key) return false;
+		try {
+			const cli = await this.rawClient();
+			return await cli.warmup({ key, resourceId: process.env.DOUBAO_TTS_RESOURCE || "seed-tts-2.0" });
+		} catch {
+			return false;
+		}
 	}
 
 	/** 语速/音色变了要重建（length_scale 在构造时定） */

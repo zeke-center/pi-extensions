@@ -1550,7 +1550,7 @@ async function doDrop(): Promise<void> {
 }
 
 /** 插件版本：优先读**自己旁边**的 package.json（真值），读不到就退回下面这个手写常量 */
-const PLUGIN_VER_FALLBACK = "1.27.0";
+const PLUGIN_VER_FALLBACK = "1.28.0";
 
 /**
  * `/status` 里会显示它 —— 用途很具体：**一眼确认"我到底 reload 上了没"**。

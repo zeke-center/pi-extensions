@@ -124,7 +124,7 @@ export class Speaker {
 				try {
 					const r = await this.opts.router.say(next.text, (ms) => {
 						next.firstMs = ms;
-					});
+					}, { tone: next.tone });
 					next.engine = r.engine;
 					next.firstMs = r.firstMs;
 					next.status = this.preempt ? "preempted" : "done";

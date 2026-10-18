@@ -374,6 +374,25 @@ function speechSettings(): SettingDef[] {
 // --------------------------------------------------------------------------- #
 // 动作实现
 // --------------------------------------------------------------------------- #
+async function cloudCacheText(): Promise<string> {
+	try {
+		const dir = join(getAgentDir(), "models", "tts", ".cloud-cache");
+		const { readdirSync, statSync } = await import("node:fs");
+		let total = 0;
+		for (const f of readdirSync(dir)) {
+			try {
+				total += statSync(join(dir, f)).size;
+			} catch {
+				/* ignore */
+			}
+		}
+		return total > 0 ? `
+豆包音频缓存：${(total / 1024 / 1024).toFixed(1)} MB（上限 200MB / 7 天自动清理）` : "";
+	} catch {
+		return "";
+	}
+}
+
 async function statusText(): Promise<string> {
 	const s = ensureSpeech();
 	if (!s) return "语音模块未初始化";
@@ -386,8 +405,11 @@ async function statusText(): Promise<string> {
 		`已装模型：${st.installed.length ? st.installed.join(", ") : "（无）"}`,
 		`目录：${st.modelsDir}`,
 	].filter(Boolean);
+	const cache = await cloudCacheText();
+	if (cache) lines.push(cache.trim());
 	return lines.join("\n");
 }
+
 
 const TEST_TEXT =
 	"这次改动动了三个文件：设置页、GitHub 上的 CI 配置，还有 TypeScript 的类型。一百零四项测试全过，下一步把 diff 推到 Gitee。";
@@ -450,6 +472,13 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 	api.on("session_start", async (_e, ctx) => {
 		curCtx = ctx;
 		lastAssistantText = "";
+		// 预热：豆包握手 3~4 秒，趁用户还在打字先做掉（失败静默，绝不影响主流程）
+		try {
+			const sp = ensureSpeech();
+			if (sp) void sp.router.warmup().catch(() => {});
+		} catch {
+			/* 忽略 */
+		}
 	});
 
 	api.on("message_end", async (event) => {

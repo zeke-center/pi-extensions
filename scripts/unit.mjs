@@ -1130,6 +1130,11 @@ allOk =
 			'ok("口语行：多条取最后一条", extractStep("<step>第一步</step> 中间 <step>第二步</step>") === "第二步");',
 			'ok("口语行：没写就返回 null（走规则兜底）", extractStep("普通回答，没有标记") === null);',
 			'ok("口语行：退化成 markdown 也能念", (() => { const t = extractStep("<step>**收到**，看 `server.ts`</step>"); return !!t && t.indexOf("*") < 0 && t.indexOf("`") < 0; })());',
+			'ok("完整播报：长口播不截断、不说「以下省略」", (() => { const t = "这轮做完了。"; const body = t + "第一点说明。".repeat(30); const u = render({ kind: "result", full: "[口播]" + body + "[/口播]" }, { level: "brief", terms: "en" }); return !!u && u.text.length >= body.length * 0.95 && u.text.indexOf("省略") < 0; })());',
+			'ok("语气：结论用沉稳汇报", (() => { const u = render({ kind: "result", full: "[口播]做完了。[/口播]" }, { level: "brief", terms: "en" }); return !!u && !!u.tone && u.tone.indexOf("沉稳") >= 0; })());',
+			'ok("语气：报错用提醒", (() => { const u = render({ kind: "error", text: "测试挂了" }, { level: "brief", terms: "en" }); return !!u && !!u.tone && u.tone.indexOf("提醒") >= 0; })());',
+			'ok("语气：<step tone=calm> 能覆盖默认", (() => { const r = extractStepFull("<step tone=calm>收到</step>"); return !!r && r.tone === "calm" && toneFor("step", r.tone).indexOf("沉稳") >= 0; })());',
+			'ok("语气：没写 tone 时按类型兜底", toneFor("step").indexOf("口语") >= 0);',
 		],
 	) && allOk;
 
