@@ -343,6 +343,35 @@ def main() -> None:
 		st["speed"] = float(req.get("speed") or st["speed"])
 		st["engine"] = Engine(md, st["sid"], st["speed"])
 
+	def apply_voice(req: dict) -> None:
+		"""把请求里的 sid / speed 真正应用到引擎上。
+
+		之前只有 ensure_engine 首次建引擎时读一次 sid —— 之后所有 say 的 sid 全被忽略，
+		听起来就是"所有音色都一个声"。换 sid 只需改属性；换 speed 要重建（length_scale 在建引擎时固化）。
+		"""
+		eng = st["engine"]
+		if eng is None:
+			return
+		sid = req.get("sid")
+		if sid is not None:
+			try:
+				n = int(sid)
+			except Exception:
+				n = eng.sid
+			if n != eng.sid:
+				eng.sid = n
+				st["sid"] = n
+		speed = req.get("speed")
+		if speed is not None:
+			try:
+				v = max(0.5, min(2.0, float(speed)))
+			except Exception:
+				v = eng.speed
+			if abs(v - eng.speed) > 1e-6:
+				st["speed"] = v
+				st["engine"] = Engine(eng.dir, eng.sid, v)
+				st["sid"] = eng.sid
+
 	def start_next() -> None:
 		"""推进播放状态机：播下一句 / 收尾。"""
 		if st["until"] and time.time() < st["until"]:
@@ -403,6 +432,7 @@ def main() -> None:
 				if not sents:
 					reply({"id": req.get("id"), "ok": False, "error": "空文本"})
 					continue
+				apply_voice(req)
 				eng: Engine = st["engine"]
 				t0 = time.perf_counter()
 				first = eng.wav_path(sents[0])
@@ -440,15 +470,25 @@ def main() -> None:
 				reply({"id": req.get("id"), "event": "error", "msg": "install 已拆成 node 下载 + extract 解压"})
 			elif cmd == "extract":
 				do_extract(req)
+			elif cmd == "synth":
+				ensure_engine(req)
+				apply_voice(req)
+				eng = st["engine"]
+				outs = []
+				for sent in split_sentences(str(req.get("text") or "")):
+					path = eng.wav_path(sent)
+					data = path.read_bytes()
+					outs.append({"file": path.name, "bytes": len(data),
+					             "sha1": hashlib.sha1(data).hexdigest()[:16]})
+				reply({"id": req.get("id"), "ok": True, "sid": eng.sid, "speed": eng.speed, "wavs": outs})
 			elif cmd == "config":
 				if req.get("sid") is not None:
 					st["sid"] = int(req["sid"])
-					if st["engine"]:
-						st["engine"].sid = st["sid"]
 				if req.get("speed") is not None:
-					st["speed"] = float(req["speed"])
-					st["engine"] = None  # 语速要重建引擎（length_scale 在构造时定）
-				reply({"id": req.get("id"), "ok": True, "sid": st["sid"], "speed": st["speed"], "rebuilt": req.get("speed") is not None})
+					st["speed"] = max(0.5, min(2.0, float(req["speed"])))
+				apply_voice(req)  # 已建引擎时立即生效（换 speed 会重建，length_scale 在构造时固化）
+				reply({"id": req.get("id"), "ok": True, "sid": st["sid"], "speed": st["speed"],
+				       "rebuilt": req.get("speed") is not None})
 			elif cmd in ("shutdown", "_eof"):
 				stop_play()
 				reply({"id": req.get("id"), "ok": True, "bye": True, "reason": cmd})
