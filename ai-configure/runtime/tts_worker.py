@@ -158,6 +158,15 @@ def prune_cloud_cache(max_bytes: int = CLOUD_MAX_BYTES, max_age_days: int = CLOU
 USAGE_FILE = _agent_dir() / "narration" / "usage.json"
 
 
+def _say_stderr(msg: str) -> None:
+	"""最原始的日志通道：只写 stderr，绝不因为日志本身失败。"""
+	try:
+		sys.stderr.write("[cloud] " + msg + chr(10))
+		sys.stderr.flush()
+	except Exception:
+		pass
+
+
 def cloud_call(key: str, rid: str, fn):
 	"""豆包常驻连接空闲会被服务端关掉（报 RuntimeError: 连接关闭）。
 
@@ -173,8 +182,8 @@ def cloud_call(key: str, rid: str, fn):
 			last = e
 			doubao_ws.drop(key, rid)
 			if attempt == 0:
-				if log:
-					log(f"cloud 连接失效，重建重试：{type(e).__name__}: {e}")
+				# ⚠️ 这里不能调 log()：worker 模块里没有这个函数（曾经因此 NameError 把重试也带崩）
+				_say_stderr(f"cloud 连接失效，重建重试：{type(e).__name__}: {e}")
 				time.sleep(0.2)
 	raise last
 
