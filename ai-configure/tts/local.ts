@@ -42,6 +42,9 @@ export function extRoot(): string {
 }
 
 export function workerPath(): string {
+	// 允许覆盖：打包成单文件（测试/工具）时 import.meta.url 会变，靠这个指回真实路径
+	const env = process.env.PI_TTS_WORKER;
+	if (env && existsSync(env)) return env;
 	return join(extRoot(), "runtime", "tts_worker.py");
 }
 
@@ -83,7 +86,7 @@ type Pending = { resolve: (v: any) => void; reject: (e: Error) => void; timer: N
 export class LocalTtsClient {
 	private child: ChildProcessWithoutNullStreams | null = null;
 	private pending = new Map<number, Pending>();
-	private doneWaiters = new Map<number, () => void>();
+	private doneWaiters = new Map<number, (msg: any) => void>();
 	private seq = 1;
 	private buf = "";
 	private restarts = 0;
@@ -205,7 +208,7 @@ export class LocalTtsClient {
 				const w = this.doneWaiters.get(id);
 				if (w) {
 					this.doneWaiters.delete(id);
-					w();
+					w(msg);
 					return;
 				}
 			}
@@ -270,15 +273,15 @@ export class LocalTtsClient {
 		const firstMs = Number(msg.first_ms ?? 0);
 		opts?.onFirst?.(firstMs);
 		// 等 worker 报 done（全部句子播完），队列才知道什么时候能播下一条
-		await new Promise<void>((resolve) => {
-			this.doneWaiters.set(id, resolve);
+		const total = await new Promise<number>((resolve) => {
+			this.doneWaiters.set(id, (m: any) => resolve(Number(m?.dur ?? 0)));
 			// 兜底：万一 done 丢了，按首句时长 + 30s 超时释放
 			const t = setTimeout(() => {
-				if (this.doneWaiters.delete(id)) resolve();
+				if (this.doneWaiters.delete(id)) resolve(Number(msg.dur ?? 0));
 			}, 180_000); // 长稿子（>30s 音频）也要能等到 done
 			t.unref?.();
 		});
-		return { firstMs, dur: Number(msg.dur ?? 0) };
+		return { firstMs, dur: total || Number(msg.dur ?? 0) };
 	}
 
 	/** 打断当前播报（毫秒级：worker 侧 SND_PURGE） */

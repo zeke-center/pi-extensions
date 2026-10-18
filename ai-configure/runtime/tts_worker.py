@@ -304,7 +304,8 @@ def main() -> None:
 	sid = int(os.environ.get("PI_TTS_SID") or 50)
 	speed = float(os.environ.get("PI_TTS_SPEED") or 1.0)
 	st: dict = {"engine": None, "model_dir": None, "sid": sid, "speed": speed,
-	            "plan": [], "until": 0.0, "id": None, "total": 0.0, "first_ms": None}
+	            "plan": [], "until": 0.0, "id": None, "total": 0.0, "first_ms": None,
+	            "pending": 0}
 
 	q: "queue.Queue[str]" = queue.Queue()
 
@@ -352,6 +353,8 @@ def main() -> None:
 			play(path, blocking=False)
 			st["until"] = time.time() + dur
 			return
+		if st["pending"] > 0:
+			return  # 还有句子在后台合成，别急着报 done
 		if st["id"] is not None:
 			reply({"id": st["id"], "ok": True, "done": True, "dur": round(st["total"], 2)})
 			st["id"] = None
@@ -361,6 +364,7 @@ def main() -> None:
 		st["plan"].clear()
 		st["until"] = 0.0
 		st["total"] = 0.0
+		st["pending"] = 0
 		if st["id"] is not None:
 			reply({"id": st["id"], "ok": True, "interrupted": True})
 			st["id"] = None
@@ -383,10 +387,12 @@ def main() -> None:
 		try:
 			if cmd == "ping":
 				eng = st["engine"]
+				md = st["model_dir"] or resolve_model(req.get("model"))
 				reply({"id": req.get("id"), "ok": True, "engine": "sherpa-onnx",
-				       "model": st["model_dir"].name if st["model_dir"] else None,
-				       "kind": eng.kind if eng else None,
+				       "model": md.name if md else None,
+				       "kind": eng.kind if eng else ("kokoro" if md and (md / "voices.bin").exists() else ("vits" if md else None)),
 				       "sample_rate": eng.sample_rate if eng else None,
+				       "_sr_loaded": bool(eng),
 				       "sid": st["sid"], "speed": st["speed"],
 				       "models_dir": str(MODELS_DIR)})
 			elif cmd == "say":
@@ -410,6 +416,7 @@ def main() -> None:
 				reply({"id": st["id"], "ok": True, "first_ms": round(st["first_ms"]), "dur": round(d0, 2)})
 				# 剩下的句子后台合成，避免阻塞命令处理
 				rest = sents[1:]
+				st["pending"] = len(rest)
 
 				def synth_rest() -> None:
 					for sen in rest:
@@ -421,6 +428,8 @@ def main() -> None:
 							st["total"] += dur
 						except Exception:
 							pass
+						finally:
+							st["pending"] = max(0, st["pending"] - 1)
 
 				if rest:
 					threading.Thread(target=synth_rest, daemon=True).start()
