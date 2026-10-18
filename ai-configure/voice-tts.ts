@@ -65,6 +65,7 @@ let lastStepAt = 0;
 let stepsThisTurn = 0;
 let lastStepText = "";
 let turnStartAt = 0;
+let turnRemote = false; // 本轮是不是手机发起的（在消息到达那一刻定格）
 let lastRetryAt = 0;
 let voiceFailures = 0; // 连续失败计数 → 熔断，绝不拖累主流程
 let disposeAsk: (() => void) | null = null;
@@ -132,7 +133,8 @@ function playLocally(): boolean {
 	const r = (readCfg().voiceRoute ?? "auto") as "auto" | "both" | "pc" | "phone";
 	if (r === "pc" || r === "both") return true;
 	if (r === "phone") return false;
-	return !isRemoteTurn();
+	if (r === "auto") return !turnRemote;
+	return !turnRemote;
 }
 
 /** 要不要把这条发到手机（auto 时手机发起才发；both 恒发；phone 恒发） */
@@ -142,8 +144,7 @@ function sendToPhone(): boolean {
 	if (r === "pc") return false;
 	if (r === "both" || r === "phone") return true;
 	// auto：手机发起的一轮**必须**发回手机（否则你在外面就彻底没声音了）
-	if (isRemoteTurn()) return true;
-	return false;
+	return turnRemote;
 }
 
 /** 把这段口播合成语音条发回手机（豆包 ogg_opus；没有豆包就发 wav 文件） */
@@ -172,10 +173,24 @@ async function sendPhoneVoice(text: string): Promise<void> {
 				const { sendVoiceToPhone } = await import("./remote");
 				const n = await sendVoiceToPhone(msg.file, { caption: text.slice(0, 200) });
 				if (n) refreshUsage();
+				else note(`语音条发送失败：没有绑定会话或 Telegram 拒绝`);
 			}
 		}
+	} catch (e) {
+		note(`语音条异常：${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
+/** 往 narration 里记一条说明（排查用，不进模型上下文） */
+function note(msg: string): void {
+	try {
+		const dir = join(getAgentDir(), "narration");
+		mkdirSync(dir, { recursive: true });
+		const d = new Date();
+		const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+		appendFileSync(join(dir, `${day}.jsonl`), JSON.stringify({ at: d.toISOString(), event: "note", msg }) + String.fromCharCode(10), "utf8");
 	} catch {
-		/* 发不出去就算了，绝不打扰主流程 */
+		/* 记不上就算了 */
 	}
 }
 
@@ -232,15 +247,25 @@ function firstSentence(text: string): string {
 }
 
 function speakResult(): void {
-	if (!enabled()) return;
+	if (!enabled()) {
+		note("结论未播：voiceTts 关着");
+		return;
+	}
 	const s = ensureSpeech();
-	if (!s) return;
+	if (!s) {
+		note("结论未播：语音模块没初始化");
+		return;
+	}
 	const c = readCfg();
 	const u = render(
 		{ kind: "result", full: lastAssistantText, text: firstSentence(lastAssistantText), ref: "turn" },
 		{ level: (c.voiceLevel ?? "brief") as SpeechLevel, terms: (c.voiceTerms ?? "en") as TermMode, toneMode: (c.voiceTone ?? "off") as "off" | "auto" },
 	);
-	if (!u) return;
+	if (!u) {
+		note("结论未播：口播稿渲染为空");
+		return;
+	}
+	note(`结论分发：电脑=${playLocally()} 手机=${sendToPhone()} 长度=${u.text.length}`);
 	if (playLocally()) s.speaker.say(u);
 	if (sendToPhone()) void sendPhoneVoice(u.text).catch(() => {});
 }
@@ -664,6 +689,10 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			try {
 				const level = (readCfg().voiceLevel ?? "brief") as SpeechLevel;
 				const stepsOn = level === "steps" || level === "chatty";
+				// ⚠️ 关键：在"这条消息到达的瞬间"定格来源。
+				// 之前每次播报都去问 isRemoteTurn()，而上一轮的 agent_settled
+				// 可能在你发新消息之后才触发，会把标记清掉 → 整轮被判成电脑轮。
+				turnRemote = isRemoteTurn();
 				if (speaker && stepsOn) void speaker.stopAll().catch(() => {});
 				lastAssistantText = "";
 				lastStepText = "";
@@ -671,6 +700,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 				refreshUsage();
 				stepsThisTurn = 0;
 				lastStepAt = 0;
+				if (turnRemote) return; // 手机轮：电脑端连"收到"也不念
 				if (stepsOn && (readCfg().voiceAck ?? true) && enabled() && !isExtDisabled() && voiceFailures < 3) {
 					const sp = ensureSpeech();
 					const u = render({ kind: "step", text: "收到，我看一下。", ref: "ack" }, { level, terms: (readCfg().voiceTerms ?? "en") as TermMode });
