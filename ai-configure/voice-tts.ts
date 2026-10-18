@@ -237,6 +237,16 @@ function speechSettings(): SettingDef[] {
 			set: (v) => patchCfg({ voiceTerms: v as TermMode }),
 		},
 		{
+			key: "voiceAck",
+			group: GROUP,
+			label: "开口先应一声",
+			desc: "你发消息后先播一句「收到」（steps/chatty 档生效）。我会在动手前再补一句具体要干什么。",
+			kind: "bool",
+			def: true,
+			get: () => readCfg().voiceAck ?? true,
+			set: (v) => patchCfg({ voiceAck: v }),
+		},
+		{
 			key: "voiceLevel",
 			group: GROUP,
 			label: "播报级别",
@@ -272,6 +282,29 @@ function speechSettings(): SettingDef[] {
 		action("tts.status", "/tts status", "看引擎状态：用了哪档、模型在不在、为什么不可用", async (c) => c.ui.notify(await statusText(), "info")),
 		action("tts.test", "/tts test", "说一句测试句（含 GitHub / CI / TypeScript / diff 这些难点词）", async (c) => {
 			await testSay(c);
+		}),
+		action("tts.demo", "/tts demo", "演一遍完整播报节奏：收到 → 看后端 → 改 → 测 → 结论（约 40 秒）", async () => {
+			const c = curCtx;
+			if (!c) return;
+			const sp = ensureSpeech();
+			if (!sp) return;
+			c.ui.notify("演示一遍完整播报节奏（约 40 秒）", "info");
+			void (async () => {
+				try {
+					for (const t of [
+						"收到，我先去看后端怎么实现的。",
+						"后端看完了，问题在配置合并那一步，我改一下。",
+						"改完了，跑个测试。",
+						"测试全过了，一百零四项。现在推双端。",
+						"这轮做完了。第一，配置合并的覆盖顺序修好了。第二，一百零四项测试全过。第三，已经推到 GitHub 和 Gitee。下一步要不要我把告警也接上？",
+					]) {
+						await sp.router.say(t);
+						await new Promise((r) => setTimeout(r, 600));
+					}
+				} catch (e) {
+					c.ui.notify(`演示中断：${e instanceof Error ? e.message : String(e)}`, "error");
+				}
+			})();
 		}),
 		action("tts.install", "/tts install", "下载选中的本地模型（384MB/183MB，支持断点续传与镜像切换）", async (c) => {
 			await installWithProgress(c);
@@ -372,11 +405,17 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 		if (msg?.role === "user") {
 			try {
 				const level = (readCfg().voiceLevel ?? "brief") as SpeechLevel;
-				if (speaker && (level === "steps" || level === "chatty")) {
-					const sp = ensureSpeech();
-					if (sp) void sp.speaker.stopAll().catch(() => {});
-				}
+				const stepsOn = level === "steps" || level === "chatty";
+				if (speaker && stepsOn) void speaker.stopAll().catch(() => {});
 				lastAssistantText = "";
+				lastStepText = "";
+				stepsThisTurn = 0;
+				lastStepAt = 0;
+				if (stepsOn && (readCfg().voiceAck ?? true) && enabled() && !isExtDisabled() && voiceFailures < 3) {
+					const sp = ensureSpeech();
+					const u = render({ kind: "step", text: "收到，我看一下。", ref: "ack" }, { level, terms: (readCfg().voiceTerms ?? "en") as TermMode });
+					if (sp && u) sp.speaker.say(u);
+				}
 			} catch {
 				voiceFailures += 1;
 			}
@@ -507,6 +546,30 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 				patchCfg({ voiceSpeed: v });
 				await router?.reconfigure({ speed: v });
 				return void ctx.ui.notify(`语速已设为 ${v}`, "info");
+			}
+			if (a === "demo") {
+				const sp = ensureSpeech();
+				if (!sp) return;
+				ctx.ui.notify("演示一遍完整播报节奏（约 40 秒，可 /tts off 打断）", "info");
+				void (async () => {
+					const level = (readCfg().voiceLevel ?? "brief") as SpeechLevel;
+					const flow: [string, "step" | "result"][] = [
+						["收到，我先去看后端怎么实现的。", "step"],
+						["后端看完了，问题在配置合并那一步，我改一下。", "step"],
+						["改完了，跑个测试。", "step"],
+						["测试全过了，一百零四项。现在推双端。", "step"],
+						["这轮做完了。第一，配置合并的覆盖顺序修好了。第二，一百零四项测试全过。第三，已经推到 GitHub 和 Gitee。下一步要不要我把告警也接上？", "result"],
+					];
+					try {
+						for (const [text, kind] of flow) {
+							await sp.router.say(text);
+							await new Promise((r) => setTimeout(r, 600));
+						}
+					} catch (e) {
+						ctx.ui.notify(`演示中断：${e instanceof Error ? e.message : String(e)}`, "error");
+					}
+				})();
+				return;
 			}
 			if (a.startsWith("voices")) {
 				const s = ensureSpeech();
