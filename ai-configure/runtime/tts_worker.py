@@ -98,6 +98,16 @@ def split_sentences(text: str, first_len: int = 14, max_len: int = 40) -> list[s
 # --------------------------------------------------------------------------- #
 # 引擎
 # --------------------------------------------------------------------------- #
+def find_model_file(d: Path) -> Path | None:
+	"""模型文件名各家不一样（model.onnx / vits-aishell3.onnx ...），优先非 int8 的。"""
+	exact = d / "model.onnx"
+	if exact.exists():
+		return exact
+	cands = sorted([p for p in d.glob("*.onnx")])
+	plain = [p for p in cands if "int8" not in p.name]
+	return (plain or cands or [None])[0]
+
+
 class Engine:
 	"""按模型目录自动识别 Kokoro / VITS(MeloTTS)，都走 sherpa-onnx。"""
 
@@ -109,13 +119,16 @@ class Engine:
 		self.speed = speed
 		self.length_scale = 1.0 / max(0.5, min(2.0, speed))
 		self.kind = "kokoro" if (model_dir / "voices.bin").exists() else "vits"
+		self.model_file = find_model_file(model_dir)
+		if self.model_file is None:
+			raise RuntimeError(f"目录里没有 .onnx 模型：{model_dir}")
 
 		if self.kind == "kokoro":
 			lexicon = model_dir / "lexicon.txt"
 			if not lexicon.exists():
 				lexicon = self._merged_lexicon(model_dir)
 			m = sherpa_onnx.OfflineTtsKokoroModelConfig(
-				model=str(model_dir / "model.onnx"),
+				model=str(self.model_file),
 				voices=str(model_dir / "voices.bin"),
 				tokens=str(model_dir / "tokens.txt"),
 				data_dir=str(model_dir / "espeak-ng-data"),
@@ -125,10 +138,12 @@ class Engine:
 			)
 			rules = [model_dir / f for f in ("date-zh.fst", "number-zh.fst", "phone-zh.fst") if (model_dir / f).exists()]
 		else:
+			dict_dir = model_dir / "dict"
 			m = sherpa_onnx.OfflineTtsVitsModelConfig(
-				model=str(model_dir / "model.onnx"),
+				model=str(self.model_file),
 				lexicon=str(model_dir / "lexicon.txt"),
 				tokens=str(model_dir / "tokens.txt"),
+				dict_dir=str(dict_dir) if dict_dir.exists() else "",
 				noise_scale=0.667,
 				noise_scale_w=0.8,
 				length_scale=self.length_scale,

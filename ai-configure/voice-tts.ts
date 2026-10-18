@@ -208,11 +208,11 @@ function speechSettings(): SettingDef[] {
 			key: "voiceLocalVoice",
 			group: GROUP,
 			label: "音色",
-			desc: "Kokoro 音色号：46~49 中文女声、50~52 中文男声（默认 50 = zm_yunjian 沉稳男声）、0~19 英文美式。MeloTTS 只有 0。",
+			desc: "Kokoro 音色号：45~48 中文女声、49~52 中文男声（49 zm_yunjian 沉稳 / 50 zm_yunxi 年轻 / 51 zm_yunxia 浑厚 / 52 zm_yunyang 清朗）、0~19 美式英语。MeloTTS 只有 0。",
 			kind: "number",
 			min: 0,
 			max: 60,
-			def: 50,
+			def: 49,
 			get: () => Math.round(num(readCfg().voiceLocalVoice, 50, 0, 60)),
 			set: (v) => {
 				const sid = Math.round(num(v, 50, 0, 60));

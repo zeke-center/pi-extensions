@@ -1,23 +1,44 @@
 {
   "_note": "模型清单：只放元数据，模型本体不进 git（下载到 ~/.pi/agent/models/tts/）。content_sha256 = 对目录内所有文件按其相对路径排序后做的确定性哈希，安装时用于校验（比只校验 tar 包更严，能发现解压不全）。",
-  "defaultModel": "kokoro-multi-lang-v1_0",
+  "defaultModel": "kokoro-multi-lang-v1_1",
   "models": [
     {
+      "id": "kokoro-multi-lang-v1_1",
+      "label": "Kokoro 82M 多语 v1.1（中文男声推荐 · 中英混读最稳）",
+      "engine": "sherpa-onnx-kokoro",
+      "bytes": 364800000,
+      "sampleRate": 24000,
+      "license": "Apache-2.0",
+      "kind": "kokoro",
+      "defaultSid": 49,
+      "sidNote": "45-48 中文女声；49-52 中文男声（49 zm_yunjian 沉稳 / 50 zm_yunxi 年轻 / 51 zm_yunxia 浑厚 / 52 zm_yunyang 清朗）；0-19 美式英语；20-27 英式英语",
+      "urls": [
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2",
+        "https://hf-mirror.com/csukuangfj/sherpa-onnx-tts-models/resolve/main/kokoro-multi-lang-v1_1.tar.bz2"
+      ],
+      "content_sha256": "b5fe9b790e07d796e87e1699911bf4d58811856089df679284f1f5aadbcc373f",
+      "postInstall": [
+        "mergeLexicon:lexicon-zh.txt+lexicon-us-en.txt"
+      ]
+    },
+    {
       "id": "kokoro-multi-lang-v1_0",
-      "label": "Kokoro 82M 多语（英文强 · 54 音色 · 推荐）",
+      "label": "Kokoro 82M 多语 v1.0（54 音色 · 老版）",
       "engine": "sherpa-onnx-kokoro",
       "bytes": 410163200,
       "sampleRate": 24000,
       "license": "Apache-2.0",
       "kind": "kokoro",
-      "defaultSid": 50,
-      "sidNote": "46-49 中文女声；50-52 中文男声；0-19 英文美式；20-27 英文英式；53 西语",
+      "defaultSid": 49,
+      "sidNote": "45-48 中文女声；49-52 中文男声；0-19 美式英语；20-27 英式英语；28-44 西/法/印地/意/日/葡；53 西语男",
       "urls": [
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2",
         "https://hf-mirror.com/csukuangfj/sherpa-onnx-tts-models/resolve/main/kokoro-multi-lang-v1_0.tar.bz2"
       ],
       "content_sha256": "58b23330e9fb437ec0bf60c8e840f67564d93c4f424cfe634349d0ba23b5bfdd",
-      "postInstall": ["mergeLexicon:lexicon-zh.txt+lexicon-us-en.txt"]
+      "postInstall": [
+        "mergeLexicon:lexicon-zh.txt+lexicon-us-en.txt"
+      ]
     },
     {
       "id": "vits-melo-tts-zh_en",
@@ -35,11 +56,30 @@
       ],
       "content_sha256": "2499996d8d1f97ef7e49ec6177c7b4ef22b3ec31091e72f60d7e279270bc2a41",
       "postInstall": []
+    },
+    {
+      "id": "vits-zh-aishell3",
+      "label": "AISHELL3 174 说话人（男声多 · **但不念英文**，仅作对比）",
+      "engine": "sherpa-onnx-vits",
+      "bytes": 146900000,
+      "sampleRate": 22050,
+      "license": "Apache-2.0",
+      "kind": "vits",
+      "defaultSid": 121,
+      "sidNote": "174 个说话人，含约 31 个男声（实测 004/032/035/069/074/091/121/143 偏男）；英文词会被吞掉（OOV），不适合中英混读",
+      "urls": [
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-zh-aishell3.tar.bz2",
+        "https://hf-mirror.com/csukuangfj/sherpa-onnx-tts-models/resolve/main/vits-zh-aishell3.tar.bz2"
+      ],
+      "content_sha256": "ef3e00c91a74253eaf6266fc3473b5815d549424b71549cf7985227b5fe2dcf8",
+      "postInstall": []
     }
   ],
   "requirements": {
     "python": "3.9+",
-    "pipPackages": ["sherpa-onnx"],
+    "pipPackages": [
+      "sherpa-onnx"
+    ],
     "note": "插件不会自动 pip install（不污染用户环境）；探测不到就在面板上给一行安装命令，并自动回退系统语音"
   }
 }
