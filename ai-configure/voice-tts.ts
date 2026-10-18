@@ -49,6 +49,7 @@ let toolStartAt = 0;
 let progressSent = false;
 let lastStepAt = 0;
 let stepsThisTurn = 0;
+let lastStepText = "";
 let voiceFailures = 0; // 连续失败计数 → 熔断，绝不拖累主流程
 let disposeAsk: (() => void) | null = null;
 
@@ -367,6 +368,20 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 
 	api.on("message_end", async (event) => {
 		const msg = (event as { message?: { role?: string; content?: unknown } }).message;
+		// 用户开口 = 打断我：正在念的先停（拟人感的关键：别自顾自说）
+		if (msg?.role === "user") {
+			try {
+				const level = (readCfg().voiceLevel ?? "brief") as SpeechLevel;
+				if (speaker && (level === "steps" || level === "chatty")) {
+					const sp = ensureSpeech();
+					if (sp) void sp.speaker.stopAll().catch(() => {});
+				}
+				lastAssistantText = "";
+			} catch {
+				voiceFailures += 1;
+			}
+			return;
+		}
 		if (msg?.role !== "assistant") return;
 		const c = msg.content;
 		if (typeof c === "string") lastAssistantText = c;
@@ -383,6 +398,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 		progressSent = false;
 		stepsThisTurn = 0;
 		lastStepAt = 0;
+		lastStepText = "";
 		if (isExtDisabled()) return;
 		speakResult();
 	});
@@ -402,13 +418,17 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 			const ev = event as Record<string, any>;
 			const tool = String(ev.toolName ?? ev.name ?? ev.tool?.name ?? "");
 			if (!tool) return;
+			// 我写的口语行优先（懂语义、像人话）；没写才退回规则模板
+			let mine = extractStep(lastAssistantText);
+			if (mine && mine === lastStepText) mine = null; // 同一句话不重复念
 			const u = render(
-				{ kind: "step", text: stepTextFor(tool, ev.input ?? ev.args ?? ev.parameters), ref: tool },
+				{ kind: "step", text: mine ?? stepTextFor(tool, ev.input ?? ev.args ?? ev.parameters), ref: mine ? "step" : tool },
 				{ level, terms: (readCfg().voiceTerms ?? "en") as TermMode },
 			);
 			if (!u) return;
 			lastStepAt = now;
 			stepsThisTurn += 1;
+			if (mine) lastStepText = mine;
 			const sp = ensureSpeech();
 			if (sp) sp.speaker.say(u);
 		} catch {

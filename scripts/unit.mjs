@@ -1126,6 +1126,10 @@ allOk =
 			'ok("阶段：read 不念文件名", (() => { const t = stepTextFor("read", { path: "src/a/b.ts" }); return t.indexOf("b.ts") < 0 && t.length <= 20; })());',
 			'ok("阶段：delegate → 派助理", /助理/.test(stepTextFor("delegate", {})));',
 			'ok("阶段：未知工具也有兜底句", stepTextFor("mystery_tool", {}).length > 2);',
+			'ok("口语行：能从回答里抽出 <step>", extractStep("先说明一句。" + String.fromCharCode(10) + "<step>收到，我先去看后端实现</step>" + String.fromCharCode(10) + "然后动手。") === "收到，我先去看后端实现");',
+			'ok("口语行：多条取最后一条", extractStep("<step>第一步</step> 中间 <step>第二步</step>") === "第二步");',
+			'ok("口语行：没写就返回 null（走规则兜底）", extractStep("普通回答，没有标记") === null);',
+			'ok("口语行：退化成 markdown 也能念", (() => { const t = extractStep("<step>**收到**，看 `server.ts`</step>"); return !!t && t.indexOf("*") < 0 && t.indexOf("`") < 0; })());',
 		],
 	) && allOk;
 

@@ -237,3 +237,18 @@ export function stepTextFor(tool: string, input: any): string {
 	if (t === "web_search" || t === "webfetch" || t === "fetch") return "上网查一下资料。";
 	return "继续下一步。";
 }
+
+/**
+ * 抽我自己写的阶段口语行：`<step>收到，我先去看后端实现</step>`。
+ *
+ * 为什么让我自己写：模板句（"看一下这段代码"）信息量低、听着像机器人。
+ * 我清楚"这一步到底在干什么"，一句话就够，成本约 10 token，不阻塞任何流程。
+ * 取**最后一条**（同一段里我可能写了多条，最新的最贴近当下的动作）。
+ */
+export function extractStep(text: string): string | null {
+	const t = String(text || "");
+	const all = [...t.matchAll(/<step>([\s\S]{1,120}?)<\/step>/gi)];
+	if (!all.length) return null;
+	const body = sanitizeForSpeech(all[all.length - 1][1]);
+	return body.length >= 2 ? body : null;
+}
