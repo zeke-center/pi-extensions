@@ -410,6 +410,7 @@ class CloudConn:
             ws_send(self.sock, pack(MSG_FULL_CLIENT, EV["FinishSession"], b"{}", session_id=sid))
 
             pcm = bytearray()
+            words = 0
             while True:
                 op, d = self.rd.frame()
                 if op == 0x9:
@@ -420,7 +421,13 @@ class CloudConn:
                 t, ev, seq, payload = unpack(d)
                 if t == MSG_AUDIO_ONLY:
                     pcm += payload
-                elif ev in (EV["SessionFinished"], EV["SessionFailed"], EV["SessionCanceled"]):
+                elif ev == EV["SessionFinished"]:
+                    try:
+                        words = int((json.loads(payload.decode() or "{}").get("usage") or {}).get("text_words") or 0)
+                    except Exception:
+                        words = 0
+                    break
+                elif ev in (EV["SessionFailed"], EV["SessionCanceled"]):
                     break
             if not pcm:
                 raise RuntimeError("豆包没有返回音频")
@@ -429,7 +436,7 @@ class CloudConn:
                 w.setsampwidth(2)
                 w.setframerate(sample_rate)
                 w.writeframes(bytes(pcm))
-            return out_path
+            return {"path": out_path, "words": words}
         except Exception:
             self.dead = True
             raise

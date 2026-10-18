@@ -35,6 +35,8 @@ interface Cfg {
 	voiceLocalVoice?: number;
 	voiceTerms?: TermMode;
 	voiceTone?: "off" | "auto";
+	/** 豆包单价：元/万字符（用于状态栏估算） */
+	voicePrice?: number;
 	voiceLevel?: SpeechLevel;
 	voiceTtsVoice?: string;
 	voiceTtsRate?: number;
@@ -301,6 +303,18 @@ function speechSettings(): SettingDef[] {
 			set: (v) => patchCfg({ voiceAck: v }),
 		},
 		{
+			key: "voicePrice",
+			group: GROUP,
+			label: "单价（元/万字符）",
+			desc: "只用于**状态栏估算**花费，不影响实际计费。豆包 TTS 2.0 按字符计费，控制台账单为准（大致 0.8~1.2）。",
+			kind: "number",
+			min: 0,
+			max: 100,
+			def: 1.0,
+			get: () => num(readCfg().voicePrice, 1.0, 0, 100),
+			set: (v) => patchCfg({ voicePrice: num(v, 1.0, 0, 100) }),
+		},
+		{
 			key: "voiceTone",
 			group: GROUP,
 			label: "语气（豆包）",
@@ -387,6 +401,48 @@ function speechSettings(): SettingDef[] {
 // --------------------------------------------------------------------------- #
 // 动作实现
 // --------------------------------------------------------------------------- #
+const USAGE_KEY = "voice-tts-usage";
+
+/** 今天的语音用量 + 估算花费（读 worker 写的 narration/usage.json） */
+function todayUsage(): { words: number; cached: number; calls: number; local: number } {
+	try {
+		const f = join(getAgentDir(), "narration", "usage.json");
+		const all = JSON.parse(readFileSync(f, "utf8") || "{}") as Record<string, { words?: number; cached?: number; calls?: number; local?: number }>;
+		const d = new Date();
+		const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+		const v = all[k] || {};
+		return { words: Number(v.words ?? 0), cached: Number(v.cached ?? 0), calls: Number(v.calls ?? 0), local: Number(v.local ?? 0) };
+	} catch {
+		return { words: 0, cached: 0, calls: 0, local: 0 };
+	}
+}
+
+/** 把"今天说了多少字、花了多少钱"刷到输入框上方那行状态栏 */
+function refreshUsage(ctx: ExtensionContext | undefined): void {
+	const c = ctx ?? curCtx;
+	if (!c?.hasUI) return;
+	try {
+		if (!enabled() || isExtDisabled()) {
+			c.ui.setStatus(USAGE_KEY, undefined);
+			return;
+		}
+		const u = todayUsage();
+		if (!u.calls && !u.words && !u.local) {
+			c.ui.setStatus(USAGE_KEY, undefined);
+			return;
+		}
+		const price = num(readCfg().voicePrice, 1.0, 0, 100);
+		const cost = (u.words / 10000) * price;
+		const bits: string[] = [];
+		if (u.words) bits.push(`🔊 豆包 ${u.words.toLocaleString()} 字`, `¥${cost.toFixed(2)}`);
+		if (u.local) bits.push(`${bits.length ? "· " : "🔊 "}本地 ${u.local.toLocaleString()} 字 ¥0`);
+		if (u.cached) bits.push(`· 缓存免单 ${u.cached} 字`);
+		c.ui.setStatus(USAGE_KEY, c.ui.theme.fg("accent", bits.join("  ")));
+	} catch {
+		/* 状态栏失败绝不影响播报 */
+	}
+}
+
 async function cloudCacheText(): Promise<string> {
 	try {
 		const dir = join(getAgentDir(), "models", "tts", ".cloud-cache");
@@ -485,6 +541,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 	api.on("session_start", async (_e, ctx) => {
 		curCtx = ctx;
 		lastAssistantText = "";
+		refreshUsage(ctx);
 		// 预热：豆包握手 3~4 秒，趁用户还在打字先做掉（失败静默，绝不影响主流程）
 		try {
 			const sp = ensureSpeech();
@@ -504,6 +561,7 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 				if (speaker && stepsOn) void speaker.stopAll().catch(() => {});
 				lastAssistantText = "";
 				lastStepText = "";
+				refreshUsage();
 				stepsThisTurn = 0;
 				lastStepAt = 0;
 				if (stepsOn && (readCfg().voiceAck ?? true) && enabled() && !isExtDisabled() && voiceFailures < 3) {
@@ -533,8 +591,12 @@ export function setupVoiceTts(api: ExtensionAPI): void {
 		stepsThisTurn = 0;
 		lastStepAt = 0;
 		lastStepText = "";
-		if (isExtDisabled()) return;
+		if (isExtDisabled()) {
+			refreshUsage();
+			return;
+		}
 		speakResult();
+		refreshUsage();
 	});
 
 	// 长任务占位播报（工具跑了 8 秒还没完 → 一句"还在跑"，20 秒后过期丢弃）

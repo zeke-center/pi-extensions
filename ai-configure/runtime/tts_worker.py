@@ -155,6 +155,36 @@ def prune_cloud_cache(max_bytes: int = CLOUD_MAX_BYTES, max_age_days: int = CLOU
 	return {"removed": removed, "bytes": removed_bytes, "left": total}
 
 
+USAGE_FILE = _agent_dir() / "narration" / "usage.json"
+
+
+def record_usage(words: int, cached: bool = False, chars: int = 0, local: bool = False) -> None:
+	"""记语音用量：豆包按字符计费，本地引擎 0 元但字数照样统计。
+
+	落盘 <agentDir>/narration/usage.json：{ "2026-10-18": {"words":123,"cached":45,"calls":7}, ... }
+	只留最近 14 天，免得越滚越大。
+	"""
+	try:
+		USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+		try:
+			data = json.loads(USAGE_FILE.read_text(encoding="utf-8") or "{}")
+		except Exception:
+			data = {}
+		day = time.strftime("%Y-%m-%d")
+		d = data.get(day) or {"words": 0, "cached": 0, "calls": 0, "local": 0}
+		if local:
+			d["local"] = int(d.get("local") or 0) + int(chars or 0)
+		d["words"] = int(d.get("words") or 0) + int(words or 0)
+		d["cached"] = int(d.get("cached") or 0) + int(chars or 0 if cached else 0)
+		d["calls"] = int(d.get("calls") or 0) + 1
+		data[day] = d
+		for k in sorted(data)[:-14]:
+			data.pop(k, None)
+		USAGE_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+	except Exception:
+		pass
+
+
 def cloud_cache_size() -> int:
 	try:
 		return sum(p.stat().st_size for p in CLOUD_DIR.glob("*.wav"))
@@ -482,10 +512,12 @@ def main() -> None:
 		def synth_one(sent: str) -> Path:
 			p = target(sent)
 			if p.exists() and p.stat().st_size > 1000:
+				record_usage(0, cached=True, chars=len(sent))   # 命中缓存：不花钱
 				return p
 			tmp = CLOUD_DIR / (p.stem + ".part.wav")
-			conn.synth(sent, speaker, str(tmp), sr, speed or 0, tone)
+			r = conn.synth(sent, speaker, str(tmp), sr, speed or 0, tone)
 			tmp.replace(p)
+			record_usage(int((r or {}).get("words") or 0) or len(sent))
 			return p
 
 		t0 = time.perf_counter()
@@ -589,6 +621,10 @@ def main() -> None:
 					continue
 				apply_voice(req)
 				eng: Engine = st["engine"]
+				try:
+					record_usage(0, chars=len(text), local=True)   # 本地引擎：0 元，只统计字数
+				except Exception:
+					pass
 				t0 = time.perf_counter()
 				first = eng.wav_path(sents[0])
 				with wave.open(str(first)) as w:
