@@ -14,6 +14,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, platform, release } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { patchExtCfg, readExtCfg } from "./shared";
 import { registerSettings } from "./settings";
 
@@ -74,6 +75,8 @@ let installId = "";
 let ctxRef: ExtensionContext | undefined;
 let sessionId = "";
 let turnNo = 0;
+let turnStartedAt = 0;
+let lastContextTokens = 0;
 let queue: TeleEvent[] = [];
 let flushing = false;
 let retries = 0;
@@ -119,6 +122,18 @@ function notify(text: string, type: "info" | "warning" | "error" = "info"): void
 	}
 }
 
+/** 把本机路径里的用户名换成 ~，避免泄露账户名。 */
+function redactPaths(text: string): string {
+	let out = text;
+	const pats: RegExp[] = [
+		/([A-Za-z]:[\\/]+Users[\\/]+)[^\\/\s"'`]+/gi,
+		/(\/c\/Users\/)[^/\s"'`]+/gi,
+		/(\/(?:home|Users)\/)[^/\s"'`]+/g,
+	];
+	for (const re of pats) out = out.replace(re, "$1~");
+	return out;
+}
+
 /** 密钥样式打码。宁可多打，不可漏。 */
 export function redact(text: string): string {
 	if (!text) return text;
@@ -132,7 +147,7 @@ export function redact(text: string): string {
 	for (const re of patterns) out = out.replace(re, (m) => (m.includes("=") || m.includes(":") ? `${m.split(/[:=]/)[0]}=[redacted]` : "[redacted]"));
 	const k = currentKey().value;
 	if (k && k.length >= 8) out = out.split(k).join("[redacted]");
-	return out;
+	return redactPaths(out);
 }
 
 /** 按档位截断字符串；超限标记 truncated。 */
@@ -167,17 +182,55 @@ function ensureInstall(): string {
 	return installId;
 }
 
+let piVerCache: string | null = null;
+/** pi 版本：环境变量 → 从入口向上找 package.json（全局安装时只能这样） */
+function piVersion(): string {
+	if (piVerCache !== null) return piVerCache;
+	const env = (process.env.PI_VERSION ?? "").trim();
+	if (env) return (piVerCache = env);
+	let dir = process.argv[1] ? dirname(process.argv[1]) : "";
+	for (let i = 0; i < 8 && dir; i++) {
+		try {
+			const p = join(dir, "package.json");
+			if (existsSync(p)) {
+				const j = JSON.parse(readFileSync(p, "utf8")) as { name?: string; version?: string };
+				if (j.name === "@earendil-works/pi-coding-agent" && j.version) return (piVerCache = j.version);
+			}
+		} catch {
+			/* ignore */
+		}
+		const up = dirname(dir);
+		if (up === dir) break;
+		dir = up;
+	}
+	return (piVerCache = "");
+}
+
+let extVerCache: string | null = null;
 function extVersion(): string {
-	for (const p of [join(getAgentDir(), "extensions/ai-configure/../package.json"), join(getAgentDir(), "extensions/ai-configure/package.json")]) {
+	if (extVerCache !== null) return extVerCache;
+	const candidates: string[] = [];
+	try {
+		candidates.push(join(dirname(fileURLToPath(import.meta.url)), "package.json"));
+	} catch {
+		/* 某些加载方式下 import.meta 不可用 */
+	}
+	candidates.push(
+		join(getAgentDir(), "extensions/ai-configure/package.json"),
+		join(getAgentDir(), "npm/node_modules/@zeke-center/pi-extensions/package.json"),
+		join(getAgentDir(), "git/gitee.com/zqk0815/pi-extensions/package.json"),
+		join(getAgentDir(), "git/github.com/zeke-center/pi-extensions/package.json"),
+	);
+	for (const p of candidates) {
 		try {
 			if (!existsSync(p)) continue;
 			const j = JSON.parse(readFileSync(p, "utf8")) as { version?: string };
-			if (j.version) return j.version;
+			if (j.version) return (extVerCache = j.version);
 		} catch {
 			/* ignore */
 		}
 	}
-	return "";
+	return (extVerCache = "");
 }
 
 function installPayload() {
@@ -186,7 +239,7 @@ function installPayload() {
 		alias: hostname().slice(0, 64),
 		os: platform(),
 		os_version: release().slice(0, 64),
-		pi_version: (process.env.PI_VERSION ?? "").slice(0, 64),
+		pi_version: piVersion(),
 		ext_version: extVersion(),
 		level,
 		consent_version: consentVersion,
@@ -211,6 +264,14 @@ export function track(kind: string, props: Record<string, unknown> = {}, extra: 
 	queue.push(ev);
 	if (queue.length >= BATCH) void flush();
 	else schedule(5000);
+}
+
+/** 把业务性拒绝和真错误分开，避免错误率虚高 */
+function classifyError(text: string): "rejected" | "aborted" | "tool_error" {
+	const t = text.slice(0, 500);
+	if (/用户没有确认|用户\*\*不要\*\*|先别做|已在电脑端选择|没有执行方案/.test(t)) return "rejected";
+	if (/aborted|abort|cancel|已取消|已中断/i.test(t)) return "aborted";
+	return "tool_error";
 }
 
 function schedule(ms: number): void {
@@ -505,6 +566,7 @@ export function setupTelemetry(api: ExtensionAPI): void {
 
 	api.on("before_agent_start", async () => {
 		turnNo++;
+		turnStartedAt = Date.now();
 	});
 
 	api.on("tool_call", async (event) => {
@@ -528,6 +590,7 @@ export function setupTelemetry(api: ExtensionAPI): void {
 				result: level === "full" ? text : text.slice(0, MAX_STR_META),
 				result_bytes: Buffer.byteLength(text),
 				error: event.isError ? text.slice(0, 500) : undefined,
+				error_kind: event.isError ? classifyError(text) : undefined,
 			},
 			{ tool: event.toolName, ok: !event.isError, duration_ms: start ? Date.now() - start : undefined },
 		);
@@ -539,6 +602,8 @@ export function setupTelemetry(api: ExtensionAPI): void {
 		sessTok.input += u.input ?? 0;
 		sessTok.output += u.output ?? 0;
 		sessTok.cacheRead += u.cacheRead ?? 0;
+		const ctxTokens = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+		lastContextTokens = ctxTokens;
 		track(
 			"turn",
 			{
@@ -547,21 +612,46 @@ export function setupTelemetry(api: ExtensionAPI): void {
 				token_output: u.output ?? 0,
 				token_cache_read: u.cacheRead ?? 0,
 				token_reasoning: u.reasoning ?? 0,
+				context_tokens: ctxTokens,
 				tool_results: event.toolResults?.length ?? 0,
 			},
-			{ duration_ms: 0 },
+			{ duration_ms: turnStartedAt ? Date.now() - turnStartedAt : 0 },
 		);
 	});
 
-	api.on("session_shutdown", async () => {
+	api.on("session_shutdown", async (event) => {
 		if (!enabled()) return;
 		track("session_end", {
 			turns: turnNo,
 			tool_calls: sessTools,
 			errors: sessErrors,
 			tokens: sessTok,
+			reason: event.reason,
 		});
 		await flush();
+	});
+
+	// 压缩：上下文压力与触发原因（manual / threshold / overflow）
+	api.on("session_compact", async (event) => {
+		track("compaction", {
+			reason: event.reason,
+			will_retry: event.willRetry,
+			from_extension: event.fromExtension,
+			context_tokens: lastContextTokens,
+		});
+	});
+
+	// 斜杠命令使用（只记命令名，不记参数内容）
+	api.on("input", async (event) => {
+		const text = event.text ?? "";
+		const m = /^\s*\/([A-Za-z0-9_-]+)/.exec(text);
+		if (m) {
+			track("command_used", {
+				command: m[1],
+				args_len: Math.max(0, text.trim().length - m[0].length),
+				source: event.source,
+			});
+		}
 	});
 
 	api.registerCommand("telemetry", {

@@ -124,6 +124,7 @@ export class Speaker {
 					ref: next.ref,
 					latency_ms: latency,
 				});
+				let errMsg = "";
 				try {
 					const r = await this.opts.router.say(next.text, (ms) => {
 						next.firstMs = ms;
@@ -133,12 +134,13 @@ export class Speaker {
 					next.status = this.preempt ? "preempted" : "done";
 				} catch (e) {
 					next.status = "error";
-					this.opts.log?.(`播报失败：${e instanceof Error ? e.message : String(e)}`);
+					errMsg = e instanceof Error ? e.message : String(e);
+					this.opts.log?.(`播报失败：${errMsg}`);
 				}
 				next.endedAt = Date.now();
 				track(
 					"tts_play",
-					{ engine: next.engine ?? "", kind: next.kind, chars: next.text.length },
+					{ engine: next.engine ?? "", kind: next.kind, chars: next.text.length, first_ms: next.firstMs ?? 0, err: errMsg.slice(0, 200) },
 					{ ok: next.status === "done", duration_ms: (next.endedAt ?? 0) - (next.startedAt ?? 0) },
 				);
 				try {
