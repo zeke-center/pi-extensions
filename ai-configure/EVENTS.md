@@ -61,14 +61,14 @@ Content-Type: application/json
 |---|---|---|
 | `install` | 首次上传（每版本一次） | `os`, `os_version`, `pi_version`, `ext_version`, `consent_version`, `consent_at`, `level` |
 | `session_start` | 会话开始 | `project`(cwd 哈希), `model`, `ext_version` |
-| `session_end` | 会话结束/退出 | `turns`, `duration_ms`, `tokens{input,output,cacheRead,reasoning}`, `tool_calls`, `errors` |
-| `turn` | 每次模型请求完成 | `model`, `duration_ms`, `tokens{...}`, `msgs_in`, `tools_in_turn` |
+| `session_end` | 会话结束/退出 | `turns`, `duration_ms`, `tokens{...}`, `tool_calls`, `errors`, `reason`(quit/reload/new/resume/fork) |
+| `turn` | 每次模型请求完成 | `model`, `duration_ms`, `tokens{...}`, `context_tokens`(本轮 prompt 总长), `tool_results` |
 
 ### 4.2 工具调用
 
 | kind | 触发 | props |
 |---|---|---|
-| `tool_call` | 每次工具调用结束 | `ok`, `duration_ms`, `args`, `args_bytes`, `result`, `result_bytes`, `truncated`, `error` |
+| `tool_call` | 每次工具调用结束 | `ok`, `duration_ms`, `args`, `args_bytes`, `result`, `result_bytes`, `truncated`, `error`, `error_kind`(`rejected`/`aborted`/`tool_error`) |
 
 > 注意：`args` / `result` 按粒度截断；`bash` 的 `command` 会做密钥样式打码，但**不隐藏命令本身**（分析要用）。
 
@@ -96,7 +96,7 @@ Content-Type: application/json
 | kind | 触发 | props |
 |---|---|---|
 | `tts_generated` | 生成口播稿 | `chars`, `tier`(steps/full), `has_code`, `latency_ms` |
-| `tts_play` | 实际播放 | `engine`(sapi/doubao), `ok`, `chars`, `duration_ms`, `error` |
+| `tts_play` | 实际播放 | `engine`(sapi/doubao), `ok`, `chars`, `first_ms`, `duration_ms`, `err` |
 
 ### 4.6 其他
 
@@ -105,6 +105,8 @@ Content-Type: application/json
 | `command_used` | 用户执行斜杠命令 | `command`, `args_len` |
 | `extension_toggled` | `/ai-ext on/off` 或单项开关 | `on`, `scope` |
 | `error` | 扩展内部异常 | `where`, `message`, `stack`(≤2KB), `fatal` |
+| `compaction` | 上下文压缩 | `reason`(manual/threshold/overflow), `will_retry`, `from_extension`, `context_tokens` |
+| `command_used` | 用户执行斜杠命令 | `command`, `args_len`, `source` |
 | `telemetry_state` | 埋点自身状态变更 | `upload`, `level`, `key_set`, `reason` |
 
 ## 5. 体积预算（基于真实会话测算）
@@ -124,5 +126,7 @@ Content-Type: application/json
 **绝不采集**：任何密钥（`sk-`、`ghp_`、`Bearer`、`X-Brain-Token`、`MASTER_KEY` 值）、环境变量全文、`.env` 内容、密码。
 
 **默认不采集**：文件内容、对话正文、思考过程（这三项只在 `full` 档且用户明确确认后记录）。
+
+**路径脱敏**：`C:\Users\<名>`、`/home/<名>`、`/Users/<名>` 一律替换成 `~/`，不泄露账户名。
 
 声明原文与版本号见 `PRIVACY.md`；`consent_version` 变号后需要重新确认才继续上传。
