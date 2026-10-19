@@ -12,11 +12,11 @@
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { hostname, platform, release } from "node:os";
-import { dirname, join } from "node:path";
+import { arch, hostname, platform, release } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { patchExtCfg, readExtCfg } from "./shared";
-import { registerSettings } from "./settings";
+import { onSettingsApplied, registerSettings } from "./settings";
 
 // ======================= 常量 =======================
 
@@ -239,6 +239,8 @@ function installPayload() {
 		alias: hostname().slice(0, 64),
 		os: platform(),
 		os_version: release().slice(0, 64),
+		arch: arch(),
+		node_version: process.version,
 		pi_version: piVersion(),
 		ext_version: extVersion(),
 		level,
@@ -272,6 +274,22 @@ function classifyError(text: string): "rejected" | "aborted" | "tool_error" {
 	if (/用户没有确认|用户\*\*不要\*\*|先别做|已在电脑端选择|没有执行方案/.test(t)) return "rejected";
 	if (/aborted|abort|cancel|已取消|已中断/i.test(t)) return "aborted";
 	return "tool_error";
+}
+
+/** 从 codemode / 直接 MCP 调用里识别记忆检索，用来衡量“记忆到底有没有被用” */
+function memoryUsage(tool: string, input: unknown, text: string): Record<string, unknown> | null {
+	const raw = JSON.stringify(input ?? {});
+	if (!/memory_(search|read)/.test(tool) && !raw.includes("memory_search") && !raw.includes("memory_read")) return null;
+	const code = typeof (input as { code?: unknown })?.code === "string" ? (input as { code: string }).code : raw;
+	const q = /query\s*:\s*["'`]([^"'`]{2,80})["'`]/.exec(code)?.[1] ?? "";
+	const p = /path\s*:\s*["'`]([^"'`]{2,120})["'`]/.exec(code)?.[1] ?? "";
+	const hit = /命中\s*(\d+)\s*条/.exec(text)?.[1];
+	return {
+		query: q,
+		path: p,
+		hits: hit ? Number(hit) : undefined,
+		via: tool.startsWith("mcp__") ? "direct" : "codemode",
+	};
 }
 
 function schedule(ms: number): void {
@@ -561,7 +579,12 @@ export function setupTelemetry(api: ExtensionAPI): void {
 			patchExtCfg({ telemetryUpload: false });
 			notify("隐私声明已更新，请重新开启埋点并确认", "warning");
 		}
-		track("session_start", { project: projectTag(ctx.cwd), model: ctx.model?.id ?? "" });
+		track("session_start", {
+			project: projectTag(ctx.cwd),
+			project_name: basename(ctx.cwd).slice(0, 48),
+			model: ctx.model?.id ?? "",
+			model_provider: ctx.model?.provider ?? "",
+		});
 	});
 
 	api.on("before_agent_start", async () => {
@@ -582,6 +605,8 @@ export function setupTelemetry(api: ExtensionAPI): void {
 			.filter((c): c is { type: "text"; text: string } => (c as { type?: string }).type === "text")
 			.map((c) => c.text)
 			.join("\n");
+		const mem = memoryUsage(event.toolName, event.input, text);
+		if (mem) track("memory_recall", mem, { tool: event.toolName, ok: !event.isError });
 		track(
 			"tool_call",
 			{
@@ -599,6 +624,9 @@ export function setupTelemetry(api: ExtensionAPI): void {
 	api.on("turn_end", async (event) => {
 		const msg = event.message as { usage?: Record<string, number> };
 		const u = msg.usage ?? {};
+		// cost 在部分 provider 上是对象，部分省略
+		const rawCost = (u as { cost?: number | { total?: number } }).cost;
+		const costTotal = typeof rawCost === "number" ? rawCost : (rawCost?.total ?? 0);
 		sessTok.input += u.input ?? 0;
 		sessTok.output += u.output ?? 0;
 		sessTok.cacheRead += u.cacheRead ?? 0;
@@ -608,10 +636,13 @@ export function setupTelemetry(api: ExtensionAPI): void {
 			"turn",
 			{
 				model: ctxRef?.model?.id ?? "",
+				model_provider: ctxRef?.model?.provider ?? "",
+				thinking_level: ctxRef?.thinkingLevel ?? "",
 				token_input: u.input ?? 0,
 				token_output: u.output ?? 0,
 				token_cache_read: u.cacheRead ?? 0,
 				token_reasoning: u.reasoning ?? 0,
+				cost_total: costTotal,
 				context_tokens: ctxTokens,
 				tool_results: event.toolResults?.length ?? 0,
 			},
@@ -644,14 +675,31 @@ export function setupTelemetry(api: ExtensionAPI): void {
 	// 斜杠命令使用（只记命令名，不记参数内容）
 	api.on("input", async (event) => {
 		const text = event.text ?? "";
+		// 流式过程中插话 = 你在纠偏/打断
+		if (event.streamingBehavior === "steer") {
+			track("user_interrupt", { source: event.source, chars: text.length });
+		}
 		const m = /^\s*\/([A-Za-z0-9_-]+)/.exec(text);
 		if (m) {
+			const args = text.trim().slice(m[0].length).trim();
+			const first = (args.split(/\s+/)[0] ?? "").slice(0, 16);
+			// 只对这几个命令记第一个参数（on/off/sync 这类），其它命令不记
+			const SAFE_ARGS = new Set(["ai-ext", "board", "tts", "voice", "remote", "delegate-mode", "telemetry", "agents"]);
 			track("command_used", {
 				command: m[1],
-				args_len: Math.max(0, text.trim().length - m[0].length),
+				args_len: args.length,
+				arg0: SAFE_ARGS.has(m[1]) ? first : undefined,
 				source: event.source,
 			});
 		}
+	});
+
+	// 配置面板保存 → 记改了哪些开关（text/list 不记值，避免密钥入埋点）
+	onSettingsApplied((changes) => {
+		track("settings_changed", {
+			count: changes.length,
+			changes: changes.map((c) => ({ key: c.key, kind: c.kind, value: c.value })),
+		});
 	});
 
 	api.registerCommand("telemetry", {

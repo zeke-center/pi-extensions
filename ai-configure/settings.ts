@@ -48,6 +48,29 @@ export interface SettingDef {
 
 const registry: SettingDef[] = [];
 
+/** 配置变更（埋点用；text/list 可能含密钥，只报 key 不报值） */
+export interface SettingsChange {
+	key: string;
+	kind: SettingKind;
+	value?: string | number | boolean;
+}
+
+let appliedHook: ((changes: SettingsChange[]) => void) | undefined;
+
+/** 配置面板保存/恢复默认后回调。任何异常都被吞掉，不影响配置本身。 */
+export function onSettingsApplied(cb: (changes: SettingsChange[]) => void): void {
+	appliedHook = cb;
+}
+
+function emitChanges(changes: SettingsChange[]): void {
+	if (!changes.length || !appliedHook) return;
+	try {
+		appliedHook(changes);
+	} catch {
+		/* 埋点失败不影响配置 */
+	}
+}
+
 /** 各模块启动时注册自己的配置项（重复 key 覆盖，便于 /reload 后重来） */
 export function registerSettings(defs: SettingDef[]): void {
 	for (const d of defs) {
@@ -188,6 +211,7 @@ export function parseFieldValue(d: SettingDef, text: string): string | number | 
 export function applySettingsValues(values: Record<string, string>, defs: SettingDef[] = registry): { applied: string[]; failed: string[] } {
 	const applied: string[] = [];
 	const failed: string[] = [];
+	const changes: SettingsChange[] = [];
 	for (const d of defs) {
 		if (!(d.key in values)) continue;
 		const text = values[d.key] ?? "";
@@ -201,24 +225,33 @@ export function applySettingsValues(values: Record<string, string>, defs: Settin
 		try {
 			d.set(v);
 			applied.push(d.label);
+			changes.push({
+				key: d.key,
+				kind: d.kind,
+				value: d.kind === "bool" || d.kind === "enum" || d.kind === "number" ? (v as string | number | boolean) : undefined,
+			});
 		} catch {
 			failed.push(d.label);
 		}
 	}
+	emitChanges(changes);
 	return { applied, failed };
 }
 
 /** 全部恢复默认（面板里「恢复全部默认」那一行用） */
 export function resetSettings(defs: SettingDef[] = registry): number {
 	let n = 0;
+	const changes: SettingsChange[] = [];
 	for (const d of defs) {
 		try {
 			d.set(Array.isArray(d.def) ? [...d.def] : d.def);
 			n++;
+			changes.push({ key: d.key, kind: d.kind });
 		} catch {
 			/* 单条失败不影响别的 */
 		}
 	}
+	emitChanges(changes);
 	return n;
 }
 

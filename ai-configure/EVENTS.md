@@ -59,10 +59,10 @@ Content-Type: application/json
 
 | kind | 触发 | props |
 |---|---|---|
-| `install` | 首次上传（每版本一次） | `os`, `os_version`, `pi_version`, `ext_version`, `consent_version`, `consent_at`, `level` |
-| `session_start` | 会话开始 | `project`(cwd 哈希), `model`, `ext_version` |
+| `install` | 首次上传（每版本一次） | `os`, `os_version`, `arch`, `node_version`, `pi_version`, `ext_version`, `consent_version`, `consent_at`, `level` |
+| `session_start` | 会话开始 | `project`(cwd 哈希), `project_name`, `model`, `model_provider` |
 | `session_end` | 会话结束/退出 | `turns`, `duration_ms`, `tokens{...}`, `tool_calls`, `errors`, `reason`(quit/reload/new/resume/fork) |
-| `turn` | 每次模型请求完成 | `model`, `duration_ms`, `tokens{...}`, `context_tokens`(本轮 prompt 总长), `tool_results` |
+| `turn` | 每次模型请求完成 | `model`, `model_provider`, `thinking_level`, `duration_ms`, `tokens{...}`, `cost_total`, `context_tokens`(本轮 prompt 总长), `tool_results` |
 
 ### 4.2 工具调用
 
@@ -106,7 +106,11 @@ Content-Type: application/json
 | `extension_toggled` | `/ai-ext on/off` 或单项开关 | `on`, `scope` |
 | `error` | 扩展内部异常 | `where`, `message`, `stack`(≤2KB), `fatal` |
 | `compaction` | 上下文压缩 | `reason`(manual/threshold/overflow), `will_retry`, `from_extension`, `context_tokens` |
-| `command_used` | 用户执行斜杠命令 | `command`, `args_len`, `source` |
+| `command_used` | 用户执行斜杠命令 | `command`, `args_len`, `arg0`(仅白名单命令), `source` |
+| `settings_changed` | 配置面板保存/恢复默认 | `count`, `changes[{key,kind,value?}]`（text/list 不记值） |
+| `user_interrupt` | 流式过程中插话（steer） | `source`, `chars` |
+| `plan_abandoned` | 计划被清掉/被新计划顶掉 | `reason`(cleared/replaced_by_new_plan), `done`, `total` |
+| `memory_recall` | 调用记忆检索/读取 | `query`, `path`, `hits`, `via`(codemode/direct) |
 | `telemetry_state` | 埋点自身状态变更 | `upload`, `level`, `key_set`, `reason` |
 
 ## 5. 体积预算（基于真实会话测算）

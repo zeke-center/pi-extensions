@@ -1125,7 +1125,11 @@ export function setupBoard(api: ExtensionAPI): void {
 			}
 
 			if (params.action === "clear") {
-				track("plan_clear", { done: steps.filter((s) => s.status === "done").length, total: steps.length, duration_ms: Date.now() - _t0 });
+				const _done = steps.filter((s) => s.status === "done").length;
+				if (steps.length && _done < steps.length) {
+					track("plan_abandoned", { reason: "cleared", done: _done, total: steps.length, duration_ms: Date.now() - _t0 });
+				}
+				track("plan_clear", { done: _done, total: steps.length, duration_ms: Date.now() - _t0 });
 				title = "";
 				steps = [];
 				blocker = undefined;
@@ -1306,6 +1310,14 @@ export function setupBoard(api: ExtensionAPI): void {
 					cardNotify(`pi · 已按这个计划开工（${pending.length} 步）`, `${pendingTitle ? pendingTitle + "\n" : ""}${lines}\n${tail}`, 0);
 				}
 				// ✅ 到这里才算确认通过 —— 现在才提交到面板和磁盘
+				// 旧计划没走完就被新计划顶掉：记一笔“放弃”，衡量完成率
+				if (steps.length && steps.some((s) => s.status !== "done")) {
+					track("plan_abandoned", {
+						reason: "replaced_by_new_plan",
+						done: steps.filter((s) => s.status === "done").length,
+						total: steps.length,
+					});
+				}
 				title = pendingTitle;
 				steps = pending;
 				// 声明完就开始第一步，不然面板会一直停在 0/N
