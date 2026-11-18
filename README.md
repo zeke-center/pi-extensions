@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 9 个模块，另有 `speech` / `speaker` / `tts/` 等支撑文件）** · 当前版本 **v1.40.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 10 个模块，另有 `speech` / `speaker` / `tts/` 等支撑文件）** · 当前版本 **v1.41.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -10,23 +10,29 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
-| `ai-configure/pi-extensions.ts` | 入口：装配下面九个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
+| `ai-configure/pi-extensions.ts` | 入口：装配下面十个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
+| `ai-configure/gate.ts` | **会话级停用总闸**（面板收起、`progress`/`delegate` 从工具表撤下、后台回投暂停） | `/ai-ext` |
+| `ai-configure/telemetry.ts` | 埋点（**默认关**，需密钥 + 确认才传） | `/telemetry` |
 | `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
 | `ai-configure/board.ts` | **任务进度看板**（含中栏运行状态 + 全局用量） | `/board` · `/usage` + `progress` 工具 |
-| `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` + `delegate` 工具 |
+| `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` · `/resume-agent` · `/agent-resume-back` · `/delegate-mode` + `delegate` 工具 |
+| `ai-configure/voice.ts` | **输入法 / 剪贴板接入**（不做语音识别，只借 IME 上屏） | `/voice` |
+| `ai-configure/remote.ts` | **手机接管**（Telegram 双向同步） | `/remote` |
+| `ai-configure/voice-tts.ts` | **语音播报**（事件 → 口播稿 → 队列 → 引擎 → 电脑/手机） | `/tts` |
 | `ai-configure/live.ts` | 子代理实时状态机（把 JSON 事件流翻成可画的行） | — |
 | `ai-configure/panel.ts` | 子代理实时面板（看板正上方整宽，默认） | `/agents` |
 | `ai-configure/mcp-pool.ts` | MCP 候选池 + 影子目录（`mcp` 隔离的底层） | — |
 | `ai-configure/form.ts` | 弹窗面板（表单 + 多选 + **分组折叠树**，`new`/`edit`/`/aihelp` 共用） | — |
+| `ai-configure/settings.ts` | `/aihelp` 面板本体（分类折叠、`ctrl+s` 保存） | — |
 | `ai-configure/help.ts` | 说明书文案（`/aihelp` 与 `/ai help` 共用一份）| — |
 | `ai-configure/health.ts` | 模块健康度登记（入口失败上报，doctor/状态栏读它） | — |
 | `ai-configure/doctor.ts` | **自检报告**（健康度 / 配置中心 / MCP 连接判定 / 助理 / 看板） | `/ai doctor` = `/aidoctor` |
 
 ```text
 pi-extensions/
-├── ai-configure/        # 一个插件，入口装配 9 个模块
+├── ai-configure/        # 一个插件，入口装配 10 个模块
 │   ├── package.json     # 内层清单：显式声明入口（显示名 = pi-extensions，不叫 index）
-│   ├── pi-extensions.ts # 入口：装配下面九个 + 注册 /aihelp；各模块独立 try/catch
+│   ├── pi-extensions.ts # 入口：装配下面十个 + 注册 /aihelp；各模块独立 try/catch
 │   ├── config.ts        # 连接台账 → MCP（/ai）
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
@@ -147,6 +153,8 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `bg all` | 连别的会话的历史记录也列出来（会标 `⚠别的会话`） |
 | | `bg redeliver` | 把**没投回主会话的立刻重投一次**（主对话卡住时的救急口） |
 | | `linger <时长>` | 改**跑完的子代理在面板上呆多久**（默认 `45s`；`0` = 立刻消失）。写进 `~/.pi/agent/ai-extensions.json` |
+
+> **播报的音频整段一次合成、一次播放**：不再句级切换，所以听起来是完整连贯的一条。代价是首音要等整段合成完（约 3 秒握手 + 字数 ÷ 25 秒），越长的口播开头等得越久。播放走独立队列、播完才取下一条（`SND_SYNC`），不会按估算时长硬切把尾音截掉。
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
 

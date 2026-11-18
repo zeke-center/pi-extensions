@@ -1205,6 +1205,7 @@ async function turnOn(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 	if (!cfg().token) {
+		appendState(false); // 清掉会话里残留的「上次开着」，否则每个新会话都会自动重试
 		ctx.ui.notify("还没配 token：在 /aihelp 面板里填，或编辑 <agentDir>/ai-extensions.json 的 telegram.token", "error");
 		return;
 	}
@@ -1213,6 +1214,7 @@ async function turnOn(ctx: ExtensionContext): Promise<void> {
 	try {
 		me = await tgCall("getMe", undefined, 15000);
 	} catch (e) {
+		appendState(false); // 失败也要写回「关」——否则会话里的旧 on 会让下个会话继续自动重试
 		ctx.ui.notify(`连不上 Telegram：${e instanceof Error ? e.message : String(e)}`, "error");
 		return;
 	}
@@ -1271,14 +1273,17 @@ async function turnOn(ctx: ExtensionContext): Promise<void> {
 }
 
 function turnOff(reason: string, bindingsKept = true): void {
-	if (!isOn) return;
+	const was = isOn;
 	isOn = false;
 	pair = undefined;
 	closeQr?.();
 	closeQr = undefined;
 	stopPoll();
 	clearCards();
+	// 即使本来就没连上，也要写回「关」：面板上显示的是实际状态，
+	// 但会话里可能还留着上次成功连接时的 on，不写回就会在每个新会话自动重试。
 	appendState(false);
+	if (!was) return;
 	notify(
 		`⚪ 已切断：${reason}。手机侧现在完全看不到、也发不进来。` +
 			(bindingsKept ? "绑定还在，下次 on 不用重扫。" : "设备绑定已清空，下次要重新配对。"),

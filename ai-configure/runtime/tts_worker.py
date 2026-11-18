@@ -16,8 +16,8 @@
   → {"cmd":"shutdown"}
 
 设计约束（都是踩过的坑）：
-  · 绝不阻塞：播放用 SND_ASYNC，主循环一直能收 stop
-  · 句级切分：**首句切短**（第一声最快），后续句子放长（韵律更好）
+  · 绝不阻塞：云端播放走独立线程（SND_SYNC 顺序播，不按估算时长硬切），主循环一直能收 stop
+  · 句级切分只用于**本地引擎**（首句切短，第一声最快）；云端是**整段一次合成**，不切句
   · 模型目录里同时支持 Kokoro（voices.bin）与 VITS/MeloTTS（lexicon+tokens）
   · 任何异常都回一行 JSON，不让 node 侧等到超时
 """
@@ -358,6 +358,18 @@ def stop_play() -> None:
 			subprocess.run(["pkill", "-f", "aplay"], check=False, capture_output=True)
 
 
+def concat_wav(paths: list[Path], out: Path) -> None:
+	"""把同参数的多段 WAV 拼成一个文件：首段定格式，其余只写音频帧。"""
+	with wave.open(str(out), "wb") as w:
+		for i, p in enumerate(paths):
+			with wave.open(str(p)) as r:
+				if i == 0:
+					w.setnchannels(r.getnchannels())
+					w.setsampwidth(r.getsampwidth())
+					w.setframerate(r.getframerate())
+				w.writeframes(r.readframes(r.getnframes()))
+
+
 # --------------------------------------------------------------------------- #
 # 主循环
 # --------------------------------------------------------------------------- #
@@ -444,7 +456,47 @@ def main() -> None:
 	speed = float(os.environ.get("PI_TTS_SPEED") or 1.0)
 	st: dict = {"engine": None, "model_dir": None, "sid": sid, "speed": speed,
 	            "plan": [], "until": 0.0, "id": None, "total": 0.0, "first_ms": None,
-	            "pending": 0}
+	            "pending": 0, "cloud": False, "gen": 0}
+
+	class Player:
+		"""顺序播放队列：SND_SYNC 播完再取下一条，避免按估算时长硬切把尾音截掉。"""
+
+		def __init__(self) -> None:
+			self.q: "queue.Queue" = queue.Queue()
+			threading.Thread(target=self._run, daemon=True).start()
+
+		def _run(self) -> None:
+			while True:
+				item = self.q.get()
+				if item is None:
+					return
+				path, gen, cb = item
+				if st.get("gen") != gen:
+					continue
+				if path is not None:
+					try:
+						play(path, blocking=True)
+					except Exception:
+						pass  # 单条播不出来也不能让播放线程死掉，否则后面全哑
+				if st.get("gen") != gen:
+					continue
+				if cb:
+					try:
+						cb()
+					except Exception:
+						pass
+
+		def enqueue(self, path, gen: int, cb=None) -> None:
+			self.q.put((path, gen, cb))
+
+		def clear(self) -> None:
+			while True:
+				try:
+					self.q.get_nowait()
+				except queue.Empty:
+					break
+
+	player = Player()
 
 	q: "queue.Queue[str]" = queue.Queue()
 
@@ -512,15 +564,15 @@ def main() -> None:
 				st["sid"] = eng.sid
 
 	def do_cloud_say(req: dict, cloud: dict) -> None:
-		"""豆包 TTS 2.0：首句先播，其余用**同一条常驻连接**流水线合成。
+		"""豆包 TTS 2.0：**整段一次合成、一次播放**，不做句级切换。
 
-		关键：握手+建会话要 3.2~3.4 秒（与句子长短无关）。每句重连 = 每句前顿一下，
-		听起来就是"断断续续/漏点"。所以连接必须常驻（doubao_ws.get_conn）。
+		代价：首音要等整段合成完（约 3.2s 握手 + 字数/25 秒）。
+		换来：一条口播完全连贯，零切换、零接缝。
 		"""
 		import doubao_ws
 
-		sents = split_sentences(str(req.get("text") or ""))
-		if not sents:
+		text = str(req.get("text") or "").strip()
+		if not text:
 			reply({"id": req.get("id"), "ok": False, "error": "空文本"})
 			return
 		key = str(cloud.get("key") or "")
@@ -530,60 +582,43 @@ def main() -> None:
 		speed = cloud.get("speechRate")
 		tone = str(cloud.get("tone") or "")
 		CLOUD_DIR.mkdir(parents=True, exist_ok=True)
-		def target(sent: str) -> Path:
-			return cloud_wav(sent, sent, speaker, sr, rid, speed, tone)
 
-		def dur_of(p: Path) -> float:
-			with wave.open(str(p)) as w:
-				return w.getnframes() / w.getframerate()
+		gen = st["gen"]
 
-		def synth_one(sent: str) -> Path:
-			p = target(sent)
-			if p.exists() and p.stat().st_size > 1000:
-				record_usage(0, cached=True, chars=len(sent))   # 命中缓存：不花钱
-				return p
-			tmp = CLOUD_DIR / (p.stem + ".part.wav")
-			r = cloud_call(key, rid, lambda c: c.synth(sent, speaker, str(tmp), sr, speed or 0, tone))
-			tmp.replace(p)
-			record_usage(int((r or {}).get("words") or 0) or len(sent))
-			return p
+		def finish() -> None:
+			if st["gen"] != gen:
+				return
+			st["cloud"] = False
+			if st["id"] is not None:
+				reply({"id": st["id"], "ok": True, "done": True, "dur": round(st["total"], 2)})
+				st["id"] = None
 
+		p = cloud_wav(text, text, speaker, sr, rid, speed, tone)
 		t0 = time.perf_counter()
-		first = synth_one(sents[0])
-		d0 = dur_of(first)
+		if p.exists() and p.stat().st_size > 1000:
+			record_usage(0, cached=True, chars=len(text))   # 命中缓存：不花钱
+		else:
+			tmp = CLOUD_DIR / (p.stem + ".part.wav")
+			r = cloud_call(key, rid, lambda c: c.synth(text, speaker, str(tmp), sr, speed or 0, tone))
+			tmp.replace(p)
+			record_usage(int((r or {}).get("words") or 0) or len(text))
+		with wave.open(str(p)) as w:
+			d0 = w.getnframes() / w.getframerate()
 		st["id"] = req.get("id")
 		st["total"] = d0
 		st["first_ms"] = (time.perf_counter() - t0) * 1000
+		st["cloud"] = True
 		st["plan"] = []
-		rest = sents[1:]
-		st["pending"] = len(rest)
-		play(first, blocking=False)
-		st["until"] = time.time() + d0
+		st["until"] = 0.0
+		st["pending"] = 0
+		player.enqueue(p, gen, finish)
 		reply({"id": st["id"], "ok": True, "cloud": True,
 		       "first_ms": round(st["first_ms"]), "dur": round(d0, 2)})
 
-		if not rest:
-			return
-
-		ref = st
-
-		def pipeline() -> None:
-			for sent in rest:
-				try:
-					p = synth_one(sent)
-					d = dur_of(p)
-					ref["plan"].append((p, d))
-					ref["total"] += d
-				except Exception:
-					# 单句失败不拖垮整段：跳过它继续
-					pass
-				finally:
-					ref["pending"] = max(0, ref["pending"] - 1)
-
-		threading.Thread(target=pipeline, daemon=True).start()
-
 	def start_next() -> None:
-		"""推进播放状态机：播下一句 / 收尾。"""
+		"""推进播放状态机：播下一句 / 收尾（云端走 Player 队列，不走这里）。"""
+		if st.get("cloud"):
+			return
 		if st["until"] and time.time() < st["until"]:
 			return
 		st["until"] = 0.0
@@ -599,7 +634,10 @@ def main() -> None:
 			st["id"] = None
 
 	def interrupt() -> None:
+		st["gen"] += 1
+		st["cloud"] = False
 		stop_play()
+		player.clear()
 		st["plan"].clear()
 		st["until"] = 0.0
 		st["total"] = 0.0
@@ -660,6 +698,7 @@ def main() -> None:
 				st["id"] = req.get("id")
 				st["total"] = d0
 				st["first_ms"] = (time.perf_counter() - t0) * 1000
+				st["cloud"] = False
 				play(first, blocking=False)
 				st["until"] = time.time() + d0
 				reply({"id": st["id"], "ok": True, "first_ms": round(st["first_ms"]), "dur": round(d0, 2)})
