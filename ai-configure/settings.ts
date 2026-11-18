@@ -141,8 +141,7 @@ export function fieldDetail(d: SettingDef): string {
 }
 
 /** 面板里的分组顺序（常用的在前，「会话级」这种偶尔用的压最后） */
-// 「手机接管」排第一：这儿天最常动的就是它（在手机上远程指挥时）
-const GROUP_ORDER = ["手机接管", "命令", "剪贴板投递", "输入框投递", "通知与弹窗", "语音播报", "计划确认", "助理 / 委派", "会话级（重启复位）"];
+const GROUP_ORDER = ["剪贴板投递", "输入框投递", "通知与弹窗", "计划确认", "助理 / 委派", "会话级（重启复位）"];
 
 /** 按上面的顺序排一遍（未知分组排在最后，按注册顺序稳定） */
 export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {

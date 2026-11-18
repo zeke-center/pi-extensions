@@ -679,27 +679,6 @@ allOk =
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-shared") },
 	) && allOk;
 
-bundle("notify.ts", "notify2.mjs");
-allOk =
-	runSuite(
-		"notify：语音播报文本清洗 / TTS 状态",
-		join(tmp, "notify2.mjs"),
-		[
-			'ok("TTS：默认关（不会突然出声）", getTts().on === false);',
-			'setTts({ on: true, rate: 99, volume: -5 });',
-			'ok("TTS：rate/volume 会被夹到合法区间", getTts().rate === 10 && getTts().volume === 0);',
-			'setTts({ on: false, rate: 0, volume: 100 });',
-			'ok("念法：去 markdown 记号", speechText("**结论**：`npm test` 全过").indexOf("*") < 0 && speechText("**结论**：`npm test` 全过").indexOf("`") < 0);',
-			'ok("念法：去 emoji", speechText("✅ 都修好了 🎉").indexOf("✅") < 0 && speechText("✅ 都修好了 🎉").indexOf("🎉") < 0);',
-			'ok("念法：去中文括号旁注", speechText("已修好（见截图）") === "已修好");',
-			'ok("念法：去链接只留文字", speechText("看 [文档](https://x.com/a) 第三节") === "看 文档 第三节");',
-			'ok("念法：超 300 字截断 + 提示", speechText("字".repeat(500)).length <= 306 && speechText("字".repeat(500)).indexOf("以下省略") > 0);',
-			'ok("念法：空输入不炸", speechText("") === "" && speechText(undefined) === "");',
-			'ok("念法：正常一句话原样保留", speechText("数据库已备份，文件名 center-1015.sql").indexOf("数据库已备份") === 0);',
-		],
-		{ PI_CODING_AGENT_DIR: join(tmp, "agent-notify2") },
-	) && allOk;
-
 // ---------- 套件：voice（语音上屏判定 / 触发词 / 不误发） ----------
 bundle("voice.ts", "voice.mjs");
 allOk =
@@ -913,12 +892,12 @@ allOk =
 		[
 			"registerVoiceSettings();",
 			"const snap = settingsSnapshot();",
-			'ok("面板：注册项数量 ≥ 20（现在 24 个）", snap.length >= 20);',
+			'ok("面板：注册项数量 ≥ 15（砍掉手机接管/播报/埋点后现在 19 个）", snap.length >= 15);',
 			'ok("面板：key 不重复", new Set(snap.map((s) => s.key)).size === snap.length);',
 			'ok("面板：每项都有名字", snap.every((s) => s.label && s.label.length >= 2));',
 			'ok("面板：每项都写了「干什么用的」（≥12 字）", snap.every((s) => s.desc && s.desc.length >= 12));',
 			'ok("面板：每项都有类型", snap.every((s) => ["bool","enum","number","text","list"].includes(s.kind)));',
-			'ok("面板：分组 ≥ 5（剪贴板/输入框/通知/播报/计划…）", new Set(snap.map((s) => s.group)).size >= 5);',
+			'ok("面板：分组 ≥ 4（剪贴板/输入框/通知/计划…）", new Set(snap.map((s) => s.group)).size >= 4);',
 			'ok("面板：每一项都读得出当前值（文本项可留空）", snap.every((s) => s.kind === "text" || fieldValue(getSetting(s.key)).length > 0));',
 			"const rt = [];",
 			'for (const s of snap) { if (s.key === "voiceClip") continue; const d = getSetting(s.key); d.set(Array.isArray(d.def) ? [...d.def] : d.def); rt.push(JSON.stringify(d.get()) === JSON.stringify(d.def)); }',
@@ -931,15 +910,13 @@ allOk =
 			'ok("面板：枚举项每个候选都设得进去", ["silent","word"].every((v) => (en.set(v), en.get() === v)));',
 			'const tr = getSetting("voiceClipTriggers"); tr.set("发送, 投给pi 继续");',
 			'ok("面板：触发词（DIY 项）逗号/空格混写也能解析", JSON.stringify(tr.get()) === JSON.stringify(["发送","投给pi","继续"]));',
-			'const tk = getSetting("voiceTtsVolume"); tk.set(200);',
-			'ok("面板：音量超 100 会被夹住", tk.get() === 100);',
 			'ok("面板：会话级项有标记（boardOff / extDisabled）", snap.filter((s) => s.session).length >= 0);',
 			// ---- 表单式面板：字段生成 / 值解析 / 保存 ----
 			'const fs2 = settingsFields();',
 			'const rows2 = fs2.filter((f) => f.kind !== "group");',
 			'const groups2 = fs2.filter((f) => f.kind === "group");',
 			'ok("表单：一行一项（设置行数 = 注册项数，各占一行）", rows2.length === snap.length && new Set(rows2.map((f) => f.key)).size === snap.length);',
-			'ok("表单：分组是独立表头行（≥5 个），设置行不再自带「·」前缀且不超长", groups2.length >= 5 && rows2.every((f) => !f.label.includes("·") && f.label.length <= 20));',
+			'ok("表单：分组是独立表头行（≥4 个），设置行不再自带「·」前缀且不超长", groups2.length >= 4 && rows2.every((f) => !f.label.includes("·") && f.label.length <= 20));',
 			'ok("表单：每个设置行都落在某个分组表头之后（表头永远可见）", rows2.every((f) => fs2.slice(0, fs2.indexOf(f)).some((x) => x.kind === "group")));',
 			'ok("表单：bool → 是/否（FormPane 的 bool 行）", fs2.filter((f) => f.kind === "bool").length >= 5);',
 			'ok("表单：枚举项带候选（回车能展开）", fs2.some((f) => f.kind === "enum" && Array.isArray(f.options) && f.options.length >= 2));',
@@ -1116,38 +1093,6 @@ console.log("PASS  静态：共享桥 shared.ts 完整且 board/voice 都接上�
 	}
 }
 if (!allOk) console.log(String.fromCharCode(10) + "❌ 静态检查失败");
-
-bundle("speech.ts", "speech1.mjs");
-allOk =
-	runSuite(
-		"speech：阶段播报（steps 档）",
-		join(tmp, "speech1.mjs"),
-		[
-			'ok("阶段：brief 档不播", render({ kind: "step", text: "看一下代码" }, { level: "brief", terms: "en" }) === null);',
-			'ok("阶段：steps 档播且带 ttl=12", (() => { const u = render({ kind: "step", text: "看一下代码" }, { level: "steps", terms: "en" }); return !!u && u.kind === "step" && u.ttl === 12; })());',
-			'ok("阶段：优先级低于结论（不抢话）", (() => { const a = render({ kind: "step", text: "看代码" }, { level: "steps", terms: "en" }); const b = render({ kind: "result", text: "第一，做完了一件事", full: "第一，做完了一件事" }, { level: "steps", terms: "en" }); return !!a && !!b && a.prio < b.prio; })());',
-			'ok("阶段：bash 跑测试 → 说人话", /测试/.test(stepTextFor("bash", { command: "npm run test" })));',
-			'ok("阶段：read 不念文件名", (() => { const t = stepTextFor("read", { path: "src/a/b.ts" }); return t.indexOf("b.ts") < 0 && t.length <= 20; })());',
-			'ok("阶段：delegate → 派助理", /助理/.test(stepTextFor("delegate", {})));',
-			'ok("阶段：未知工具也有兜底句", stepTextFor("mystery_tool", {}).length > 2);',
-			'ok("口语行：能从回答里抽出 <step>", extractStep("先说明一句。" + String.fromCharCode(10) + "<step>收到，我先去看后端实现</step>" + String.fromCharCode(10) + "然后动手。") === "收到，我先去看后端实现");',
-			'ok("口语行：多条取最后一条", extractStep("<step>第一步</step> 中间 <step>第二步</step>") === "第二步");',
-			'ok("口语行：没写就返回 null（走规则兜底）", extractStep("普通回答，没有标记") === null);',
-			'ok("口语行：退化成 markdown 也能念", (() => { const t = extractStep("<step>**收到**，看 `server.ts`</step>"); return !!t && t.indexOf("*") < 0 && t.indexOf("`") < 0; })());',
-			'ok("完整播报：长口播不截断、不说「以下省略」", (() => { const t = "这轮做完了。"; const body = t + "第一点说明。".repeat(30); const u = render({ kind: "result", full: "[口播]" + body + "[/口播]" }, { level: "brief", terms: "en" }); return !!u && u.text.length >= body.length * 0.95 && u.text.indexOf("省略") < 0; })());',
-			'ok("语气：默认 off（不加任何语气指令）", (() => { const u = render({ kind: "result", full: "[口播]做完了。[/口播]" }, { level: "brief", terms: "en" }); return !!u && u.tone === undefined; })());',
-			'ok("语气：auto 时结论用沉稳汇报", (() => { const u = render({ kind: "result", full: "[口播]做完了。[/口播]" }, { level: "brief", terms: "en", toneMode: "auto" }); return !!u && !!u.tone && u.tone.indexOf("沉稳") >= 0; })());',
-			'ok("语气：auto 时报错用提醒", (() => { const u = render({ kind: "error", text: "测试挂了" }, { level: "brief", terms: "en", toneMode: "auto" }); return !!u && !!u.tone && u.tone.indexOf("提醒") >= 0; })());',
-			'ok("语气：<step tone=calm> 能覆盖默认", (() => { const r = extractStepFull("<step tone=calm>收到</step>"); return !!r && r.tone === "calm" && toneFor("step", r.tone, "auto").indexOf("沉稳") >= 0; })());',
-			'ok("要点：列了五条就念五条（不砍到三条）", (() => { const md = ["## 做完了","- 第一条说明","- 第二条说明","- 第三条说明","- 第四条说明","- 第五条说明"].join(String.fromCharCode(10)); const u = render({ kind: "result", full: md }, { level: "brief", terms: "en" }); return !!u && ["第一","第二","第三","第四","第五"].every((n) => u.text.indexOf(n) >= 0); })());',
-			'ok("要点：结尾不出现「省略/详情见」", (() => { const md = ["- 甲项说明","- 乙项说明"].join(String.fromCharCode(10)); const u = render({ kind: "result", full: md }, { level: "brief", terms: "en" }); return !!u && !/省略|详情见|屏幕/.test(u.text); })());',
-			'ok("台词：池子够大（≥60 句，缓存命中后边际成本 0）", Object.values(PHRASES).reduce((n, a) => n + a.length, 0) >= 60);',
-			'ok("台词：时间感有 early/mid/late 三池", !!PHRASES["wait.early"] && !!PHRASES["wait.mid"] && !!PHRASES["wait.late"]);',
-			'ok("台词：每句 ≤16 字且不空", Object.values(PHRASES).every((a) => a.every((x) => x.length > 1 && x.length <= 16)));',
-			'ok("台词：同一类连抽 20 次不会连续重复", (() => { for (let i = 0; i < 20; i++) { const a = phraseFor("read"); const b = phraseFor("read"); if (a === b) return false; } return true; })());',
-			'ok("台词：报错句子都带失败的意味", PHRASES.retry.every((x) => /报错|没过|问题|挂了|重试|日志/.test(x)));',
-		],
-	) && allOk;
 
 rmSync(tmp, { recursive: true, force: true });
 

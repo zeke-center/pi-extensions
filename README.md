@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 10 个模块，另有 `speech` / `speaker` / `tts/` 等支撑文件）** · 当前版本 **v1.41.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 7 个模块）** · 当前版本 **v2.0.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -10,15 +10,12 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 
 | 文件 | 功能 | 入口 |
 |---|---|---|
-| `ai-configure/pi-extensions.ts` | 入口：装配下面十个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
+| `ai-configure/pi-extensions.ts` | 入口：装配下面七个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
 | `ai-configure/gate.ts` | **会话级停用总闸**（面板收起、`progress`/`delegate` 从工具表撤下、后台回投暂停） | `/ai-ext` |
-| `ai-configure/telemetry.ts` | 埋点（**默认关**，需密钥 + 确认才传） | `/telemetry` |
 | `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
 | `ai-configure/board.ts` | **任务进度看板**（含中栏运行状态 + 全局用量） | `/board` · `/usage` + `progress` 工具 |
 | `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` · `/resume-agent` · `/agent-resume-back` · `/delegate-mode` + `delegate` 工具 |
 | `ai-configure/voice.ts` | **输入法 / 剪贴板接入**（不做语音识别，只借 IME 上屏） | `/voice` |
-| `ai-configure/remote.ts` | **手机接管**（Telegram 双向同步） | `/remote` |
-| `ai-configure/voice-tts.ts` | **语音播报**（事件 → 口播稿 → 队列 → 引擎 → 电脑/手机） | `/tts` |
 | `ai-configure/live.ts` | 子代理实时状态机（把 JSON 事件流翻成可画的行） | — |
 | `ai-configure/panel.ts` | 子代理实时面板（看板正上方整宽，默认） | `/agents` |
 | `ai-configure/mcp-pool.ts` | MCP 候选池 + 影子目录（`mcp` 隔离的底层） | — |
@@ -30,9 +27,9 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 
 ```text
 pi-extensions/
-├── ai-configure/        # 一个插件，入口装配 10 个模块
+├── ai-configure/        # 一个插件，入口装配 7 个模块
 │   ├── package.json     # 内层清单：显式声明入口（显示名 = pi-extensions，不叫 index）
-│   ├── pi-extensions.ts # 入口：装配下面十个 + 注册 /aihelp；各模块独立 try/catch
+│   ├── pi-extensions.ts # 入口：装配下面七个 + 注册 /aihelp；各模块独立 try/catch
 │   ├── config.ts        # 连接台账 → MCP（/ai）
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
@@ -42,6 +39,12 @@ pi-extensions/
 │   ├── form.ts          # 弹窗面板（表单 + 多选 + 分组折叠树）
 │   ├── health.ts        # 模块健康度登记（入口失败上报）
 │   ├── doctor.ts        # /ai doctor 自检
+│   ├── voice.ts         # 输入法/剪贴板接入（/voice）
+│   ├── notify.ts        # 通知/弹窗/提示音
+│   ├── shared.ts        # 模块间共享状态（计划问答/后台轮标记）
+│   ├── gate.ts          # 会话级停用总闸（/ai-ext）
+│   ├── settings.ts      # /aihelp 面板本体（分类折叠）
+│   ├── rpc.ts           # RPC 通道辅助
 │   └── help.ts          # /aihelp 的说明书文案
 ├── prompts/             # 提示词模板（= /命令，按需展开）
 │   └── ai-delegate.md   #   派活纪律（配合 delegate 工具）
@@ -94,25 +97,17 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `off` | 关掉本会话拉进来的连接 |
 | | `project off` \| `project clear` | 关掉 / 清空项目级连接 |
 | | `help`（`?` / `h` 也行） | 打印全部功能与参数 |
-| **`/aihelp`** | — | **可视化配置 / 命令面板**：**按分类折起来**（9 组，如 `命令 (8)` / `剪贴板投递 (8)`），`↑↓` 移动、`回车` 或 `←→` **展开 / 收起**（折叠状态**同一会话内记住**），`ctrl+s` 保存、`esc` 取消。`/ai help` = 文本版 |
+| **`/aihelp`** | — | **可视化配置 / 命令面板**：**按分类折起来**（6 组，如 `剪贴板投递 (8)` / `通知与弹窗 (5)`），`↑↓` 移动、`回车` 或 `←→` **展开 / 收起**（折叠状态**同一会话内记住**），`ctrl+s` 保存、`esc` 取消。`/ai help` = 文本版 |
 | **`/ai-ext`** | `off` \| `on` | **会话级停用 / 恢复整个扩展**（不用卸载）：面板收起、`progress`/`delegate` 从工具表撤下、后台回投暂停。本会话记住，换会话自动恢复 |
 | | `status` | 看当前状态 + 已接入闸门的模块 |
 | | 启动即停用 | `pi --no-ai-ext` 或 `PI_AI_EXT=off` |
-| **`/remote`** | （无参数） | **手机接管**：打开面板（连接 / 配对 / 回传详细度 / 来源前缀 / 危险放行 / 离线消息）|
-| | `on` \| `off` | 连上 / 切断 Telegram。**默认不连 = 一条网络请求都不发**；断开后手机完全看不到、也发不进来（绑定保留，下次 `on` 不用重扫）|
 | | `status` | 连接状态 · 空闲/忙 · 已授权设备 · 上下文占用 |
-| | `qr` | 出二维码配对（手机扫码，或拄口令在手机上 `/start 口令`）|
-| | `bind [码]` | 确认**手机上申请配对**的设备（不带码则列出全部待确认）|
 | | `catchup` \| `drop` | 离线积压 **补收并执行** / **丢弃只收新的**（默认**不自动执行** —— 怕把几小时前的旧指令当成新指令）|
-| | `mark on\|off` | 手机来的消息正文要不要带 `📱 ` 前缀（让**模型**也知道来源，回答会自动短一点）|
-| | `verbose quiet\|tools\|full` | 手机上回传多少过程（默认 `tools` = 一条**持续更新**的「工具进度卡」）|
 | | `allow-danger [off]` | 临时放行白名单里标了 `danger` 的命令（**每次 `on` 都重置**）|
 | | `unpair` | 解除全部设备绑定 |
 | | `help` | 打印全部用法 |
-| **手机侧**（在 Telegram 里发）| `/help` | **手机上能敲什么**（内置那几个 + 白名单清单）—— 手机上没有 pi 那个 `/` 菜单，所以专门给一张表 |
 | | `/status` `/stop` `/compact` `/verbose` | 看状态（连接·忙闲·**当前模型**·上下文占用·**插件版本**）/ 停任务 / 压上下文 / 改回传详细度 —— **只有这几个 + `/run` 会执行**，其它斜杠命令原样当消息投给 pi |
 | | `/run <名字> [参数]` | 执行**白名单命令**（只能在配置里预定义；默认不走 shell，所以参数里写 `;` `|` 不成立）|
-| | 计划确认 | 电脑端弹「这个计划行不行」时会**同步到手机**，带 `✅ 按这个执行 / ✏️ 我要改 / ⛔ 先别做`；也可以直接回「同意 / 算了」|
 | **`/voice`** | `talk on` \| `off` | **输入框模式**：不做语音识别 —— 借微信输入法等 IME 把文字上屏；**默认只认句尾触发词**（说「发送」才发） |
 | | `talk auto on` \| `off` | 额外允许「说完停一下就自动发」⚠️ 中文输入法**选词也成块上屏** → 打字中途停顿会被误当「说完了」（默认关） |
 | | `clip on` \| `off` | **剪贴板模式**：IME 语音结果会写系统剪贴板 → 句尾带触发词就投递，**pi 最小化也行** |
@@ -124,7 +119,6 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `clear` | 清空任务列表 |
 | | `above` \| `below` | 面板放输入框上方 / 下方 |
 | | `right` \| `mid` | 显示 / 隐藏右区（MCP / 插件 / 助理）/ 中栏 |
-| **`/tts`** | `on` \| `off` | **语音播报开关**（总闸 `voiceTts`；默认关）。关掉不影响结果卡片 |
 | | `status` | 用了哪档引擎、模型在不在、为什么不可用、今天花了多少钱 |
 | | `test` \| `demo` | 念测试句（GitHub / CI / TypeScript / diff 这些难点词）/ 演示整档效果 |
 | | `install` \| `rm` | 下载离线模型（断点续传 + sha256 + 双镜像）/ 删模型 |
@@ -154,7 +148,6 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `bg redeliver` | 把**没投回主会话的立刻重投一次**（主对话卡住时的救急口） |
 | | `linger <时长>` | 改**跑完的子代理在面板上呆多久**（默认 `45s`；`0` = 立刻消失）。写进 `~/.pi/agent/ai-extensions.json` |
 
-> **播报的音频整段一次合成、一次播放**：不再句级切换，所以听起来是完整连贯的一条。代价是首音要等整段合成完（约 3 秒握手 + 字数 ÷ 25 秒），越长的口播开头等得越久。播放走独立队列、播完才取下一条（`SND_SYNC`），不会按估算时长硬切把尾音截掉。
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
 
@@ -568,35 +561,26 @@ pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 
 
 ### ④ 配置面板 `/aihelp`（表单式，和 `/assistants` 一个外观）
 
-配置项太多了（**47 项 + 12 个可点执行的命令**），靠子命令记不住 —— 所以 `/aihelp` 是个**表单弹窗**（复用 `form.ts` 的 FormPane）。**v1.15.0** 起它是一棵**可折叠的分类树**：
+配置项太多了（**20 项**），靠子命令记不住 —— 所以 `/aihelp` 是个**表单弹窗**（复用 `form.ts` 的 FormPane）。**v1.15.0** 起它是一棵**可折叠的分类树**：
 
 ```
 ╭───────────────────────────────────────────────────────────────────────╮
 │ ⚙ ai-configure 配置 / 命令（按分类折叠，回车展开）                     │
 ├───────────────────────────────────────────────────────────────────────┤
-│ ▾ 命令 (8)                                                            │
-│     ▸ /remote               → 回车执行   回车直接执行                   │
-│     ▸ /remote status        → 回车执行   回车直接执行                   │
-│     ▸ /remote on            → 回车执行   回车直接执行                   │
-│     …                                                                 │
 │ ▸ 剪贴板投递 (8)                                                       │
 │ ▸ 输入框投递 (3)                                                       │
 │ ▸ 通知与弹窗 (5)                                                       │
-│ ▸ 语音播报 (4)                                                         │
 │ ▸ 计划确认 (3)                                                         │
 │ ▸ 助理 / 委派 (1)                                                      │
 │ ▸ 会话级（重启复位） (2)                                               │
-│ ▸ 手机接管 (3)                                                         │
 ├───────────────────────────────────────────────────────────────────────┤
-│  「命令」共 8 项 —— 回车（或 ←→）展开 / 收起                           │
 ├───────────────────────────────────────────────────────────────────────┤
 │  ↑↓ 移动 · 回车/←→ 展开收起 · ctrl+s 保存 · esc 取消                    │
 ╰───────────────────────────────────────────────────────────────────────╯
 ```
 
-- **默认全部收起**（一屏平铺 37 行根本找不着东西）→ 打开只看到 9 行分组；**折叠状态同一会话内记住**
+- **默认全部收起**（一屏平铺 37 行根本找不着东西）→ 打开只看到 6 行分组；**折叠状态同一会话内记住**
 - **键位**：`↑↓` 移动（**自动跳过收起的组里的行**）· `回车` 改值，**在分类表头上回车 = 展开/收起** · `←→` 也能收起/展开当前组（文件树的习惯）· `ctrl+s` 保存 · `esc` 取消
-- **`命令` 组是「行动」不是配置**：选中回车 = **立即执行**那条命令（`action` 行），不是改值
 - **每项都讲清楚**：选中行下面那行写着「这是干什么用的｜取值｜当前｜默认」；选中分类表头时显示「这一组 N 项 —— 回车展开」
 - **收起不会丢改动**：你改成“是”再把这组收起来，`ctrl+s` 照样提交（收起的组在提交里也在）
 - **DIY 项也在里面**：触发词、音色这种自由填的直接行内输（触发词用逗号分隔）
@@ -693,26 +677,6 @@ pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 
 - 仍可能误投（比如你 Ctrl+C 一段中文长段落）→ 用 `/voice clip` 的忙时策略 `abort` 或直接把内容判断关掉/打开试试
 - 想回到最安全的档：`/voice clip trigger-mode word`
 - 每次判定都进台账：`/voice clip log` 会显示 `等待静默 / 静默投递 / 丢弃·不像语音（原因）`
-
-### ⑦ 语音播报（TTS）：答完自动念结论（卡片照旧常驻）
-
-```
-/voice tts on            # 开：答完弹卡片的同时自动念「结论摘要」
-/voice tts test          # 试听（立刻生效，不用等下一轮）
-/voice tts voice Microsoft Huihui Desktop   # 换音色（default = 恢复默认）
-/voice tts rate -2       # 语速 -10~10 · /voice tts volume 80 音量 0~100
-/voice tts               # 看当前状态
-```
-
-- **零安装**：用系统自带语音库 —— Windows `System.Speech`（中文音色 `Microsoft Huihui Desktop`）·
-  macOS `say` · Linux `spd-say`。**离线、不联网、内容不外发**
-- **卡片不会跟着走**：结论弹窗是**常驻**的（点 ✕ 才关），播报只是顺带念一遍那 300 字以内的口播稿；
-  念完了卡片还在，方便你回来对照（念的稿子和卡片正文不是一份：稿子会剥掉代码块/链接/符号，最多 300 字）
-- **只念摘要**：`speechText()` 是纯函数（可测），把 markdown 记号 / emoji / 链接 / 括号旁注洗掉，
-  超 300 字截断并加「……以下省略」—— 避免它念「星号 星号 结论 星号 星号」
-- **默认关**（不会突然出声）；`auto` 关闭时/`tts off` 时结果卡片行为完全不变（9s 自动关）
-- ⚠️ **踩过的坑**：把脚本里的 `
-` 写成真换行 → 字符串没闭合（同上，注意转义）
 
 ### 其他
 
@@ -1318,225 +1282,6 @@ Windows toast。语音那条跑完还会再弹一下「答完了，回来看一�
 
 ---
 
-## 模块 6 · remote.ts（手机接管：Telegram 双向同步 · **v1.14.0** 起）
-
-**一句话**：让你在**手机上**接着电脑上这个 pi 会话唠 —— 消息进的是**同一个会话**（不是另开一个对话），而且手机上**能看见中间过程**、**能确认计划**、**能触发白名单命令**。
-
-### 为什么做成 pi 扩展（而不是一个独立进程）
-
-因为要的正是「**同一个会话**」：消息出在同一个 TUI 里，复用 `pi.on()` / `pi.sendUserMessage()` / `ctx.abort()` / `ctx.compact()` / `sessionManager`。
-顺带不用 SSH 代理、不用 Tailscale —— Telegram 长轮询是**纯出站**请求，4G 也能用。
-
-### 默认不公开（设计原则）
-
-| 行为 | 默认 |
-|---|---|
-| 不 `on` 时发不发网络请求 | **一条都不发**（不轮询、不上报）|
-| 开关状态存在哪 | **会话级**（`appendEntry`）—— 换会话回来默认就是「关」|
-| 手机没配对能干什么 | 只能拿到一个 6 位码；**必须在电脑上** `/remote bind` 批准 |
-| 群聊 | 直接丢掉（只认私聊），否则群里谁说话都成指令 |
-
-### 配对（反向，推荐）
-
-手机先给 bot **随便发一句** → bot 回一个 6 位码 → 电脑上 `/remote bind <码>`。
-为什么反向：手机上敲 8 位口令很难受，而电脑有键盘；**批准权在电脑**，所以码本身泄露也不致命。
-
-### 手机上能看到什么（v2）
-
-1. **过程回传**：每次工具调用开始/结束，手机上**同一条消息被反复编辑**（`⏳ bash pytest` → `✅ 3.1s`），节流 1.5s）—— 不刷屏但进度一直在动；跑完这条“冻结”成 `✅ 完成 · 21s`，最终回复**另发**一条。超 10 行折叠成「前面还有 N 次调用」。
-   - 为什么是「编辑同一条」：Telegram 同聊天约 1 条/秒，连发 N 条既刷屏又会被 429。
-2. **计划确认**：电脑端那个「计划行不行」的框会**同步到手机**（带三个按钮），不然你从手机驱动会话时会**卡在那个弹窗上**。
-   - **两边真同步**：手机一答，**电脑终端那个选择框会自己关掉**（`ui.select` 传 `AbortSignal`）；在电脑上答，手机那张卡也会照实追加一行「⛔ 已在电脑端选择：先别做」。
-   - **卡片不会被改掉**：答复后只**在末尾追加一行**（`—— ✅ 已答复：按这个执行`），计划标题+步骤一字不改（以前是把整张卡替换成一行，用户：“本来那张卡直接消失了”）。
-   - 只有**明确**的同意/拒绝才当答复；说一句别的（可能是新任务）**不猜** —— 反问你一下“是改意见还是新指令”（实测踩过：长句被当修改意见 → **新任务被吞**）。
-3. **上下文占用**：`/status` 带百分比 + 进度条图标（终端里那个进度条手机上本来看不到）。
-
-### 手机上能做什么（v2）
-
-| 动作 | 说明 |
-|---|---|
-| `/status` `/usage` | 状态 + 上下文占用 |
-| `/stop` | `ctx.abort()` |
-| `/compact` | `ctx.compact()` —— 手机上也能主动压上下文 |
-| `/verbose quiet\|tools\|full` | 改回传详细度 |
-| `/run <名字> [参数…]` | 执行**白名单命令** |
-
-### `/run` 的四条安全底线（**是设计，不是懒得做**）
-
-1. 命令**只能在电脑上的配置文件里预定义**（`telegram.phoneCommands`）—— 手机侧永远加不了新命令；
-2. 默认**不走 shell**（`cmd` + `args` 直接当 argv 传）→ 参数里写 `;` `|` `$()` 都**不是元字符**，注入不成立；
-3. 真需要管道/`&&` 就写 `shell` 字段，那时参数过**白名单字符校验**（只允许 `\w @ . / : = + -`）；
-4. `danger: true` 的命令**默认拒绝** —— 要电脑上 `/remote allow-danger` 临时放行，**每次 `on` 都重置**；
-5. 每次执行都在**终端留痕** + 写一条 `ai-remote-run` 审计条目。
-
-为什么这么紧：手机一旦丢了/被人拿到，它就是**能在你电脑上跑命令**的。
-
-配置例子：
-
-```json
-{
-  "telegram": {
-    "phoneCommands": [
-      { "name": "gst", "desc": "后端 git 状态", "cmd": "git", "args": ["status", "--short"],
-        "cwd": "F:/AI/My_Center/center_backend" },
-      { "name": "deploy", "desc": "拉代码并重启后端", "cmd": "bash",
-        "args": ["-lc", "cd ~/center_backend && git pull && ~/center_start.sh"], "danger": true }
-    ]
-  }
-}
-```
-
-### 配置项（`<agentDir>/ai-extensions.json` 的 `telegram` 段）
-
-| 键 | 说明 |
-|---|---|
-| `token` | bot token（**自己填；别贴到对话里**，泄露就去 @BotFather `/revoke`）|
-| `chats` | 已授权设备 `{chatId, label, boundTo}`；`boundTo` = `<机器名>:<工作目录>` |
-| `deliver` | 忙时怎么投：`followUp`（排队，默认）/ `steer`（插话）|
-| `markInbound` | 手机消息正文加不加 `📱 ` 前缀（默认加）|
-| `verbose` | 回传详细度 `quiet` / `tools`（默认）/ `full` |
-| `phoneCommands` | 手机白名单命令（见上）|
-| `runTimeoutMs` | 白名单命令超时（默认 60000，上限 600000）|
-| `offset` | 轮询游标（自动维护）|
-
-### 语音条回传（v1.31.0 起）
-
-手机发起的**那一轮**，结论会额外合成一条 Telegram **语音条**推回手机（见模块 7 的 `voiceRoute=auto`）——
-走路/开车时不用盯屏幕。判定按**轮**（消息到达那一刻定格），不按时间窗口。
-
-### 踩过的坑（都是实测）
-
-- **IPv6 间歇性 ECONNRESET**：本机 DNS 会返回 AAAA 而到 Telegram 的 IPv6 路由不通；`curl` 自带 happy-eyeballs 会回退所以「curl 能通、Node 不通」。→ 加载时就 `setDefaultResultOrder("ipv4first")` + `tgFetch` 重试 4 次。
-- **格式突然坏样**：根因是把「网络失败」和「HTML 不合法」混进同一个 `catch` → 网络一抽风就降级成纯文本（露出 `**` 和 `|`）。→ 只有 Telegram **明确说 HTML 不合法**才降级。
-- **409 Conflict**：一个 bot 同时只能有一个消费者（`getUpdates` 硬限制）→ 第二个实例收到 409；退出时要把**会话状态写回**。
-- **离线积压被当新指令执行** → 年龄 > 120s 的积压**先问再投**（`/remote catchup|drop`）。
-- **命令太多记不住**：pi 的 `RegisteredCommand` **没有** hidden/group 字段（查过类型）→ `/` 弹出列表**改不了**。所以“分层”做在**入口**上：`/remote` 不带参数 = 图形面板，`/aihelp` 里多一个「**命令**」分组（**选中即执行**）。
-- **⚠️ 手机上点按钮“没反应、过一会儿才到”**（最好骗人的一个 bug）：轮询时写了 `allowed_updates: ["message"]`，把 `callback_query` **过滤掉了**。Telegram 的行为是：**请求发出之后**产生的其他类型更新会被过滤（发出之前的仍会给）→ 你点的那一下正好落在一次 25s 长轮询中间，就得**等下一轮**才拿到。你连点几次，然后一次性全到。
-  → 现在有一份共用的 `ALLOWED_UPDATES = ["message", "callback_query"]`，三处 `getUpdates`（轮询 / 存量检查 / 丢弃）**全部显式带上**（不写会**沿用上一次的设置**，这种隐式状态极容易咬人）。
-  → 另外：`answerCallbackQuery`（手机上转圈停下来的**唯一**信号）现在**第一件事就发且不 await**。
-  → **测试教训**：当时只测了 `handleUpdate()`（handler 层）→ “能不能**收到**”这条链路从没被测过。现在有走 `getUpdates` 全链路的用例，并断言请求里带了 `callback_query`。
-- **轮询循环是串行的**：手机发的 `/run` 最长跑 60s，以前是 `await` 它 → 这期间你点按钮、发消息全排在它后面。现在白名单命令**扔后台**跑，跑完主动发结果。
-
-### 相关代码位置
-
-| 文件 | 干什么 |
-|---|---|
-| `remote.ts` | 主体（轮询 / 投递 / 进度卡 / 计划桥 / 白名单 / 面板）|
-| `qr.ts` + `vendor/qrcode.js` | 二维码（内联 `qrcode-generator`，MIT）|
-| `telegram-md.ts` | Markdown → Telegram HTML（表格 / 代码块 / 粗体）|
-| `shared.ts` | 计划问答通道（`openPlanAsk`/`answerPlanAsk`/`parsePlanAnswer`）+ `onPlanAskChange` 钩子 |
-| `form.ts` | 面板组件（`FormPane`/`showForm`）；`action` 行 = 回车即执行 · **`group` 行 = 分类表头（回车/←→ 展开收起）**|
-
----
-
-## 模块 7 · voice-tts.ts（语音播报：事件 → 口播稿 → 队列 → 引擎 → 电脑/手机 · **v1.17.0** 起，**v1.40.0** 现状）
-
-给「用耳朵写代码」用的输出侧。**默认关闭**（`voiceTts=false`），装上模型也不会自动开。
-
-```
-agent_settled / tool_execution_end / 计划确认 / 用户消息
-        ↓  事件（不是整段 markdown）
-speech.ts      口播稿：结论先行、不念代码和路径；`[口播]` 段优先，没有就用要点兜底
-        ↓
-speaker.ts     唯一出口：优先级 · 抢占 · ttl 过期 · 可打断 + 写 narration/YYYY-MM-DD.jsonl
-        ↓
-tts/index.ts   引擎路由：doubao（云端）→ local（离线模型）→ sapi（系统语音）→ off
-        ↓
-runtime/tts_worker.py   常驻子进程：离线合成播放 / 云端合成（WebSocket）/ 导出 ogg 语音条
-        ↓
-电脑扬声器  ／  Telegram 语音条（手机）
-```
-
-三条硬约束（改代码前先记住）：
-
-1. **播报与主流程完全解耦**：不 `await`、整段 `try/catch`、异常静默、三道熔断
-   （连续 3 次失败停播 / 节流 ≥6s / 一轮最多 5~6 句）、独立子进程。
-   播不出来绝不能影响回答本身。
-2. **口播稿不进对话历史**：只走 `Speaker` + `narration/*.jsonl`（`appendEntry` 的 custom 条目也不进上下文），
-   规则模板 **0 次模型调用**。
-3. **粒度按「阶段」不按工具调用**：每个工具都念一遍太吵。
-
-### 引擎（`voiceEngine`：`auto` / `doubao` / `local` / `sapi`）
-
-| 引擎 | 说明 | 代价 |
-|---|---|---|
-| `doubao` | 火山豆包语音（v3 双向流 WebSocket，`seed-tts-2.0`），男声可选多；**只当「嘴」不当「脑子」** | 按字符计费（默认 1.0 元/万字符），本机实测约 0.5~2 元/天 |
-| `local` | 离线 sherpa-onnx 模型（默认 `kokoro-multi-lang-v1_1`，另可选 `vits-zh-aishell3`、`melotts`），下载到 `~/.pi/agent/models/tts/` | 0 元，CPU 合成一句 10 秒音频约 3 秒 |
-| `sapi` | 系统自带语音（Windows `System.Speech` / macOS `say` / Linux `spd-say`） | 0 元、零安装，音质最差 |
-| `off` | 不播 | — |
-
-**模型不进 git**：清单在 `ai-configure/tts/manifest.json`，本体下载到 `~/.pi/agent/models/tts/<model-id>/`，删目录即可卸载。
-
-### 播什么（`voiceLevel`）
-
-| 档 | 念什么 |
-|---|---|
-| `brief` | 只念结论 1~2 句 |
-| `normal` | 结论 + 风险/待办 |
-| `full` | 400 字以内整段（不插「以下省略」） |
-| `steps`（默认） | **阶段**：开工应答（「收到，我看一下」）+ 长任务过渡台词 + 结论 |
-| `chatty` | `steps` + 工具失败时的安慰句（节流 10 秒、一轮最多 6 句） |
-
-- **口播稿谁写**：我自己写 —— 回答里带 `[口播]…[/口播]` 段（优先用它），工具前写 `<step>…</step>` 行（≤20 字）；
-  规则模板只兜底（`keyPoints` → 「第一…第二…」）。
-- **语气**（`voiceTone`，默认 `off`）：`off` 不加 / `auto` 按场景 / 也可在 `<step tone="calm">` 里指定；
-  走豆包的 `context_texts`（**不计费**）。
-- **英文术语**（`voiceTerms`，默认 `en`）：保留原词（GitHub / API / TypeScript 不会被念成「G H U B」），
-  `zh` 才转中文。
-- **口播不截断**：上限 1500 字，只在句读处收口。
-
-### 发到哪（`voiceRoute`：`auto` / `both` / `pc` / `phone`）
-
-| 档 | 电脑 | 手机 |
-|---|---|---|
-| `auto`（默认） | 电脑发起的一轮就电脑念 | 手机发起的一轮就发语音条，**电脑完全静音**（连「收到」都不念） |
-| `both` | ✅ | ✅ |
-| `pc` | ✅ | ❌ |
-| `phone` | ❌ | ✅ |
-
-- **按「轮」判定来源，不用时间窗口**：消息到达那一刻定格 `turnRemote`，整轮不再变。
-  早期用「最近 3 分钟」窗口 → 长任务（>3 分钟）会被判成电脑轮，人在外面就彻底没声音。
-- 手机语音条：worker 合成 ogg_opus（48k）→ Telegram `sendVoice`（文件名非 `.ogg` 时降级 `sendDocument`）。
-- **发送有兜底**：主路径（`remote.sendVoiceToPhone`）返回 0 时自动走**直发**（自己读配置里的 token/chats 调
-  `sendVoice`），还失败就把 HTTP 状态码 + Telegram 返回体写进 `narration`。
-
-### 命令
-
-| 命令 | 作用 |
-|---|---|
-| `/tts status` | 用了哪档引擎、模型在不在、为什么不可用、今天花了多少钱 |
-| `/tts test` / `demo` | 念测试句（含 GitHub / CI / TypeScript / diff 这些难点词）/ 演示播报效果 |
-| `/tts install` / `rm` | 下载（断点续传、GitHub↔hf-mirror 双镜像、sha256 校验）/ 删模型 |
-| `/tts on` / `off` | 开关播报 |
-| `/tts voice 49` / `voices` | 换音色 / 列出所有音色 |
-| `/tts speed 0.92` | 语速（默认 1.0；真旋钮是 `length_scale = 1/speed`） |
-
-### 用量与费用
-
-- `<agentDir>/narration/usage.json`：`{日期: {words, cached, calls, local}}`，只留 14 天。
-- 状态栏一行：`🔊 豆包 1,240 字 ¥0.12 · 缓存免单 800 字`（`voicePrice` 默认 1.0 元/万字符）。
-- 音频缓存 `<agentDir>/models/tts/.cloud-cache/`：键含 `text|speaker|sr|rid|speed|tone`，
-  换任何一项必 miss；200MB / 7 天自动清理。**同样的句子第二次念不花钱。**
-
-### 踩过的坑（都是真机实测，改这块之前先看）
-
-| 现象 | 真因 |
-|---|---|
-| 长稿只念第一句 | 后台合成没完就报 `done` → 加 `pending` 计数，`say()` 等 `done` 取总时长 |
-| 换音色没效果 | `ensure_engine()` 建好即 return，`say` 的 sid 从未应用 → 抽出 `apply_voice()`（换 sid 只改属性，换 speed 重建） |
-| 音色编号对不上 | 官方表 45-48 中文女声、**49-52 中文男声**（49 `zm_yunjian` 沉稳，默认）；早期误用 50 |
-| 语音条收到了但**没声音** | 云端音频帧解包时 seq 字段位置写死，吃掉每帧前 4 字节 → 容器头毁。改用**长度自校验**定位 payload |
-| 突然 `RuntimeError: 连接关闭` | 豆包常驻连接被服务端回收（省握手 3.2~3.4s 的代价）→ `cloud_call()` 作废连接 + **重建重试一次**（+3s） |
-| 手机上永远收不到 | ① 遗留守卫 `if (!c.voiceSendPhone) return;` 让函数第一步就返回 ② 判定用的全局标记被上一轮清掉 → 改成按轮定格 |
-| 方舟（ark）的 key 调不动语音 | 方舟 ≠ 语音技术，鉴权体系不同：v3 `X-Api-Key` → 401 `Invalid X-Api-Key`；Bearer → 400 `app key not found in header` |
-| `seed-audio-1.0` 特别慢 | 生成式音频模型（固定 ~37s 开销，与文本长度无关），**不是实时 TTS**；实时要 `seed-tts-2.0` |
-
-### 为什么不吃 token
-
-口播稿由我自己顺手写（`[口播]` 段约 60~150 字 ≈ 100 token），规则模板 0 次模型调用，
-音频合成在**独立子进程**里跑，不占对话上下文。
-实测本机：首句出声 0.4~0.6s（离线）/ 1.0~1.6s（云端，连接常驻后），一句 10 秒音频合成约 3 秒。
-
 ## 上下文成本实测
 
 每轮都会重发的内容，实测（同一句「只回答：好」，deepseek-v4-flash，2026-10-03）：
@@ -1669,21 +1414,6 @@ pi remove git:github.com/zeke-center/pi-extensions
 
 删完重启 pi（或 `/reload`）。`install.ps1` 现在会**自动检测**包通道并拒绝重复同步扩展（红字提示），除非显式 `-ForceExtensions`。
 
-### 语音不播 / 手机收不到语音条
-
-先看 `<agentDir>/narration/YYYY-MM-DD.jsonl`（**UTC 时间**），结论那一轮会有明确记录：
-
-| 日志 | 意思 | 怎么办 |
-|---|---|---|
-| `结论分发：电脑=false 手机=true 来源=手机 长度=268` | 决策正常 | 看下一行 |
-| `语音条合成失败：RuntimeError: 连接关闭` | 豆包常驻连接被回收 | v1.40.0 起会自动重建重试；仍失败看 key |
-| `语音条已发送：1 个会话，412KB` | **成功** | — |
-| `兜底发送失败：<HTTP码> <返回体>` | Telegram 侧拒绝 | 看返回体（常见 400 chat not found / 413 太大） |
-| `结论未播：voiceTts 关着` / `语音模块没初始化` | 开关或环境问题 | `/tts on`、`/tts status` |
-| 完全没有 `结论分发` 一行 | `agent_settled` 没跑到 | 看有没有别的异常日志 |
-
-其它常见点：电脑上不念 → 看 `voiceRoute` 是不是 `phone`；`/tts status` 里引擎是 `off` → 模型没装好且没有系统语音。
-
 ### 启动报 `Ignored settings` / MCP 字段不生效
 
 如果你装了 `pi-mcp-adapter`（并在 settings 里把它设成 MCP 提供方，如 `"extensions": ["-builtin:mcp"]`），那 `~/.pi/agent/mcp.json` **由 adapter 读取**。adapter 只翻译 pi 原生字段；它**自己的**字段要写 `~/.pi/agent/mcp-adapter.json`：
@@ -1700,29 +1430,6 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 ```
 
 一句话：**能进 pi 原生 `mcp.json` 的只有官方字段（含 `timeout`，单位秒）**；adapter 专属的别往那儿塞。
-
-## 模块 8 · telemetry.ts（埋点，默认关）
-
-把「哪些功能真有人用、哪里慢、哪里老报错」记下来，用于迭代。
-
-- **默认关闭**：`telemetryUpload=false` 时不采集、不落盘、不联网。
-- **必须有密钥**：后端 `MASTER_KEY`（请求头 `X-Brain-Token`），否则开关会自己回弹。
-  优先级：`PI_TELEMETRY_KEY` → `CENTER_TOKEN` → `CENTER_MASTER_KEY` → `MASTER_KEY` 环境变量 → 配置里的 `telemetryKey`。
-  变量名可在设置里改；`/telemetry` 会显示密钥来源（`env:MASTER_KEY` / `file`），不打印值。
-- 首次开启弹确认框，逐条列出采集内容并声明**数据可能用于迭代本项目**；改声明版本会强制重新确认。
-- 命令：
-
-| 命令 | 作用 |
-|---|---|
-| `/telemetry` | 看状态（开关 / 粒度 / 密钥是否已填 / 队列长度 / 今日已传） |
-| `/telemetry on` | 走一遍确认流程后开启 |
-| `/telemetry off` | 停止上传并清空本地队列 |
-| `/telemetry flush` | 立即上报 |
-
-- 设置面板 → **数据与隐私**：开关、密钥、上报地址（默认取 `CENTER_API`）、粒度（`meta` / `full`）、查看声明。
-- 采集的事件与字段：`ai-configure/EVENTS.md`；隐私声明：`PRIVACY.md`。
-- 失败不打扰：攒批 20 条 / 5 秒，失败落 `~/.pi/agent/telemetry-queue.jsonl`，最多重试 3 次；401 自动关开关。
-- 单日上限 20MB（超了停传并提示），服务端再限单批 500 条 / 2MB，原始事件保留 180 天。
 
 ## 许可
 

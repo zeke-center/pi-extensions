@@ -94,13 +94,11 @@ export function cardDirPath(): string {
  * - `seconds = 0`（默认）= **常驻**，只有你手动点 X 才会消失
  * - `seconds > 0` = 到点自己消失（用于“输入弹窗”这种看一眼就够的）
  * - 多张弹窗会**自动往下叠**，不会互相顶掉
- * - `speak` 传了才播报（不传 = 静默）
  */
-export function cardNotify(title: string, body: string, seconds = 0, speak?: string): void {
+export function cardNotify(title: string, body: string, seconds = 0): void {
 	if (!popupOn) return;
 	if (process.platform !== "win32") {
 		systemNotifyPosix(title, body, 0);
-		if (speak) speakPosix(speak);
 		return;
 	}
 	try {
@@ -125,14 +123,6 @@ export function cardNotify(title: string, body: string, seconds = 0, speak?: str
 				b64(body),
 				"-Seconds",
 				String(seconds),
-				"-SpeakB64",
-				b64(speak ?? ""),
-				"-VoiceName",
-				ttsVoice,
-				"-Rate",
-				String(ttsRate),
-				"-Volume",
-				String(ttsVolume),
 				"-CardDir",
 				cardDir(),
 			],
@@ -145,7 +135,7 @@ export function cardNotify(title: string, body: string, seconds = 0, speak?: str
 	}
 }
 /** 自绘“弹窗”脚本（纯 ASCII，参数走 base64）：圆角 + 半透明 + 贴屏幕顶部居中，不抢焦点，到点自动消失，点一下立刻关 */
-const POPUP_PS1 = `param([string]$TitleB64 = '', [string]$BodyB64 = '', [int]$Seconds = 0, [int]$Top = 14, [string]$SpeakB64 = '', [string]$VoiceName = '', [int]$Rate = 0, [int]$Volume = 100, [string]$CardDir = '')
+const POPUP_PS1 = `param([string]$TitleB64 = '', [string]$BodyB64 = '', [int]$Seconds = 0, [int]$Top = 14, [string]$CardDir = '')
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -215,19 +205,6 @@ $cl.Add_Click({ $f.Close() })
 $f.Add_FormClosed({
   if ($CardDir -ne '') { Remove-Item (Join-Path $CardDir "$PID.txt") -Force -ErrorAction SilentlyContinue }
 })
-# 语音播报（可选；默认关）
-$spk = $null
-if ($SpeakB64 -ne '') {
-  try {
-    Add-Type -AssemblyName System.Speech
-    $spk = New-Object System.Speech.Synthesis.SpeechSynthesizer
-    if ($VoiceName -ne '') { try { $spk.SelectVoice($VoiceName) } catch { } }
-    $spk.Rate = [Math]::Max(-10, [Math]::Min(10, $Rate))
-    if ($Volume -gt 0) { $spk.Volume = [Math]::Max(0, [Math]::Min(100, $Volume)) }
-    $say = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($SpeakB64))
-    $spk.SpeakAsync($say) | Out-Null
-  } catch { $spk = $null }
-}
 # 只有显式传 Seconds > 0 才会自动消失；默认 0 = 常驻，必须你手动点 X
 if ($Seconds -gt 0) {
   $started = Get-Date
@@ -235,10 +212,7 @@ if ($Seconds -gt 0) {
   $tm.Interval = 250
   $tm.Add_Tick({
     $el = ((Get-Date) - $started).TotalSeconds
-    if ($spk) {
-      if ($el -gt 1.0 -and $spk.State -eq 'Ready') { $f.Close() }
-      elseif ($el -gt 180) { $f.Close() }
-    } elseif ($el -gt $Seconds) { $f.Close() }
+    if ($el -gt $Seconds) { $f.Close() }
   })
   $tm.Start()
 }
@@ -358,63 +332,6 @@ export function getPopupOn(): boolean {
 	return popupOn;
 }
 
-// ======================= 语音播报（TTS）=======================
-// 用系统自带语音库（Windows: System.Speech · macOS: say · Linux: spd-say）：
-// 零安装、离线、不外发内容。开关 = /voice tts on|off（配置 voiceTts）。
-let ttsOn = false;
-let ttsVoice = "";
-let ttsRate = 0;
-let ttsVolume = 100;
-/** 播报文本上限（超了念不完，还不如短点） */
-const SPEECH_MAX = 300;
-
-export function setTts(o: { on?: boolean; voice?: string; rate?: number; volume?: number }): void {
-	if (typeof o.on === "boolean") ttsOn = o.on;
-	if (typeof o.voice === "string") ttsVoice = o.voice;
-	if (Number.isFinite(o.rate)) ttsRate = Math.max(-10, Math.min(10, Math.round(o.rate as number)));
-	if (Number.isFinite(o.volume)) ttsVolume = Math.max(0, Math.min(100, Math.round(o.volume as number)));
-}
-export function getTts(): { on: boolean; voice: string; rate: number; volume: number } {
-	return { on: ttsOn, voice: ttsVoice, rate: ttsRate, volume: ttsVolume };
-}
-
-/**
- * 把结论摘要洗成**适合念**的文本。**纯函数**。
- *
- * 念出来和看起来不一样：emoji、markdown 记号、括号旁注都得去掉，
- * 否则它会念「星号 星号 结论 星号 星号」「括号 见截图 括号」。
- */
-export function speechText(md: string): string {
-	let t = (md ?? "")
-		.replace(/```[\s\S]*?```/g, " ")
-		.replace(/`([^`]*)`/g, "$1")
-		.replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
-		.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-		.replace(/https?:\/\/\S+/g, " ")
-		.replace(/[#*_>~|]+/g, " ")
-		.replace(/（[^）]{0,40}）/g, " ")
-		.replace(/\([^)]{0,40}\)/g, " ")
-		.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{2B00}-\u{2BFF}]/gu, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-	if (t.length > SPEECH_MAX) t = `${t.slice(0, SPEECH_MAX)}……以下省略`;
-	return t;
-}
-
-/** 非 Windows 的播报（macOS say / Linux spd-say）；失败静默 */
-function speakPosix(text: string): void {
-	try {
-		const cmd = process.platform === "darwin" ? "say" : "spd-say";
-		const args = process.platform === "darwin" ? [text] : ["-w", text];
-		const c = spawn(cmd, args, { detached: false, stdio: "ignore" });
-		c.on("error", () => {});
-		c.unref();
-	} catch {
-		/* ignore */
-	}
-}
-
-
 export function setNotifyMode(m: NotifyMode): void {
 	notifyMode = m;
 }
@@ -455,7 +372,6 @@ export function sendResult(opts: {
 		osc: opts.osc,
 		toast: opts.toast,
 		beep: opts.beep,
-		speak: body,
 	});
 }
 
@@ -480,8 +396,6 @@ export function notifyUser(opts: {
 	toast?: boolean;
 	/** true = 响一下系统提示音；"warn" = 换成警告音 */
 	beep?: boolean | "warn";
-	/** 要念的文本（传了且 TTS 开着 → 弹卡片 + 自动播报；念完卡片一起消失） */
-	speak?: string;
 }): void {
 	const tm = terminalInfo();
 	const mode = notifyMode;
@@ -503,14 +417,10 @@ export function notifyUser(opts: {
 			? false
 			: mode === "toast" || (mode === "auto" && process.platform !== "win32");
 	const beep = opts.beep === "warn" ? 2 : opts.beep === true ? 1 : 0;
-	// TTS 靠"弹窗"承载（Win 上就是卡片里那台喇叭）→ 弹窗关了就不出声，避免你以为坏了
-	const speak = ttsOn && popupOn ? speechText(opts.speak ?? opts.body ?? "") : "";
 	if (useOsc) oscNotify(opts.title ?? "pi", opts.oscBody ?? opts.body ?? "");
-	// TTS 开着 → 一定要弹卡片（卡片就是"播报台"：念完自己消失）
-	if (wantCard || (speak && process.platform === "win32")) {
-		cardNotify(opts.title ?? "pi", opts.body ?? "", opts.cardSeconds ?? 12, speak || undefined);
+	if (wantCard) {
+		cardNotify(opts.title ?? "pi", opts.body ?? "", opts.cardSeconds ?? 12);
 	}
-	if (speak && process.platform !== "win32") speakPosix(speak);
 	if (!wantSys && !beep) return;
 	// 非 Windows：直接另起平台原生命令（macOS / Linux），连提示音一起办
 	if (process.platform !== "win32") {

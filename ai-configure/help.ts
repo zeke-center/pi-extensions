@@ -19,7 +19,7 @@ export const HELP_TEXT = `AI configure · 全部功能
   /ai project clear       清空项目级连接
   /ai help                就是你现在看的这个（文本版说明书）
 /aihelp                   **可视化配置面板**（表单式，和 /assistants 一样）：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消
-                           标签前缀就是分组（剪贴板·/ 输入框·/ 通知·/ 播报·/ 计划·/ 助理·/ 会话级·），
+                           标签前缀就是分组（剪贴板·/ 输入框·/ 通知·/ 计划·/ 助理·/ 会话级·），
                            每一项都写了「这是干什么用的」，改完立即生效并写进 ai-extensions.json
 /ai-ext                   会话级停用 / 恢复整个扩展（不用卸载，本会话记住）
   /ai-ext off             停用：面板收起、progress/delegate 从工具表撤下、后台回投暂停
@@ -52,10 +52,6 @@ export const HELP_TEXT = `AI configure · 全部功能
   /voice popup on|off     **桌面弹窗开关**：输入弹窗(4s自消)/执行弹窗(常驻)/结论弹窗(常驻)，多张自动往下叠
 
                           通道细调：/voice notify auto|osc|card|both|toast
-  /voice tts on|off       **语音播报**：开 = 答完弹卡片的同时自动念结论摘要（卡片照旧常驻，点 ✕ 才关）
-  /voice tts test         试听（音色/语速/音量立刻生效，不用等下一轮）
-  /voice tts voice <名称>  换音色（Windows: Microsoft Huihui Desktop / Microsoft Zira Desktop；default=恢复默认）
-  /voice tts rate -10..10 语速 · /voice tts volume 0~100 音量 · /voice tts 看状态
   /voice result on|off    答完把**结论**弹出来（默认开：语音轮一定弹）
   /voice result long 20   手打的轮跑够 20s 也弹（0 = 只弹语音轮）
   /voice notify auto      通知通道（默认 auto）：终端支持就发**胶囊**（Warp 顶部那个效果），

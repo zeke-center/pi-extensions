@@ -52,7 +52,6 @@ import {
 	sendResult,
 	setNotifyMode,
 	setPopupOn,
-	setTts,
 	summarizeReply,
 	terminalInfo,
 	type NotifyMode,
@@ -547,11 +546,6 @@ let turnIsCustom = false;
 let resultSent = false;
 /** 结果卡片开关 + 手打轮的时长阈值（秒，0 = 手打轮从不弹） */
 let resultOn = true;
-/** 语音播报：开 = 弹卡片的同时自动念，念完卡片一起消失 */
-let ttsOn = false;
-let ttsVoiceName = "";
-let ttsRate = 0;
-let ttsVolume = 100;
 /** 自绘弹窗总开关 */
 let popupOn = true;
 let resultLongSec = 20;
@@ -1358,68 +1352,6 @@ export function registerVoiceSettings(): void {
 			},
 		}),
 
-		// ---------- 语音播报 ----------
-		mkSet({
-			key: "voiceTts",
-			group: "语音播报",
-			label: "语音播报",
-			desc: "答完自动把结论**念出来**（系统自带语音，离线、不联网）。念的是剥掉代码/链接的口播稿，最多 300 字。",
-			kind: "bool",
-			def: false,
-			get: () => ttsOn,
-			set: (v) => {
-				ttsOn = !!v;
-				setTts({ on: ttsOn });
-				patchCfg({ voiceTts: ttsOn });
-			},
-		}),
-		mkSet({
-			key: "voiceTtsVoice",
-			group: "语音播报",
-			label: "音色",
-			desc: "念结论用哪个嗓音（Windows 上常见：Microsoft Huihui Desktop / Microsoft Zira Desktop）。留空=系统默认。",
-			kind: "text",
-			def: "Microsoft Huihui Desktop",
-			get: () => ttsVoiceName,
-			set: (v) => {
-				ttsVoiceName = String(v);
-				setTts({ voice: ttsVoiceName });
-				patchCfg({ voiceTtsVoice: ttsVoiceName });
-			},
-		}),
-		mkSet({
-			key: "voiceTtsRate",
-			group: "语音播报",
-			label: "语速",
-			desc: "念的快慢：-10（很慢）~ 10（很快），0 = 正常。",
-			kind: "number",
-			min: -10,
-			max: 10,
-			def: 0,
-			get: () => ttsRate,
-			set: (v) => {
-				ttsRate = Math.max(-10, Math.min(10, Math.round(Number(v) || 0)));
-				setTts({ rate: ttsRate });
-				patchCfg({ voiceTtsRate: ttsRate });
-			},
-		}),
-		mkSet({
-			key: "voiceTtsVolume",
-			group: "语音播报",
-			label: "音量",
-			desc: "0~100。0 = 用系统默认音量。",
-			kind: "number",
-			min: 0,
-			max: 100,
-			def: 100,
-			get: () => ttsVolume,
-			set: (v) => {
-				ttsVolume = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
-				setTts({ volume: ttsVolume });
-				patchCfg({ voiceTtsVolume: ttsVolume });
-			},
-		}),
-
 		// ---------- 计划确认 ----------
 		mkSet({
 			key: "voicePlanTimeout",
@@ -1488,12 +1420,6 @@ export function setupVoice(api: ExtensionAPI): void {
 	if (Number.isFinite(ctw) && ctw >= 0 && ctw <= 20) clipTailWindow = Math.round(ctw);
 	beepOn = cfg.voiceBeep !== false;
 	resultOn = cfg.voiceResult !== false;
-	// 语音播报（TTS）：开着就"弹窗 + 自动念"，念完窗口一起消失
-	ttsOn = cfg.voiceTts === true;
-	ttsRate = Number.isFinite(Number(cfg.voiceTtsRate)) ? Math.round(Number(cfg.voiceTtsRate)) : 0;
-	ttsVolume = Number.isFinite(Number(cfg.voiceTtsVolume)) ? Math.round(Number(cfg.voiceTtsVolume)) : 100;
-	ttsVoiceName = typeof cfg.voiceTtsVoice === "string" ? cfg.voiceTtsVoice : "";
-	setTts({ on: ttsOn, voice: ttsVoiceName, rate: ttsRate, volume: ttsVolume });
 	popupOn = cfg.voicePopup !== false; // 弹窗总开关（默认开）
 	setPopupOn(popupOn);
 	// 计划确认：C（后台低风险自动过）· B（超时兜底）
@@ -1949,7 +1875,7 @@ export function setupVoice(api: ExtensionAPI): void {
 						`🪟 自绘弹窗：${getPopupOn() ? "开" : "关"}（当前挂着 ${liveCards()} 张 · 通道：${getNotifyMode()}）\n` +
 							"　输入弹窗(投递后 4s 自消) · 执行弹窗(计划开跑，常驻) · 结论弹窗(答完，常驻)\n" +
 							"　多张自动往下叠、互不顶掉；常驻的只有你点 ✕ 才关\n" +
-							"　关 = 不弹窗，只走终端胶囊或系统通知（注意：语音播报靠弹窗承载，关了就不出声）\n" +
+							"　关 = 不弹窗，只走终端胶囊或系统通知\n" +
 							"用法：/voice popup on|off · 通道细调：/voice notify auto|osc|card|both|toast",
 						"info",
 					);
@@ -2021,83 +1947,6 @@ export function setupVoice(api: ExtensionAPI): void {
 						`　超时：${nowLine}\n` +
 						"　在后台怎么答：直接粘一句话 —— 「同意」执行 · 「不行」撤 · 其他内容当成「我要改」\n" +
 						"　/voice plan auto on|off · timeout <秒> · ontimeout run|cancel",
-					"info",
-				);
-				return;
-			}
-
-			// ---------- 语音播报（TTS） ----------
-			if (low === "tts" || low.startsWith("tts ")) {
-				const rest = a.slice(3).trim();
-				const rlow = rest.toLowerCase();
-				if (rlow === "on" || rlow === "off") {
-					ttsOn = rlow === "on";
-					setTts({ on: ttsOn });
-					patchCfg({ voiceTts: ttsOn });
-					refreshStatus();
-					ctx.ui.notify(
-						ttsOn
-							? `🔊 语音播报：开（音色 ${ttsVoiceName || "系统默认（中文 Huihui）"} · 语速 ${ttsRate} · 音量 ${ttsVolume}）\n` +
-								"答完弹卡片的同时**自动念**结论摘要；念完卡片和声音一起消失（点卡片可提前结束）。\n" +
-								"想先听听：/voice tts test"
-							: "🔇 语音播报：关（结果卡片照旧弹，不念）",
-						"info",
-					);
-					return;
-				}
-				if (rlow === "test") {
-					const demo = "语音播报测试：你好，我是 pi，以后结论会这样念给你听。";
-					setTts({ on: true, voice: ttsVoiceName, rate: ttsRate, volume: ttsVolume });
-					cardNotify("pi · 语音播报测试", demo, 180, demo);
-					setTts({ on: ttsOn });
-					ctx.ui.notify(`🔊 正在试听（音色 ${ttsVoiceName || "系统默认"} · 语速 ${ttsRate} · 音量 ${ttsVolume}）`, "info");
-					return;
-				}
-				if (rlow.startsWith("voice")) {
-					const v = rest.slice(5).trim();
-					if (!v) {
-						ctx.ui.notify(
-							`当前音色：${ttsVoiceName || "（系统默认）"}\n` +
-								"Windows（System.Speech）可用：Microsoft Huihui Desktop（中文）· Microsoft Zira Desktop（英文）\n" +
-								"用法：/voice tts voice Microsoft Huihui Desktop · 恢复默认：/voice tts voice default",
-							"info",
-						);
-						return;
-					}
-					ttsVoiceName = v.toLowerCase() === "default" ? "" : v;
-					setTts({ voice: ttsVoiceName });
-					patchCfg({ voiceTtsVoice: ttsVoiceName });
-					ctx.ui.notify(`🔊 音色：${ttsVoiceName || "（系统默认）"}（/voice tts test 试听）`, "info");
-					return;
-				}
-				if (rlow.startsWith("rate")) {
-					const n = Number(rest.slice(4).trim());
-					if (!Number.isFinite(n) || n < -10 || n > 10) {
-						ctx.ui.notify(`当前语速：${ttsRate}（-10 最慢 ~ 10 最快）\n用法：/voice tts rate -2`, "info");
-						return;
-					}
-					ttsRate = Math.round(n);
-					setTts({ rate: ttsRate });
-					patchCfg({ voiceTtsRate: ttsRate });
-					ctx.ui.notify(`🔊 语速：${ttsRate}`, "info");
-					return;
-				}
-				if (rlow.startsWith("volume")) {
-					const n = Number(rest.slice(6).trim());
-					if (!Number.isFinite(n) || n < 0 || n > 100) {
-						ctx.ui.notify(`当前音量：${ttsVolume}（0~100）\n用法：/voice tts volume 80`, "info");
-						return;
-					}
-					ttsVolume = Math.round(n);
-					setTts({ volume: ttsVolume });
-					patchCfg({ voiceTtsVolume: ttsVolume });
-					ctx.ui.notify(`🔊 音量：${ttsVolume}`, "info");
-					return;
-				}
-				ctx.ui.notify(
-					`🔊 语音播报：${ttsOn ? "开" : "关"}（音色 ${ttsVoiceName || "系统默认"} · 语速 ${ttsRate} · 音量 ${ttsVolume}）\n` +
-						"　用系统自带语音库：离线、不联网、不外发内容；只念结论摘要，最长 300 字\n" +
-						"　/voice tts on|off · test（试听）· voice <名称> · rate <-10..10> · volume 0~100",
 					"info",
 				);
 				return;

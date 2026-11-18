@@ -23,10 +23,9 @@ import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
 import { cardNotify } from "./notify";
-import { track } from "./telemetry";
 import { registerSettings } from "./settings";
 import { guardCtx, readExtCfg, patchExtCfg } from "./shared";
-import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk, setAskOutcome } from "./shared";
+import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk } from "./shared";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1116,7 +1115,6 @@ export function setupBoard(api: ExtensionAPI): void {
 			ctx: ExtensionContext,
 		) {
 			lastCtx = ctx;
-			const _t0 = Date.now();
 			resetProgressWatch(); // 任何 progress() 调用都算“有更新”
 
 			// 停用态：工具理论已被撤下，这里再兜一道（防「撤下前已在飞」的调用）
@@ -1125,11 +1123,6 @@ export function setupBoard(api: ExtensionAPI): void {
 			}
 
 			if (params.action === "clear") {
-				const _done = steps.filter((s) => s.status === "done").length;
-				if (steps.length && _done < steps.length) {
-					track("plan_abandoned", { reason: "cleared", done: _done, total: steps.length, duration_ms: Date.now() - _t0 });
-				}
-				track("plan_clear", { done: _done, total: steps.length, duration_ms: Date.now() - _t0 });
 				title = "";
 				steps = [];
 				blocker = undefined;
@@ -1170,20 +1163,13 @@ export function setupBoard(api: ExtensionAPI): void {
 				//   · 你在终端亲手派的计划 → 照旧弹终端确认（要改就先改）
 				// 另外「粘贴一句话」和「超时兜底」两条通道仍然管用（谁先答算谁）
 				const stepTexts = pending.map((x) => x.text);
-				track("plan_declared", {
-					title: pendingTitle,
-					steps: stepTexts,
-					steps_count: stepTexts.length,
-					skip_confirm: params.skipConfirm === true,
-				});
-				const _askedAt = Date.now();
 				const bgTurn = isBackgroundTurn();
 				const pcfg = getPlanCfg();
 				const needAsk = params.skipConfirm !== true && !bgTurn && ctx?.hasUI;
 				let choice: string | undefined = "✅ 按这个执行";
 				if (needAsk) {
 					// ⚠ 终端那个选择框**必须能被别人关掉**：
-					//   以前只靠 `Promise.race` 选赢家 —— 手机/剪贴板先答了，agent 确实继续跑了，
+					//   以前只靠 `Promise.race` 选赢家 —— 剪贴板先答了，agent 确实继续跑了，
 					//   但 `ctx.ui.select` 那个浮层**没人去关** → 一直挂在屏幕上等你按（用户实测反馈）。
 					//   pi 的 `ui.select` 支持 `signal`（原话：“AbortSignal to programmatically dismiss the dialog”）。
 					const termAc = new AbortController();
@@ -1194,35 +1180,21 @@ export function setupBoard(api: ExtensionAPI): void {
 					);
 					// “谁先答算谁”——用**幂等的 pick**，不用 Promise.race。
 					// 为什么：abort 会让 select 以 `undefined` 结束，如果跑 race，这个 undefined 可能
-					// **抢先**把 race 定成“取消了”，反而把手机那个真实的答复吞了。
+					// **抢先**把 race 定成“取消了”，反而把剪贴板那条真实的答复吞了。
 					let picked = false;
 					let resolveChoice!: (v: string | undefined) => void;
 					const choicePromise = new Promise<string | undefined>((r) => {
 						resolveChoice = r;
 					});
-					const pick = (v: string | undefined, src: "tui" | "remote" | "timeout") => {
+					const pick = (v: string | undefined) => {
 						if (picked) return;
 						picked = true;
 						termAc.abort(); // 先把终端那个框关掉（自己答的话它已经关了，这是无操作）
-						// 终端/超时答的 → 也告诉手机一声（手机那张卡会照这个文案追加一行）
-						if (src !== "remote") {
-							setAskOutcome(
-								src === "timeout"
-									? "⏰ 电脑端超时，已按默认处理"
-									: v === "✅ 按这个执行"
-										? "✅ 已在电脑端选择：按这个执行"
-										: v && v.startsWith("⛔")
-											? "⛔ 已在电脑端选择：先别做"
-											: v && v.startsWith("✏️")
-												? "✏️ 已在电脑端选择：我要改"
-												: "✔ 已在电脑端答复了",
-							);
-						}
 						resolveChoice(v);
 					};
 					void tuiAsk.then(
-						(v) => pick(v, "tui"),
-						() => pick(undefined, "tui"),
+						(v) => pick(v),
+						() => pick(undefined),
 					);
 					const pasteAsk = new Promise<string | undefined>((res) => {
 						openPlanAsk(pendingTitle, stepTexts, (a, note) => {
@@ -1233,8 +1205,8 @@ export function setupBoard(api: ExtensionAPI): void {
 						});
 					});
 					void pasteAsk.then(
-						(v) => pick(v, "remote"),
-						() => pick(undefined, "remote"),
+						(v) => pick(v),
+						() => pick(undefined),
 					);
 					const timeoutAsk =
 						pcfg.timeoutSec > 0
@@ -1243,17 +1215,11 @@ export function setupBoard(api: ExtensionAPI): void {
 									t.unref?.();
 								})
 							: undefined;
-					if (timeoutAsk) void timeoutAsk.then((v) => pick(v, "timeout"));
+					if (timeoutAsk) void timeoutAsk.then((v) => pick(v));
 					choice = await choicePromise;
 					const answer = !choice || choice.startsWith("⛔") ? "no" : choice.startsWith("✏️") ? "edit" : "yes";
-					track("plan_answer", {
-						answer,
-						wait_ms: Date.now() - _askedAt,
-						edit_text: choice.includes("|") ? choice.split("|").slice(1).join("|").trim() : undefined,
-					});
 					closePlanAsk(); // 谁先答都要把挂起状态清掉（否则下一轮计划会被误应答）
 				} else if (bgTurn) {
-					track("plan_answer", { answer: "auto", wait_ms: 0 });
 					ctx.ui.notify(`📋 剪贴板投递的计划（${pending.length} 步）→ 默认开始执行：${pendingTitle || ""}`, "info");
 				}					if (choice && choice.startsWith("✏️") && choice.includes("|")) {
 						// 粘贴通道带来的修改意见：直接当"我要改"处理（不用再弹输入框）
@@ -1310,14 +1276,6 @@ export function setupBoard(api: ExtensionAPI): void {
 					cardNotify(`pi · 已按这个计划开工（${pending.length} 步）`, `${pendingTitle ? pendingTitle + "\n" : ""}${lines}\n${tail}`, 0);
 				}
 				// ✅ 到这里才算确认通过 —— 现在才提交到面板和磁盘
-				// 旧计划没走完就被新计划顶掉：记一笔“放弃”，衡量完成率
-				if (steps.length && steps.some((s) => s.status !== "done")) {
-					track("plan_abandoned", {
-						reason: "replaced_by_new_plan",
-						done: steps.filter((s) => s.status === "done").length,
-						total: steps.length,
-					});
-				}
 				title = pendingTitle;
 				steps = pending;
 				// 声明完就开始第一步，不然面板会一直停在 0/N
@@ -1334,7 +1292,6 @@ export function setupBoard(api: ExtensionAPI): void {
 
 			if (params.action === "block") {
 				blocker = params.text ?? "遇到问题";
-				track("plan_block", { text: blocker, index: steps.findIndex((s) => s.status === "doing") + 1, total: steps.length });
 				lastProgressTurn = turnNo;
 				refresh();
 				persist();
@@ -1352,7 +1309,6 @@ export function setupBoard(api: ExtensionAPI): void {
 				}
 				const st = params.status ?? "doing";
 				steps[idx]!.status = st;
-				track("plan_step", { index: idx + 1, status: st, total: steps.length, done: steps.filter((s) => s.status === "done").length });
 				if (st === "done" && blocker) blocker = undefined;
 				lastProgressTurn = turnNo;
 				refresh();
