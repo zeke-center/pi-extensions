@@ -302,6 +302,19 @@ if (-not $partial -and -not $skipExtensions) {
 				$untouched += "$($d.Name)\"
 			}
 		}
+
+		# ── 目录式插件**内部**的孤儿文件 ──
+		# 以前只清「整个插件目录」和「根级单文件」，插件里删掉的文件会一直留在目的地：
+		# pi 虽然只按 package.json 的入口加载，但多出来的 .ts 在目录里会让人误以为还在生效。
+		# 依据仍是上次的清单（files 里带路径分隔符的那些），清单外的一律不动。
+		foreach ($rel in $prevFiles) {
+			if ($rel -notmatch '[\\/]') { continue }        # 根级单文件上面已处理
+			if ($keepRel -contains $rel) { continue }        # 本次还要同步的，留着
+			$full = Join-Path $destDir $rel
+			if (-not (Test-Path -LiteralPath $full)) { continue }
+			if (Test-Path -LiteralPath $full -PathType Container) { continue }
+			$orphans += [pscustomobject]@{ Path = $full; Rel = $rel; IsDir = $false }
+		}
 	}
 	if ($orphans.Count -gt 0) {
 		Write-Host ''
@@ -309,6 +322,20 @@ if (-not $partial -and -not $skipExtensions) {
 			$tag = if ($List) { '待清理' } else { '清理' }
 			Write-Host ("  [{0}] {1}" -f $tag, $o.Rel) -ForegroundColor Magenta
 			if (-not $List) { Remove-Item -LiteralPath $o.Path -Recurse -Force }
+		}
+		# 删完顺手收掉变空的目录（tts\ runtime\ 这种整个模块被删掉的情况）
+		if (-not $List) {
+			foreach ($p in $pluginNames) {
+				$pd = Join-Path $destDir $p
+				if (-not (Test-Path -LiteralPath $pd)) { continue }
+				$dirs = @(Get-ChildItem -LiteralPath $pd -Recurse -Directory -ErrorAction SilentlyContinue |
+					Sort-Object { $_.FullName.Length } -Descending)
+				foreach ($d in $dirs) {
+					if (@(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0) {
+						Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+					}
+				}
+			}
 		}
 	}
 	if ($untouched.Count -gt 0) {
@@ -319,11 +346,12 @@ if (-not $partial -and -not $skipExtensions) {
 # 记下本次装了什么（下次清理只删有据可查的）
 if (-not $List -and -not $skipExtensions -and -not $partial) {
 	try {
-		$rootFiles = @($extItems | Where-Object { $_.Rel -notmatch '[\\/]' } | ForEach-Object { $_.Rel })
+		# ⚠️ 要记**全部**同步过的文件（含插件目录里带路径的），否则插件内部删掉的文件下次清不掉。
+		$allFiles = @($extItems | ForEach-Object { $_.Rel })
 		$newState = [pscustomobject]@{
-			version   = 1
+			version   = 2
 			updatedAt = (Get-Date).ToString('s')
-			files     = $rootFiles
+			files     = $allFiles
 			plugins   = @($pluginNames)
 		}
 		($newState | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $statePath -Encoding UTF8

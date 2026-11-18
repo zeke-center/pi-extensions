@@ -136,31 +136,6 @@ function price(): { in: number; out: number; cache: number } {
 	}
 }
 
-// ---- 语音（豆包 TTS）用量：字数 + 估算花费 ----
-let voiceCache = { at: 0, words: 0, cached: 0, local: 0, calls: 0 };
-function voiceUsage(): typeof voiceCache {
-	if (Date.now() - voiceCache.at < 2000) return voiceCache;
-	let words = 0;
-	let cached = 0;
-	let local = 0;
-	let calls = 0;
-	try {
-		const f = join(getAgentDir(), "narration", "usage.json");
-		const all = JSON.parse(readFileSync(f, "utf8") || "{}") as Record<string, any>;
-		const d = new Date();
-		const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-		const v = all[k] || {};
-		words = Number(v.words ?? 0);
-		cached = Number(v.cached ?? 0);
-		local = Number(v.local ?? 0);
-		calls = Number(v.calls ?? 0);
-	} catch {
-		/* 没播过就没有 */
-	}
-	voiceCache = { at: Date.now(), words, cached, local, calls };
-	return voiceCache;
-}
-
 /** token 用量 → 估算花费（元） */
 function costOf(input: number, output: number, cacheRead: number): number {
 	const p = price();
@@ -477,20 +452,6 @@ function midLines(theme: Theme): string[] {
 			t.fg("dim", ` R${fmtTok(sessTok.cacheRead)}`) +
 			t.fg("muted", ` ${fmtCost(costOf(sessTok.input, sessTok.output, sessTok.cacheRead))}`),
 	);
-
-	// ── 语音（豆包 TTS：按字符计费，不是 token）──
-	{
-		const v = voiceUsage();
-		const price = (readExtCfg().voicePrice as number) ?? 1.0;
-		const yuan = (v.words / 10000) * price;
-		if (v.words || v.local || v.cached) {
-			const bits = [` ${t.fg("muted", "语音")}`];
-			if (v.words) bits.push(t.fg("text", `${fmtTok(v.words)}字`), t.fg("accent", fmtCost(yuan)));
-			if (v.local) bits.push(t.fg("dim", ` 本地${fmtTok(v.local)}字`));
-			if (v.cached) bits.push(t.fg("dim", ` 免单${fmtTok(v.cached)}`));
-			out.push(bits.join(""));
-		}
-	}
 
 	// ── 子代理（delegate 的账，主会话看不到，得自己扫）──
 	if (subTok.sessions > 0) {
