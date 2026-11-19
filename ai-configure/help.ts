@@ -19,7 +19,7 @@ export const HELP_TEXT = `AI configure · 全部功能
   /ai project clear       清空项目级连接
   /ai help                就是你现在看的这个（文本版说明书）
 /aihelp                   **可视化配置面板**（表单式，和 /assistants 一样）：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消
-                           标签前缀就是分组（剪贴板·/ 输入框·/ 通知·/ 计划·/ 助理·/ 会话级·），
+                           标签前缀就是分组（剪贴板·/ 输入框·/ 通知·/ 计划·/ 助理·/ 价格·/ 会话级·），
                            每一项都写了「这是干什么用的」，改完立即生效并写进 ai-extensions.json
 /ai-ext                   会话级停用 / 恢复整个扩展（不用卸载，本会话记住）
   /ai-ext off             停用：面板收起、progress/delegate 从工具表撤下、后台回投暂停

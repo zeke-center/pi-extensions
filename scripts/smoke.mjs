@@ -6,12 +6,13 @@
  * 用法：node scripts/smoke.mjs
  */
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const entry = join(root, "ai-configure", "pi-extensions.ts");
+// 默认测仓库源码；设了 PI_SMOKE_ENTRY 就测那个（用来验证**生效目录**能不能被 /reload 起来）
+const entry = process.env.PI_SMOKE_ENTRY || join(root, "ai-configure", "pi-extensions.ts");
 
 // 静态守卫：同一批资源只能声明一遍。
 // package.json 的 pi.prompts 与入口的 resources_discover 都往 pi 的 promptPaths 里塞；
@@ -21,7 +22,15 @@ const entry = join(root, "ai-configure", "pi-extensions.ts");
 {
 	const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 	const declared = [...(pkg.pi?.prompts ?? []), ...(pkg.pi?.skills ?? [])];
-	const src = readFileSync(entry, "utf8");
+	// entry 可能是目录（-e <插件目录>）：静态检查就按它 package.json 声明的入口读
+	let entryFile = entry;
+	try {
+		if (statSync(entry).isDirectory()) {
+			const inner = JSON.parse(readFileSync(join(entry, "package.json"), "utf8"));
+			entryFile = join(entry, inner.pi?.extensions?.[0] ?? "index.ts");
+		}
+	} catch { /* 读不到就不做源码扫描 */ }
+	const src = entryFile.endsWith(".ts") || entryFile.endsWith(".mjs") ? readFileSync(entryFile, "utf8") : "";
 	if (declared.length > 0 && /(?:api|pi)\.on\(\s*["']resources_discover["']/.test(src)) {
 		console.error(
 			"❌ package.json 已声明 pi.prompts/pi.skills，入口又用了 resources_discover → 同一资源注册两遍（Prompt conflicts）。二选一。",
