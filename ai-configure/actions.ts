@@ -12,11 +12,25 @@
  *      所以每次打开面板前用 `setOpenRefresher` 重新生成一遍 —— 新建完不用 /reload。
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadTemplates } from "./delegate";
+import { pickFromList } from "./form";
+import { assistantFormPage, loadTemplates } from "./delegate";
 import type { CommandMap } from "./pi-extensions";
 import { registerSettings, setOpenRefresher, settingsCtx, unregisterSettings, type SettingDef } from "./settings";
 
 const ASSISTANT_PREFIX = "act.ai.";
+
+/** 按**显示宽度**截断（中文算 2 列），超了补省略号 —— 左栏就 30 来列，别让它把边框撑开 */
+function clip(s: string, cols: number): string {
+	let n = 0;
+	let out = "";
+	for (const ch of s) {
+		const w = (ch.codePointAt(0) ?? 0) >= 0x2e80 ? 2 : 1;
+		if (n + w > cols) return `${out}…`;
+		out += ch;
+		n += w;
+	}
+	return out;
+}
 const COMMAND_PREFIX = "act.cmd.";
 
 /** 面板里执行一条命令：handler 就是各模块注册的那个（不重写逻辑） */
@@ -48,8 +62,9 @@ function makeRunner(cmds: CommandMap): Runner {
  */
 async function pick(ctx: ExtensionContext, title: string, options: string[]): Promise<string | undefined> {
 	try {
-		const r = await ctx.ui.select(title, options, undefined);
-		return r ?? undefined;
+		// ⚠️ 用**弹窗**版（ctx.ui.custom），不要用 ctx.ui.select：
+		// 那个是 pi 的输入框内联提示，会掉到输入框下面去，跟面板不是一套观感。
+		return await pickFromList(ctx, title, options);
 	} catch {
 		return undefined;
 	}
@@ -103,12 +118,20 @@ function assistantRows(): SettingDef[] {
 		const bits = [tag];
 		if (t.extends) bits.push(`← ${t.extends}`);
 		if (t.mcp.length) bits.push(`${t.mcp.length} MCP`);
-		const brief = (t.desc || t.name || "").replace(/\s+/g, " ").slice(0, 28);
+		const brief = clip((t.desc || t.name || "").replace(/\s+/g, " "), 11);
+		const role = t.base ? "底座" : t.demo ? "示例样板" : t.enabled === false ? "已停用" : "可派";
 		const detail = [
-			`${t.key}：${t.desc || "（没写 desc，模型就不知道什么时候该派它）"}`,
-			`${[`${tag}`, t.extends ? `底座 ${t.extends}` : "无底座", t.mcp.length ? `MCP ${t.mcp.join("、")}` : "不连 MCP", `超时 ${t.timeoutMs ? Math.round(t.timeoutMs / 1000) + "s" : "默认"}`, t.agentsMd === false ? "不读 AGENTS.md" : "读 AGENTS.md"].join(" · ")}`,
+			`${t.desc || "（没写 desc —— 模型就不知道什么时候该派它）"}`,
+			"",
+			`角色：${role}${t.extends ? `（继承 ${t.extends}）` : ""}`,
+			`MCP：${t.mcp.length ? t.mcp.join("、") : "不连"}`,
+			`超时：${t.timeoutMs ? Math.round(t.timeoutMs / 1000) + "s" : "默认"}`,
+			`AGENTS.md：${t.agentsMd === false ? "不读" : "读"}`,
 			`文件：${t.file}`,
-			"回车 = 打开编辑面板（名字 / 何时派它 / 底座 / 工作目录 / 模型 / MCP / 超时 / AGENTS.md / 存哪儿 / 正文）",
+			"",
+			t.base
+				? "底座只读：只能被 extends。要定制就「＋ 新建助理」派生一个。"
+				: "回车进入 → 能改：文件名 / 显示名 / 何时派它 / 底座 / 工作目录 / 模型 / MCP / 超时 / AGENTS.md / 存哪儿 / 提示词正文",
 		].join("\n");
 		const row = action(
 			`${ASSISTANT_PREFIX}${t.key}`,
@@ -116,12 +139,18 @@ function assistantRows(): SettingDef[] {
 			t.key,
 			detail,
 			async () => {
+				// 兜底：只有面板翻页失败时才会真的跑这条命令
 				const runner = runnerRef;
 				if (runner) await runner("assistants", `edit ${t.key}`);
 			},
 		);
 		// 行上显示「可派 · 简述」，比只显示 key 好认
 		row.hint = `${bits.join(" · ")}${brief ? ` · ${brief}` : ""}`;
+		// 面板里回车直接翻进这一页（同一个框，esc 返回），不另开面板
+		row.page = () => {
+			const c = settingsCtx();
+			return c ? assistantFormPage(c, c.cwd ?? process.cwd(), t.key) : undefined;
+		};
 		return row;
 	});
 
@@ -151,69 +180,37 @@ export function refreshAssistantRows(): void {
 // 命令组
 // --------------------------------------------------------------------------- //
 
-function commandRows(run: Runner): SettingDef[] {
-	const G = "命令";
-	const direct = (key: string, label: string, desc: string, name: string, args = "") =>
-		action(`${COMMAND_PREFIX}${key}`, G, label, `${desc}\n选中等价于敲 /${name}${args ? ` ${args}` : ""}`, () => run(name, args));
-
-	/** 二级选单：options 的显示文本要和 args 一一对应 */
-	const menu = (key: string, label: string, desc: string, name: string, items: Array<[string, string]>) =>
-		action(`${COMMAND_PREFIX}${key}`, G, label, desc, async (ctx) => {
-			const picked = await pick(ctx, `/${name} —— 选一个动作`, items.map(([t]) => t));
-			if (picked === undefined) return;
-			const hit = items.find(([t]) => t === picked);
-			if (hit) await run(name, hit[1]);
-		});
-
-	return [
-		menu("ai", "/ai 配置中心", "从 AI 配置中心拉连接台账，或看状态 / 自检 / 设密钥 / 关掉连接。", "ai", [
-			["拉取连接（打开选择器）", ""],
-			["状态：密钥 / 会话级 / 项目级", "status"],
-			["自检（模块健康度 / 台账 / MCP / 助理 / 看板）", "doctor"],
-			["设置 API 密钥", "token"],
-			["关掉本会话拉进来的连接", "off"],
-			["关掉项目级连接", "project off"],
-			["清空项目级连接", "project clear"],
-			["文本版帮助", "help"],
-		]),
-		menu("agents", "/agents 子代理面板", "派活时的实时面板：形态 / 详情 / 后台任务。", "agents", [
-			["开（也是重新叫回）", ""],
-			["关掉（下次派活也不再自动弹）", "off"],
-			["展开 / 折叠 思考过程", "detail"],
-			["整宽面板（默认形态）", "widget"],
-			["右侧浮层", "float"],
-			["打印成纯文本（调试用）", "text"],
-			["看后台任务状态", "bg"],
-			["把没投回主会话的立刻重投", "bg redeliver"],
-		]),
-		menu("ai-ext", "/ai-ext 停用开关", "会话级停用整个扩展（面板收起、工具撤下、回投暂停）。", "ai-ext", [
-			["停用（本会话）", "off"],
-			["恢复", "on"],
-			["看当前状态", "status"],
-		]),
-		menu("delegate-mode", "/delegate-mode 派活模式", "派活默认同步等结果，还是异步派完就走。", "delegate-mode", [
-			["异步：派完就走，完成自动回投（默认）", "async"],
-			["同步：派完等结果才继续", "sync"],
-		]),
-		direct("usage", "/usage 全局 token 账", "本会话 + 所有子代理的 token 明细。", "usage"),
-		direct("resume", "/resume-agent 助理会话", "翻看助理的历次会话（它们不在 /resume 里）。", "resume-agent"),
-		direct("back", "/agent-resume-back 回主会话", "从助理会话一键回主会话。", "agent-resume-back"),
-	];
-}
-
 /** 看板组：都是动作（真正的开关在看板模块自己的「会话级」里） */
 function boardRows(run: Runner): SettingDef[] {
 	const G = "看板";
 	return [
-		action(`${COMMAND_PREFIX}board.clear`, G, "清空任务列表", "把看板上的计划和步骤都清掉（等价 /board clear）。面板上不留残留。", () => run("board", "clear")),
-		action(`${COMMAND_PREFIX}board.pos`, G, "面板位置", "任务看板贴在输入框上方还是下方。等价 /board above | below。", async (ctx) => {
-			const picked = await pick(ctx, "任务看板放在哪儿？", ["输入框上方（默认）", "输入框下方"]);
-			if (picked) await run("board", picked.includes("下方") ? "below" : "above");
-		}),
-		action(`${COMMAND_PREFIX}board.cols`, G, "栏位显示", "右栏（MCP / 插件 / 助理）和中栏（运行状态 / 用量）要不要显示。等价 /board right | mid。", async (ctx) => {
-			const picked = await pick(ctx, "要切哪个栏位？", ["右栏：MCP / 插件 / 助理 显示或隐藏", "中栏：运行状态 / 用量 显示或隐藏"]);
-			if (picked) await run("board", picked.startsWith("右栏") ? "right" : "mid");
-		}),
+		action(
+			`${COMMAND_PREFIX}board.clear`,
+			G,
+			"清空任务列表",
+			"把看板上的计划和步骤**全部清掉**，面板立刻变空。\n\n⚠ 不可撤销：会话记录里还能翻到历史，但面板不再显示。\n\n等价 `/board clear`。",
+			() => run("board", "clear"),
+		),
+		action(
+			`${COMMAND_PREFIX}board.pos`,
+			G,
+			"面板位置",
+			"任务看板贴在哪一侧：**上方**（默认，推荐 —— 不挡输入）或**下方**。\n只影响显示位置，不影响任何功能。\n\n等价 `/board above` / `/board below`。",
+			async (ctx) => {
+				const picked = await pick(ctx, "任务看板放在哪儿？", ["输入框上方（默认）", "输入框下方"]);
+				if (picked) await run("board", picked.includes("下方") ? "below" : "above");
+			},
+		),
+		action(
+			`${COMMAND_PREFIX}board.cols`,
+			G,
+			"栏位显示",
+			"两栏各管一块：\n\n**右栏** = MCP / 插件 / 助理 那几列（终端窄就关掉）。\n**中栏** = 本轮运行状态 + token 用量。\n\n等价 `/board right` / `/board mid`。",
+			async (ctx) => {
+				const picked = await pick(ctx, "要切哪个栏位？", ["右栏：MCP / 插件 / 助理 显示或隐藏", "中栏：运行状态 / 用量 显示或隐藏"]);
+				if (picked) await run("board", picked.startsWith("右栏") ? "right" : "mid");
+			},
+		),
 	];
 }
 
@@ -235,11 +232,9 @@ export function registerPanelActions(cmds: CommandMap): void {
 		unregisterSettings(COMMAND_PREFIX);
 		registerSettings(assistantRows());
 		registerSettings(boardRows(run));
-		registerSettings(commandRows(run));
 	});
 
 	// 启动时先填一批（不发面板也能被 settingsSnapshot / 测试看到）
 	refreshAssistantRows();
 	registerSettings(boardRows(run));
-	registerSettings(commandRows(run));
 }

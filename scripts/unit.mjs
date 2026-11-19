@@ -636,7 +636,6 @@ allOk =
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-gate"), PI_AI_EXT: "" },
 	) && allOk;
 
-// ---------- 套件：notify（TTS 文本清洗）----------
 // ---------- 套件：shared（计划确认：答复解析 + 风险判定） ----------
 bundle("shared.ts", "shared.mjs");
 allOk =
@@ -721,6 +720,29 @@ allOk =
 			'const r2 = applySettingsValues(bad);',
 			'ok("保存：坏值 → 记到 failed 且不写坏", r2.failed.length === 1 && r2.applied.length === 0 && getSetting("tNum").get() === 1500);',
 			'ok("详情行：写清了「干什么用的 + 取值 + 当前 + 默认」", fieldDetail(getSetting("tNum")).includes("取值：") && fieldDetail(getSetting("tNum")).includes("默认："));',
+			'registerSettings([{ key: "tAct", group: "丙组", label: "动作行", desc: "这是一个动作行，用来测值列摘要", kind: "action", def: "", hint: "可派 · 通用助理", get: () => "", set: () => {} }]);',
+			'const actRow = settingsFields().find((f) => f.key === "tAct");',
+			'ok("动作行：值列显示摘要（不再重复「→ 回车执行」）", actRow.value === "可派 · 通用助理" && actRow.hint === "回车执行");',
+			'ok("动作行：详情说清「选中即执行、不参与保存」", fieldDetail(getSetting("tAct")).includes("立即执行"));',
+			// ---- 分页：首页 → 组 → 项 ----
+			'const home = settingsHomePage();',
+			'ok("分页：首页每组一行，且每行都是「回车进入」", home.fields.length >= 3 && home.fields.every((f) => f.drill === true));',
+			'const gp = settingsGroupPage("甲组");',
+			'ok("分页：组页第一行是「← 返回」", gp.fields[0].key === "nav.back" && gp.fields[0].drill === true);',
+			'ok("分页：组页行数 = 该组项数 + 1（返回行）", gp.fields.length === settingsDefs().filter((d) => d.group === "甲组").length + 1);',
+			'ok("分页：配置行回车进编辑页、动作行不翻页", !!gp.enter && gp.enter(gp.fields[1]).fields.length === 2 && gp.enter({ key: "tAct", label: "x", value: "", kind: "action" }) === undefined);',
+			'const ip = settingsItemPage(getSetting("tNum"));',
+			'ok("分页：项页有「返回 + 该项」两行，且带保存钩子", ip.fields.length === 2 && typeof ip.save === "function");',
+			'ok("分页：项页保存会把值写回去", (() => { ip.save({ tNum: "4200" }); return getSetting("tNum").get() === 4200; })());',
+			'ok("分页：返回行回车 = 弹回上一层（返回 null）", ip.enter(ip.fields[0]) === null);',
+			'// 回归：动作行的 set 是「跑起来」，绝不能被批量落地当成「改过的配置」（否则一次选中会执行一堆动作）',
+			'const fired = [];',
+			'registerSettings([{ key: "tAct2", group: "丙组", label: "动作行2", desc: "x", kind: "action", def: "", hint: "可派 · 通用助理", get: () => "", set: () => { fired.push("act"); } }]);',
+			'const actVal = settingsFields().find((f) => f.key === "tAct2").value;',
+			'applySettingsValues({ tAct2: actVal }, settingsDefs());',
+			'ok("回归：动作行在批量保存里不被执行", fired.length === 0);',
+			'resetSettings(settingsDefs());',
+			'ok("回归：恢复全部默认也不执行动作行", fired.length === 0);',
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-settings") },
 	) && allOk;
@@ -751,12 +773,12 @@ allOk =
 			'ok("入口：/aihelp 注册上了（面板入口）", typeof cmds.aihelp === "function");',
 			'ok("入口：/ai help 的文本版还在（showHelp 没被拆）", typeof cmds.ai === "function");',
 			"const snap = settingsSnapshot();",
-			'ok("面板：装完后注册项 ≥ 14（新建 1 + 看板 3 + 命令 7 + 设置 3）", snap.length >= 14);',
+			'ok("面板：装完后注册项 ≥ 7（新建 1 + 看板 3 + 设置 3）", snap.length >= 7);',
 			// 测试用的 agentDir 是空的 → 没有助理模板，但也必须至少有「＋ 新建助理」那一行
 			'ok("面板：有「助理」分组（没有模板时也有「＋ 新建助理」）", snap.filter((s) => s.group === "助理").length >= 1);',
 			'ok("面板：有「看板」分组（3 个动作行）", snap.filter((s) => s.group === "看板").length === 3);',
-			'ok("面板：有「命令」分组（7 个动作行）", snap.filter((s) => s.group === "命令").length === 7);',
-			'ok("面板：动作行是 action 类型（选中就跑，不参与保存）", snap.filter((s) => s.kind === "action").length >= 11);',
+			'ok("面板：没有「命令」分组（命令一律走命令行，不塞面板）", snap.filter((s) => s.group === "命令").length === 0);',
+			'ok("面板：动作行是 action 类型（选中就跑，不参与保存）", snap.filter((s) => s.kind === "action").length >= 4);',
 			'ok("面板：有「助理 / 委派」分组（delegate 注册上了）", snap.some((s) => s.group.includes("助理")));',
 			'ok("面板：有「会话级」分组（board/gate 注册上了）", snap.some((s) => s.group.includes("会话级")));',
 			'ok("面板：不是空板（每一项都有说明，打开就能看）", snap.every((s) => s.desc.length >= 12));',
@@ -824,6 +846,41 @@ allOk =
 	} else {
 		allOk = false;
 		console.log("FAIL  静态：actions.ts 缺 → " + bad.join(", "));
+	}
+}
+{
+	// 双栏渲染：宽屏两栏、窄屏退回单栏、右栏标题与折行都得在
+	const formSrc = readFileSync(join(ext, "form.ts"), "utf8");
+	const checks = {
+		"宽屏阈值": /const twoCol = width >= 90;/.test(formSrc),
+		"两栏分隔": /leftW/.test(formSrc) && /rightW/.test(formSrc) && /┬/.test(formSrc),
+		"窄屏退回单栏": /if \(twoCol\)/.test(formSrc) && /wrapText\(this\.detail/.test(formSrc),
+		"视口跟光标": /MAX_ROWS/.test(formSrc) && /还有 \$\{more/.test(formSrc),
+	};
+	const bad = Object.entries(checks).filter(([, ok]) => !ok).map(([k]) => k);
+	if (bad.length === 0) {
+		console.log("PASS  静态：面板双栏渲染完整（宽屏两栏 / 窄屏单栏 / 超长视口跟光标）");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：双栏渲染缺 → " + bad.join(", "));
+	}
+}
+{
+	const setSrc = readFileSync(join(ext, "settings.ts"), "utf8");
+	const formSrc = readFileSync(join(ext, "form.ts"), "utf8");
+	const checks = {
+		"页面栈": /setPages\(/.test(formSrc) && /pushPage\(/.test(formSrc) && /popPage\(/.test(formSrc),
+		"分页入口": /showFormPages/.test(formSrc) && /showFormPages\(ctx/.test(setSrc),
+		"三页构建": ["settingsHomePage", "settingsGroupPage", "settingsItemPage"].every((n) => setSrc.includes(`function ${n}`)),
+		"助理页复用": /assistantFormPage/.test(readFileSync(join(ext, "delegate.ts"), "utf8")),
+		"入口不关面板": /runAction/.test(formSrc) && !/return openSettings\(ctx\)/.test(setSrc),
+	};
+	const bad = Object.entries(checks).filter(([, ok]) => !ok).map(([k]) => k);
+	if (bad.length === 0) {
+		console.log("PASS  静态：面板分页完整（页面栈 / 三页 / 助理页复用 / 动作在本页执行）");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：分页缺 → " + bad.join(", "));
 	}
 }
 {

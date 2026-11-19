@@ -42,7 +42,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { type FormResult, type FormField, showForm, type PickItem } from "./form";
+import { type FormResult, type FormField, type FormPage, showForm, type PickItem, pickFromList } from "./form";
 import { guardCtx } from "./shared";
 import { registerSettings } from "./settings";
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
@@ -1193,8 +1193,7 @@ function renderCard(r: RunResult): string {
 			if (r.truncated) {
 				body +=
 					"\n\n⚠️ 它的最终回复撞到了模型的输出上限，被**截断**了（pi 1.2.0 起 `-p` 会因此以退出码 1 结束，" +
-					"结论已按上面的原文保留）。要完整结果：再调一次 delegate，带 resume: \"" +
-					r.names.id +
+					"结论已按上面的原文保留）。要完整结果：再调一次 delegate，带 resume: \"" + r.names.id +
 					"\" 让它接着写，或者让它分成几段输出。";
 			}
 			break;
@@ -1537,6 +1536,51 @@ function shortBaseName(name: string): string {
 	return name.replace(/[（(]\s*底座\s*[)）]\s*$/, "").replace(/底座\s*$/, "").trim() || name;
 }
 
+/** 模型下拉里代表「跟主会话用同一个」的那一项 */
+export const MODEL_INHERIT = "（继承主会话）";
+
+/** 从当前会话能用的模型里拼出下拉选项：provider/id（和 --model 的写法一致） */
+export function modelChoices(ctx: ExtensionContext): string[] {
+	const out: string[] = [];
+	const push = (m: { provider?: string; id?: string } | undefined) => {
+		if (!m?.id) return;
+		const id = m.provider ? `${m.provider}/${m.id}` : m.id;
+		if (!out.includes(id)) out.push(id);
+	};
+	push(ctx.model as { provider?: string; id?: string } | undefined);
+	try {
+		const scoped = (ctx.scopedModels ?? []).map((x) => x.model as { provider?: string; id?: string });
+		if (scoped.length) scoped.forEach(push);
+		else ((ctx.modelRegistry?.getAvailable?.() ?? []) as { provider?: string; id?: string }[]).forEach(push);
+	} catch {
+		/* 拿不到就退化成一个空列表 → 模型行回到手输 */
+	}
+	return out;
+}
+
+/** 模型行：能枚举出可用模型就给下拉，否则（拿不到）退回手输，别把功能弄坏 */
+function modelField(value: string, options: string[]): FormField {
+	if (!options.length) {
+		return { key: "model", label: "模型", value, kind: "text", hint: "(留空 = 继承主会话；也可以填 provider/model)" };
+	}
+	// 手写的怪值（比如只写了 modelId）也留在选项里，不然一编辑就被悄悄改掉
+	const opts = [MODEL_INHERIT, ...(value && !options.includes(value) ? [value] : []), ...options];
+	return {
+		key: "model",
+		label: "模型",
+		value: value || MODEL_INHERIT,
+		kind: "enum",
+		options: opts,
+		hint: `(回车展开 —— 就是 /model 里能选的那些；选「${MODEL_INHERIT}」= 跟主会话用同一个)`,
+	};
+}
+
+/** 下拉里的「继承主会话」= 不写 model 字段（继承主会话当前模型） */
+function normModel(raw: string | undefined): string {
+	const v = (raw ?? "").trim();
+	return v === MODEL_INHERIT ? "" : v;
+}
+
 function buildFields(o: {
 	key: string;
 	name: string;
@@ -1554,6 +1598,8 @@ function buildFields(o: {
 	extendsKey: string;
 	/** 能选的底座 */
 	bases: { key: string; name: string }[];
+	/** 可选模型（provider/id）。非空 → 「模型」变成下拉，留空仍是继承主会话 */
+	modelOptions?: string[];
 }): FormField[] {
 	const baseKeys = o.bases.map((b) => b.key);
 	// 手写的非底座 extends 也留在选项里，不然一编辑就被悄悄改掉
@@ -1596,7 +1642,7 @@ function buildFields(o: {
 			kind: "text",
 			hint: "(在哪儿干活：文件读写 / 项目 AGENTS.md)",
 		},
-		{ key: "model", label: "模型", value: o.model, kind: "text", hint: "(留空 = 继承主会话)" },
+		modelField(o.model, o.modelOptions ?? []),
 		{ key: "timeout", label: "超时", value: o.timeout, kind: "text", hint: "(10m / 90s / 1.5h，留空 = 5 分钟)" },
 		{
 			key: "agents_md",
@@ -1678,7 +1724,7 @@ async function commitForm(
 		name: (v.name ?? "").trim() || key,
 		desc: (v.desc ?? "").trim(),
 		cwd: cwdIn,
-		model: (v.model ?? "").trim(),
+		model: normModel(v.model),
 		timeout,
 		agents_md: (v.agents_md ?? "是") === "是" ? undefined : "false",
 		mcp: (v.mcp ?? "").trim(),
@@ -1703,7 +1749,7 @@ async function commitForm(
 		);
 		if (!go) {
 			ctx.ui.notify(
-				`没保存。\n补连接：把定义放进本地目录 ${localCatalogPath()}\n或者 /ai 从配置中心拉（会写到项目级）`,
+				`没保存。\n补连接：把定义放进候选池 ${localCatalogPath()}\n或者 /ai 从配置中心拉（会写到项目级）`,
 				"info",
 			);
 			return;
@@ -1776,6 +1822,109 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 	ctx.ui.notify(`${lines.join("\n")}${body}`, "info");
 }
 
+/**
+ * 助理编辑页每个字段的说明（右栏那一段）。
+ * 写的是「这个字段影响什么」——面板里只看到一行值，光看值猜不出来。
+ */
+const ASSISTANT_FIELD_DOC: Record<string, string> = {
+	key: "文件名 = 派活时用的 key（`delegate(assistant=db)` 里的 db）。\n改名字等于新建一个助理，原来的还留着。",
+	name: "显示名：面板和会话标题里显示的名字。中文也行，留空就用文件名。",
+	desc: "**什么时候该派它** —— 这句话会写进主会话的 delegate 工具描述，模型靠它决定派谁。\n写清「什么活找它、什么活别找它」，含糊了模型就会乱派。",
+	extends: "底座：继承它的正文、工作目录等默认值，再叠上你自己写的部分。\n底座只读（改它会连累所有继承它的助理），要定制就派生一个。",
+	cwd: "工作目录：文件读写、相对路径、项目 AGENTS.md 都按它算。\n留空则继承底座；都没有就用当前项目目录。",
+	model:
+		"模型：派它的时候用哪个模型（回车展开，列表就是 `/model` 里能选的那些）。\n\n选「（继承主会话）」= 跟主 pi 用同一个，主会话切模型它也跟着切；\n选具体某个 = 钉死，省钱的活就派给便宜模型。\n\n拿不到模型列表时这一行会退回手输（填 `provider/model`）。",
+	timeout: "超时：这个助理最长跑多久（`10m` / `90s` / `1.5h`，留空 = 5 分钟）。\n超时会被中止，结果标成 timeout。",
+	agents_md: "带 AGENTS.md：开 = 把全局/项目 AGENTS.md 塞进它的上下文（约 +1500 token/次）。\n关掉能省钱，但它就不知道项目规矩了。",
+	mcp: "MCP：这个助理能连哪些服务（回车勾选）。**跟工作目录无关**，是按需给的。\n不勾 = 一个都不连，只能用本地文件工具。",
+	dispatchable: "可派发：关掉 = 只当样板看，不能真的派活。\n底座自动是「否」；示例模板也建议关。",
+	scope: "存哪儿：全局 = `~/.pi/agent/assistants/`（所有项目都能用）；\n项目 = 当前项目的 `.pi/assistants/`（只在这个项目里出现）。",
+	body: "提示词正文：这个助理的角色设定。回车打开编辑器写。\n继承底座时，这里是「在底座基础上追加」的部分。",
+};
+
+/**
+ * 助理编辑用的字段 + MCP 候选池。
+ * 抽出来是为了让 `/aihelp` 的面板能**在同一个框里翻到这一页**（不再弹新面板）。
+ */
+export function assistantFormParts(
+	cwd: string,
+	tpl: Template,
+	modelOptions: string[] = [],
+): { fields: FormField[]; mcp: PickItem[]; commit: (r: FormResult) => Promise<void> } {
+	const pool = loadMcpPool(tpl.cwd);
+	const fields = buildFields({
+		key: tpl.key,
+		name: tpl.name,
+		desc: tpl.desc,
+		cwd: tpl.cwd,
+		model: tpl.model ?? "",
+		timeout: tpl.timeoutMs ? humanTimeout(tpl.timeoutMs) : "",
+		agentsMd: tpl.agentsMd !== false,
+		dispatchable: tpl.demo !== true,
+		dispatchNote: tpl.base === true ? "(base：底座，不能在这儿改)" : undefined,
+		scope: isProjectFile(tpl.file, cwd) ? SCOPE_PROJECT : SCOPE_GLOBAL,
+		bodyChars: tpl.body.length,
+		keyEditable: false,
+		extendsKey: tpl.extends ?? "",
+		bases: availableBases(cwd).map((b) => ({ key: b.key, name: b.name })),
+		modelOptions,
+	});
+	return {
+		fields,
+		mcp: mcpItems(pool, tpl.mcp),
+		commit: (r) => commitForm({ form: r, cwd, original: tpl }),
+	};
+}
+
+/**
+ * 面板里「助理」那一行回车 → 这一页（同一个框内翻页）。
+ * 底座只读：页里所有字段 readonly，右栏直接说明为什么不能改。
+ */
+export function assistantFormPage(ctx: ExtensionContext, cwd: string, key: string): FormPage | undefined {
+	const tpl = findTemplate(cwd, key);
+	if (!tpl) return undefined;
+	const parts = assistantFormParts(cwd, tpl, modelChoices(ctx));
+	const readonly = tpl.base === true;
+	const fields: FormField[] = [
+		{ key: "nav.back", label: "← 返回助理列表", value: "", kind: "text", readonly: true, drill: true },
+		...parts.fields.map((f) => ({ ...f, readonly: readonly || f.readonly })),
+	];
+	return {
+		title: tpl.name,
+		fields,
+		mcp: parts.mcp,
+		footer: readonly ? "这是底座（只读）· esc 返回上一层" : "回车 改 · ctrl+s 保存（退回列表）· esc 返回上一层",
+		detail: (f) => {
+			if (f.key === "nav.back") return "回到助理列表（也可以直接按 esc）。\n\n本页所有改动都要按 ctrl+s 才落盘。";
+
+			return ASSISTANT_FIELD_DOC[f.key] ?? `${f.label}：${f.value}`;
+		},
+		enter: (f) => (f.key === "nav.back" ? null : undefined),
+		// 「提示词正文」是动作行：回车当场开编辑器并保存（面板不关，和以前一样能用）
+		runAction: (f) => {
+			if (f.key !== "body") return;
+			const values: Record<string, string> = {};
+			for (const x of fields) {
+				values[x.key] = x.kind === "mcp" ? parts.mcp.filter((m) => m.checked).map((m) => m.value).join(", ") : x.value;
+			}
+			void parts.commit({ values, openBody: true }).catch((e: unknown) => {
+				ctx.ui.notify(`✗ 保存失败：${e instanceof Error ? e.message : String(e)}`, "error");
+			});
+		},
+		save: (values) => {
+			if (readonly) {
+				ctx.ui.notify(`「${tpl.key}」是底座（只读）：要定制请用「＋ 新建助理」派生一个。`, "warning");
+				return true;
+			}
+			const merged: FormResult = { values: { ...values }, openBody: false };
+			void parts.commit(merged).catch((e: unknown) => {
+				ctx.ui.notify(`✗ 保存失败：${e instanceof Error ? e.message : String(e)}`, "error");
+			});
+			return false; // 存完退回列表
+		},
+	};
+}
+
 async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, focusKey?: string): Promise<void> {
 	const tpl = findTemplate(cwd, what);
 	if (!tpl) return notFound(ctx, cwd, what);
@@ -1795,24 +1944,9 @@ async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, f
 		return;
 	}
 
-	const pool = loadMcpPool(tpl.cwd);
-	const fields = buildFields({
-		key: tpl.key,
-		name: tpl.name,
-		desc: tpl.desc,
-		cwd: tpl.cwd,
-		model: tpl.model ?? "",
-		timeout: tpl.timeoutMs ? humanTimeout(tpl.timeoutMs) : "",
-		agentsMd: tpl.agentsMd !== false,
-		dispatchable: tpl.demo !== true,
-		dispatchNote: tpl.base === true ? "(base：底座，不能在这儿改)" : undefined,
-		scope: isProjectFile(tpl.file, cwd) ? SCOPE_PROJECT : SCOPE_GLOBAL,
-		bodyChars: tpl.body.length,
-		keyEditable: false,
-		extendsKey: tpl.extends ?? "",
-		bases: availableBases(cwd).map((b) => ({ key: b.key, name: b.name })),
-	});
-	const r = await showForm(ctx, `${tpl.name} · 配置`, fields, mcpItems(pool, tpl.mcp), focusKey);
+	const parts = assistantFormParts(cwd, tpl, modelChoices(ctx));
+	if (!parts) return;
+	const r = await showForm(ctx, `${tpl.name} · 配置`, parts.fields, parts.mcp, focusKey);
 	if (!r) {
 		ctx.ui.notify("已取消，什么都没改。", "info");
 		return;
@@ -1849,6 +1983,7 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string, bas
 		keyEditable: true,
 		extendsKey,
 		bases: bases.map((b) => ({ key: b.key, name: b.name })),
+		modelOptions: modelChoices(ctx),
 	});
 	const r = await showForm(
 		ctx,
@@ -2024,7 +2159,8 @@ async function resumeAgent(ctx: ExtensionCommandContext, arg: string): Promise<v
 		(r, i) =>
 			`${String(i + 1).padStart(2, "0")}  ${fmtClock(r.ts)} · ${r.key} · ${r.name || "(无名)"} · ${r.kb}KB · ${r.first.slice(0, 36) || "(无任务)"}`,
 	);
-	const picked = await ctx.ui.select(`助理会话（${shown.length}/${rows.length} 条，选中后切过去看，Esc 取消）`, labels);
+	// 弹窗版单选（ctx.ui.select 会掉到输入框下面去，跟面板不是一套观感）
+	const picked = await pickFromList(ctx, `助理会话（${shown.length}/${rows.length} 条，选中后切过去看，Esc 取消）`, labels);
 	if (!picked) return;
 	const row = shown[labels.indexOf(picked)];
 	if (!row) return;
@@ -2477,7 +2613,7 @@ function registerDelegateSettings(): void {
 			key: "assistantLingerMs",
 			group: "委派",
 			label: "助理保鲜期",
-			desc: "后台助理（子代理）跑完之后，它的小票还在面板上留多久 —— 留一会儿你回来还能看到它干了啥。0 = 跑完立刻撤掉。",
+			desc: "后台助理（子代理）跑完之后，它那张小票在面板上还留多久。\n\n留一会儿你回来能看见它干了啥；`0` = 跑完立刻撤掉。\n等价 `/agents linger <秒>`。",
 			kind: "number",
 			min: 0,
 			max: 600000,
@@ -2672,10 +2808,10 @@ export function setupDelegate(api: ExtensionAPI): void {
 								` 实际挂上：${shadow.names.join(", ") || "(一个都没有)"}\n` +
 								` 候选池里只有：${Object.keys(pool.servers).join(", ") || "(空)"}\n\n` +
 								`三个来源（同名后者覆盖）：\n` +
-								`  本地目录  ${localCatalogPath()}\n` +
+								`  候选池    ${localCatalogPath()}\n` +
 								`  用户级    ${join(getAgentDir(), "mcp.json")}\n` +
 								`  项目级    ${join(tpl.cwd, ".pi", "mcp.json")}\n\n` +
-								`补法：把定义写进本地目录（它不会被主会话自动加载，只当助理候选），` +
+								`补法：把定义写进候选池（它不会被主会话自动加载，只当助理候选），` +
 								`或者 /assistants edit ${tpl.key} 改挂一个池子里已有的。`,
 						},
 					],

@@ -16,7 +16,7 @@
  * 注意: pi 的 widget 只支持 above/below 两个位置，"左右分栏"是本组件自己画出来的。
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { type Focusable, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
@@ -728,8 +728,10 @@ function refreshData(ctx: ExtensionContext): void {
 }
 
 // ======================= 组件 =======================
-class BoardComponent implements Focusable {
-	focused = false;
+// ⚠️ 别给看板加 `implements Focusable` / `handleInput()`：
+//    看板是纯展示，不需要光标，也不应该收键。以前有个**空的** handleInput()——
+//    pi-tui 里它的语义是「组件获得焦点时接管键盘」，空实现 = 把所有键吃掉（含 ESC）。
+class BoardComponent {
 
 	constructor(
 		private theme: Theme,
@@ -780,8 +782,6 @@ class BoardComponent implements Focusable {
 		}
 		return out;
 	}
-
-	handleInput(): void {}
 
 	invalidate(): void {}
 
@@ -960,7 +960,7 @@ function registerBoardSettings(): void {
 			key: "boardOff",
 			group: "会话级（重启复位）",
 			label: "任务面板",
-			desc: "会话级临时关掉看板（不落盘，重启 pi 自动恢复）。想永久不用就别启用这个扩展。",
+			desc: "会话级临时关掉任务看板：面板收起、不再刷新。\n\n不落盘 —— 重启 pi 自动恢复。\n想永久不用就别启用这个扩展（或 `/ai-ext off`）。等价 `/board off`。",
 			kind: "bool",
 			def: false,
 			session: true,

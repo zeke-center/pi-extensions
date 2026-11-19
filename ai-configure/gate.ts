@@ -112,7 +112,7 @@ function registerGateSettings(): void {
 			key: "extDisabled",
 			group: "会话级（重启复位）",
 			label: "整个扩展",
-			desc: "一把全关：本会话内 ai-configure 的所有功能都停掉（等于 /ai-ext off）。重启 pi 或改回「开」恢复。",
+			desc: "**一把全关**：本会话内 ai-configure 的所有功能停掉 —— 看板收起、`progress`/`delegate` 从工具表撤下、子代理结果不再回投。\n\n只影响本会话，重启 pi 或改回「开」就恢复。等价 `/ai-ext off`。",
 			kind: "bool",
 			def: false,
 			session: true,

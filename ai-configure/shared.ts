@@ -1,11 +1,12 @@
 /**
  * shared.ts —— 模块之间的**小共享状态**（避免循环引用）。
  *
- * 为什么要有它：`voice.ts` 已经 import 了 `board.ts`（拿 boardSnapshot），
- * 所以 `board.ts` 不能反过来 import `voice.ts`；而「计划确认」这件事两边都要参与：
- *   - `board.ts`：计划要确认时，把问题挂出来等答复（终端弹窗 + 粘贴通道 + 超时）
- *   - `voice.ts`：剪贴板投进来的一句话可能就是那个答复（「同意」「不行」「改用…」）
- * 于是把这点状态放这里，两个模块都只依赖它。
+ * 为什么要有它：`settings.ts`、`board.ts`、`delegate.ts`、`gate.ts` 之间互相要用一点状态，
+ * 直接互相 import 会绕成环（A → B → A，Node 的 ESM 下会拿到半截模块）。
+ * 于是把这些东西放这里，谁都只依赖它：
+ *   - 计划确认的挂起状态（谁在等答复、超时多久）
+ *   - 扩展配置文件（`ai-extensions.json`）的读写
+ *   - 「面板打开前刷新助理列表」这类回调注册
  *
  * ⚠️ 这里全是**内存状态**，不落盘（粘贴内容绝不写文件）。
  */
@@ -38,7 +39,7 @@ export function guardCtx<T>(ctx: unknown, fn: (ctx: any) => T): { ok: boolean; s
 }
 
 // ======================= 扩展配置文件（ai-extensions.json）=======================
-// 放这里是因为 settings.ts（面板）、voice.ts、delegate.ts 都要读写，谁都不该依赖谁。
+// 放这里是因为 settings.ts（面板）、delegate.ts（派活）、gate.ts（总开关）都要读写，谁都不该依赖谁。
 
 /** 配置文件路径：<agent dir>/ai-extensions.json */
 export function extCfgFile(): string {

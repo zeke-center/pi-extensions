@@ -323,7 +323,7 @@ if (-not $partial -and -not $skipExtensions) {
 			Write-Host ("  [{0}] {1}" -f $tag, $o.Rel) -ForegroundColor Magenta
 			if (-not $List) { Remove-Item -LiteralPath $o.Path -Recurse -Force }
 		}
-		# 删完顺手收掉变空的目录（tts\ runtime\ 这种整个模块被删掉的情况）
+		# 删完顺手收掉变空的目录（整个子模块被删掉后留下的空壳）
 		if (-not $List) {
 			foreach ($p in $pluginNames) {
 				$pd = Join-Path $destDir $p

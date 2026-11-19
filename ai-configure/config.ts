@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { showHelp } from "./help";
+import { pickFromList } from "./form";
 import { showDoctor } from "./doctor";
 import { isExtDisabled, onGateApply } from "./gate";
 
@@ -229,7 +230,7 @@ class MultiSelect implements Focusable {
 
 		this.items.forEach((it, i) => {
 			const isSel = i === this.sel;
-			const box = it.checked ? t.fg("success", "[x]") : t.fg("dim", "[ ]");
+			const box = it.checked ? t.fg("success", "[✓]") : t.fg("dim", "[ ]");
 			const text = isSel ? t.fg("accent", it.label) : t.fg("text", it.label);
 			const prefix = isSel ? t.fg("accent", "▶ ") : "  ";
 			let line = ` ${prefix}${box} ${text}`;
@@ -446,8 +447,8 @@ export function setupConfig(api: ExtensionAPI): void {
 			);
 			if (!picked || picked.length === 0) return;
 
-			// 2) 选应用方式
-			const mode = await ctx.ui.select("应用到哪里？", [
+			// 2) 选应用方式（用弹窗版，别用 ctx.ui.select —— 那个会掉到输入框下面）
+			const mode = await pickFromList(ctx, "应用到哪里？", [
 				"会话级（立即生效，退出 pi 即消失）",
 				"项目级（写入 " + PROJECT_FILE + "，下次启动生效）",
 			]);

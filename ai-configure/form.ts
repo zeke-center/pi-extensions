@@ -72,6 +72,28 @@ function padRight(s: string, w: number): string {
 	return vw >= w ? truncateToWidth(s, w) : s + " ".repeat(w - vw);
 }
 
+/**
+ * 一页（同一个面板框内翻页用）。栈式导航：首页 → 组 → 项，esc 逐层返回。
+ * 不提供 pages 时就是老行为（一张表 + 底部/右栏说明）。
+ */
+export interface FormPage {
+	/** 面包屑这一层（例：助理 / db） */
+	title: string;
+	fields: FormField[];
+	/** 这一页的 MCP 候选池（助理页要用） */
+	mcp?: PickItem[];
+	/** 右栏说明（不传就用构造时那个） */
+	detail?: (f: FormField) => string;
+	/** 回车在「drill」行上：下一页 / `null` = 弹回上一层 / undefined = 不翻页（走默认行为） */
+	enter?: (f: FormField) => FormPage | null | undefined;
+	/** 动作行回车：**在本页执行**（面板不关）—— async 也行，错误自己接 */
+	runAction?: (f: FormField) => void;
+	/** 底部提示（不传用默认那句） */
+	footer?: string;
+	/** ctrl+s：返回 false = 退回上一层（默认留在本页）；不传 = 老行为（提交并关闭） */
+	save?: (values: Record<string, string>) => boolean | void;
+}
+
 /** 面板里的一行 */
 export interface FormField {
 	/** 提交时的键名 */
@@ -92,6 +114,8 @@ export interface FormField {
 	readonly?: boolean;
 	/** 值后面那句灰字 */
 	hint?: string;
+	/** 这一行回车 = 翻到下一页（不是改值、也不是执行动作） */
+	drill?: boolean;
 }
 
 export interface FormResult {
@@ -151,7 +175,7 @@ export class MultiSelect implements Focusable {
 		}
 		this.items.forEach((it, i) => {
 			const isSel = i === this.sel;
-			const box = it.checked ? t.fg("success", "[x]") : t.fg("dim", "[ ]");
+			const box = it.checked ? t.fg("success", "[✓]") : t.fg("dim", "[ ]");
 			const text = isSel ? t.fg("accent", it.label) : t.fg("text", it.label);
 			const prefix = isSel ? t.fg("accent", "▶ ") : "  ";
 			let line = ` ${prefix}${box} ${text}`;
@@ -176,6 +200,38 @@ export class FormPane implements Focusable {
 	private openBody = false;
 	/** 按下的 action 行的 key（kind="action"） */
 	private actionKey: string | undefined = undefined;
+	/** 页面栈（至少 1 层）；每层各自的 fields / mcp / detail / 翻页与保存钩子 */
+	private stack: FormPage[];
+	/** 每层各自的光标位置（返回上一层时能回到原来那行） */
+	private sels: number[] = [0];
+
+	private page(): FormPage {
+		return this.stack[this.stack.length - 1]!;
+	}
+	private flds(): FormField[] {
+		return this.page().fields;
+	}
+	private mcpPool(): PickItem[] {
+		return this.page().mcp ?? this.mcp;
+	}
+	private pageDetail(): ((f: FormField) => string) | undefined {
+		return this.page().detail ?? this.detail;
+	}
+	/** 往里压一页（记住当前光标） */
+	private pushPage(next: FormPage): void {
+		this.sels[this.stack.length - 1] = this.sel;
+		this.stack.push(next);
+		this.sel = 0;
+		this.mode = "nav";
+	}
+	/** 弹回上一层；已经是最外层就返回 false（调用方决定要不要关面板） */
+	private popPage(): boolean {
+		if (this.stack.length <= 1) return false;
+		this.stack.pop();
+		this.sel = this.sels[this.stack.length - 1] ?? 0;
+		this.mode = "nav";
+		return true;
+	}
 
 	constructor(
 		private theme: Theme,
@@ -187,6 +243,8 @@ export class FormPane implements Focusable {
 		/** 可选：给选中的行显示一段完整说明（配置面板用它写「这是干什么用的」） */
 		private detail?: (f: FormField) => string,
 	) {
+		// 页面栈：首页 = 传进来的这张表；drill 行回车往里压页，esc 弹回上一层
+		this.stack = [{ title: "", fields, mcp, detail }];
 		if (focusKey) {
 			const i = fields.findIndex((f) => f.key === focusKey);
 			if (i >= 0) {
@@ -198,14 +256,23 @@ export class FormPane implements Focusable {
 		}
 	}
 
+	/** 用页面栈启动（首页 + 若干层）；showFormPage 用 */
+	setPages(pages: FormPage[]): void {
+		if (!pages.length) return;
+		this.stack = pages;
+		this.sels = pages.map(() => 0);
+		this.sel = 0;
+		this.mode = "nav";
+	}
+
 	/** ↑↓ 移动，**跳过收起的组里的行** */
 	private move(d: number): void {
-		const n = this.fields.length;
+		const n = this.flds().length;
 		if (!n) return;
 		let i = this.sel;
 		for (let k = 0; k < n; k++) {
 			i = (i + d + n) % n;
-			if (!isHiddenRow(this.fields, i)) {
+			if (!isHiddenRow(this.flds(), i)) {
 				this.sel = i;
 				return;
 			}
@@ -217,15 +284,15 @@ export class FormPane implements Focusable {
 	 * 不这么做的话光标会停在**已经被藏起来的那一行**上 → 界面上看不出选中在哪（实测踩到）。
 	 */
 	private fixCursor(): void {
-		if (!isHiddenRow(this.fields, this.sel)) return;
-		const g = ownerGroup(this.fields, this.sel);
+		if (!isHiddenRow(this.flds(), this.sel)) return;
+		const g = ownerGroup(this.flds(), this.sel);
 		if (!g) return;
-		const i = this.fields.findIndex((f) => f.key === g);
+		const i = this.flds().findIndex((f) => f.key === g);
 		if (i >= 0) this.sel = i;
 	}
 
 	private cur(): FormField | undefined {
-		return this.fields[this.sel];
+		return this.flds()[this.sel];
 	}
 
 	private mcpValue(): string {
@@ -234,7 +301,10 @@ export class FormPane implements Focusable {
 
 	private finish(): void {
 		const values: Record<string, string> = {};
-		for (const f of this.fields) values[f.key] = f.kind === "mcp" ? this.mcpValue() : f.value;
+		// 页面栈里每一页的值都收上来（助理页 / 配置页混着改也不会丢）
+		for (const page of this.stack) {
+			for (const f of page.fields) values[f.key] = f.kind === "mcp" ? this.mcpValue() : f.value;
+		}
 		this.done({ values, openBody: this.openBody, ...(this.actionKey ? { actionKey: this.actionKey } : {}) });
 	}
 
@@ -245,25 +315,34 @@ export class FormPane implements Focusable {
 		if (matchesKey(data, "ctrl+s")) {
 			if (this.mode === "edit" && f) f.value = this.buf;
 			this.mode = "nav";
+			const page = this.page();
+			if (this.stack.length > 1 && page.save) {
+				const values: Record<string, string> = {};
+				for (const x of page.fields) values[x.key] = x.kind === "mcp" ? this.mcpValue() : x.value;
+				const keep = page.save(values);
+				if (keep === false) this.popPage(); // 存完退回上一层
+				return;
+			}
 			this.finish();
 			return;
 		}
 
 		if (this.mode === "mcp") {
+			const pool = this.mcpPool();
 			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "return")) {
 				this.mode = "nav";
 				return;
 			}
-			if (matchesKey(data, "up") && this.mcp.length) {
-				this.mcpSel = (this.mcpSel - 1 + this.mcp.length) % this.mcp.length;
+			if (matchesKey(data, "up") && pool.length) {
+				this.mcpSel = (this.mcpSel - 1 + pool.length) % pool.length;
 				return;
 			}
-			if (matchesKey(data, "down") && this.mcp.length) {
-				this.mcpSel = (this.mcpSel + 1) % this.mcp.length;
+			if (matchesKey(data, "down") && pool.length) {
+				this.mcpSel = (this.mcpSel + 1) % pool.length;
 				return;
 			}
 			if (matchesKey(data, "space")) {
-				const it = this.mcp[this.mcpSel];
+				const it = pool[this.mcpSel];
 				if (it) it.checked = !it.checked;
 			}
 			return;
@@ -343,8 +422,9 @@ export class FormPane implements Focusable {
 			return;
 		}
 
-		// nav
+		// nav：esc 逐层返回（深层先弹回上一层，最外层才关面板）
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			if (this.popPage()) return;
 			this.done(null);
 			return;
 		}
@@ -358,7 +438,7 @@ export class FormPane implements Focusable {
 		}
 		// ←→ = 收起 / 展开当前这一组（跟文件树的习惯一样）
 		if (matchesKey(data, "left") || matchesKey(data, "right")) {
-			const g = ownerGroup(this.fields, this.sel);
+			const g = ownerGroup(this.flds(), this.sel);
 			if (g) {
 				if (matchesKey(data, "left")) {
 					expandedGroups.delete(g);
@@ -376,7 +456,20 @@ export class FormPane implements Focusable {
 				} else expandedGroups.add(f.key);
 				return;
 			}
-			if (!f || f.readonly) return;
+			if (!f) return;
+			// drill 行：翻到下一页（配置面板靠它做「首页 → 组 → 项」）
+			if (f.drill) {
+				const next = this.page().enter?.(f);
+				if (next === null) {
+					this.popPage(); // 「← 返回」行
+					return;
+				}
+				if (next) {
+					this.pushPage(next);
+					return;
+				}
+			}
+			if (f.readonly) return;
 			if (f.kind === "bool") {
 				f.value = f.value === "是" ? "否" : "是";
 				return;
@@ -392,6 +485,11 @@ export class FormPane implements Focusable {
 				return;
 			}
 			if (f.kind === "action") {
+				// 分页模式：在本页跑掉，面板不关（老行为是关面板 + 外面重开，很跳）
+				if (this.page().runAction) {
+					this.page().runAction!(f);
+					return;
+				}
 				this.openBody = true;
 				this.actionKey = f.key;
 				this.finish();
@@ -403,59 +501,154 @@ export class FormPane implements Focusable {
 		}
 	}
 
+	/**
+	 * 渲染。宽屏（≥90 列）走**左右双栏**：左边列表 3，右边说明 1。
+	 *
+	 * 为什么改双栏：以前说明挤在面板底部一行（`描述｜取值｜当前｜默认` 糊成一段），
+	 * 描述稍长就 wrap 三四行、还跟列表抢高度，长描述根本看不全。
+	 * 右侧独立窄栏可以固定宽度折行，长描述不再影响左侧能看见的行数。
+	 *
+	 * 窄屏（<90 列）自动退回单栏 + 底部说明 —— 两栏都挤成碎片更没法读。
+	 */
 	render(width: number): string[] {
 		const t = this.theme;
-		const w = Math.min(84, width);
+		const twoCol = width >= 90;
+		const w = Math.min(twoCol ? 108 : 84, width);
 		const inner = w - 2;
 		const b = (s: string) => t.fg("border", s);
-		const line = (s: string) => b("│") + padRight(truncateToWidth(s, inner), inner) + b("│");
-		const out: string[] = [];
 
-		out.push(b(`╭${"─".repeat(inner)}╮`));
-		out.push(line(` ${t.fg("accent", t.bold(this.title))}`));
-		out.push(b(`├${"─".repeat(inner)}┤`));
+		// 标签列宽：按**本页最长的标签**算（上限 22），
+		// 别用固定 16 —— 首页有「会话级（重启复位）」这种长组名，会被截掉右括号。
+		const labelW = Math.min(
+			22,
+			Math.max(8, ...this.flds().map((f) => visibleWidth(f.label) + 2)),
+		);
 
-		this.fields.forEach((f, i) => {
-			if (isHiddenRow(this.fields, i)) return; // 收起的组里的行不画
+		// ---------- 左栏：列表 ----------
+		const left: Array<{ text: string; sel: boolean; selIndex: number }> = [];
+		this.flds().forEach((f, i) => {
+			if (isHiddenRow(this.flds(), i)) return; // 收起的组里的行不画
 			const isSel = i === this.sel;
-
-			// 分组表头：折剪头**兼任选中标记**（两个三角挤在一起太丑）
 			if (f.kind === "group") {
 				const open = expandedGroups.has(f.key);
-				const n = countInGroup(this.fields, f.key);
+				const n = countInGroup(this.flds(), f.key);
 				const arrow = t.fg(isSel ? "accent" : "muted", open ? "▾" : "▸");
-				const row = ` ${arrow} ${t.fg("accent", t.bold(f.label))} ${t.fg("dim", `(${n})`)}`;
-				out.push(line(row));
+				left.push({
+					text: ` ${arrow} ${t.fg("accent", t.bold(f.label))} ${t.fg("dim", `(${n})`)}`,
+					sel: isSel,
+					selIndex: i,
+				});
 				return;
 			}
-
-			const indent = ownerGroup(this.fields, i) ? "  " : "";
-			const label = padRight(indent + f.label, LABEL_W);
+			const indent = ownerGroup(this.flds(), i) ? "  " : "";
+			const label = padRight(indent + f.label, labelW);
 			let val: string;
 			if (f.kind === "mcp") {
-				const names = this.mcp.filter((x) => x.checked).map((x) => x.value);
+				const names = this.mcpPool().filter((x) => x.checked).map((x) => x.value);
 				val = names.length ? `${names.length} 个：${names.join(", ")}` : "(不连)";
 			} else {
-				val = f.value || "(空)";
+				// 动作行的值列是摘要，空的就留白（别显示「(空)」，那不是配置）
+				val = f.value || (f.kind === "action" || f.drill ? "" : "(空)");
 			}
 			if (isSel && this.mode === "edit") {
 				val = this.buf.slice(0, this.cursor) + CURSOR_MARKER + this.buf.slice(this.cursor);
 			}
 			const color: "accent" | "text" | "dim" = isSel && !f.readonly ? "accent" : f.readonly ? "dim" : "text";
-			let row = ` ${isSel ? t.fg("accent", "▸") : " "} ${t.fg(color, label)} ${t.fg(color, val)}`;
-			if (f.hint) row += `  ${t.fg("dim", f.hint)}`;
-			out.push(line(row));
+			left.push({
+				text: ` ${isSel ? t.fg("accent", "▸") : " "} ${t.fg(color, label)} ${t.fg(color, val)}`,
+				sel: isSel,
+				selIndex: i,
+			});
 		});
 
-		// 选中行的完整说明（可选）—— 配置面板靠这行讲清「这是干什么用的」
-		if (this.detail && this.cur()) {
-			const txt = this.detail(this.cur()!);
-			out.push(b(`├${"─".repeat(inner)}┤`));
-			for (const ln of wrapText(txt, inner - 2)) out.push(line(` ${t.fg("muted", ln)}`));
+		// 列表过长时开一个跟随光标的视口（30 行以内不启用，行为跟以前完全一样）
+		const MAX_ROWS = 30;
+		let viewFrom = 0;
+		if (left.length > MAX_ROWS) {
+			const curRow = Math.max(0, left.findIndex((r) => r.sel));
+			viewFrom = Math.max(0, Math.min(curRow - Math.floor(MAX_ROWS / 2), left.length - MAX_ROWS));
+		}
+		const leftView = left.slice(viewFrom, viewFrom + MAX_ROWS);
+		const more = left.length > MAX_ROWS ? { above: viewFrom, below: left.length - viewFrom - leftView.length } : undefined;
+
+		// ---------- 右栏：说明 ----------
+		const leftW = twoCol ? Math.floor((inner - 1) * 0.75) : inner;
+		const rightW = twoCol ? inner - 1 - leftW : 0;
+		const right: string[] = [];
+		const cur = this.cur();
+		if (twoCol && this.detail && cur) {
+			// 标题行：组 = 「组名」；普通行 = 「组名 · 项名」
+			const owner = ownerGroup(this.flds(), this.sel);
+			const ownerField = owner ? this.flds().find((x) => x.key === owner) : undefined;
+			const title = cur.kind === "group" ? cur.label : [ownerField?.label, cur.label].filter(Boolean).join(" · ");
+			right.push(` ${t.fg("accent", t.bold(title))}`);
+			right.push("");
+			const txt = this.pageDetail()!(cur);
+			for (const ln of wrapText(txt, rightW - 2, 24)) right.push(ln ? ` ${t.fg("muted", ln)}` : "");
+		}
+
+		// ---------- 拼装 ----------
+		const out: string[] = [];
+		const full = (s: string) => b("│") + padRight(truncateToWidth(s, inner), inner) + b("│");
+		/**
+		 * 一行铺满整栏；**选中行整行铺底色**。
+		 *
+		 * 为什么不是只换前景色（accent vs text）：实测在多数主题里这两种前景色
+		 * 亮度和色相都接近，扫一眼看不出选中的是哪行（尤其分组表头本身就是 accent+bold）。
+		 * 用 padRight 先铺满再包 bg —— `fg()` 收尾只发 \x1b[39m（只重置前景），
+		 * 不会把外层底色冲掉，所以整行底色是安全的。
+		 */
+		const cell = (s: string, sel: boolean, cw: number): string => {
+			const padded = padRight(truncateToWidth(s, cw), cw);
+			return sel ? t.bg("selectedBg", padded) : padded;
+		};
+		out.push(b(`╭${"─".repeat(inner)}╮`));
+		const crumbs = this.stack.map((p) => p.title).filter(Boolean);
+		const titleText = crumbs.length ? `${this.title} › ${crumbs.join(" › ")}` : this.title;
+		out.push(full(` ${t.fg("accent", t.bold(titleText))}`));
+		if (twoCol) out.push(b(`├${"─".repeat(leftW)}┬${"─".repeat(rightW)}┤`));
+		else out.push(b(`├${"─".repeat(inner)}┤`));
+
+		if (twoCol) {
+			const rows = Math.max(leftView.length, right.length);
+			for (let i = 0; i < rows; i++) {
+				let l = leftView[i]?.text ?? "";
+				let sel = leftView[i]?.sel ?? false;
+				// 视口提示：被挡住的还有多少行（提示行不是真实行，不铺底色）
+				if (more && i === 0 && more.above > 0) {
+					l = ` ${t.fg("dim", `↑ 还有 ${more.above} 行`)}`;
+					sel = false;
+				}
+				if (more && i === leftView.length - 1 && more.below > 0) {
+					l = ` ${t.fg("dim", `↓ 还有 ${more.below} 行`)}`;
+					sel = false;
+				}
+				out.push(b("│") + cell(l, sel, leftW) + b("│") + padRight(truncateToWidth(right[i] ?? "", rightW), rightW) + b("│"));
+			}
+			// 双栏区收口（这条线同时当下方帮助区上边线，不再额外加一条）
+		} else {
+			for (let i = 0; i < leftView.length; i++) {
+				let l = leftView[i]!.text;
+				let sel = leftView[i]!.sel;
+				if (more && i === 0 && more.above > 0) {
+					l = ` ${t.fg("dim", `↑ 还有 ${more.above} 行`)}`;
+					sel = false;
+				}
+				if (more && i === leftView.length - 1 && more.below > 0) {
+					l = ` ${t.fg("dim", `↓ 还有 ${more.below} 行`)}`;
+					sel = false;
+				}
+				out.push(b("│") + cell(l, sel, inner) + b("│"));
+			}
+			// 窄屏：说明退到列表下面（和旧版一致）
+			if (this.pageDetail() && cur) {
+				out.push(b(`├${"─".repeat(inner)}┤`));
+				for (const ln of wrapText(this.detail(cur), inner - 2, 6)) out.push(full(` ${t.fg("muted", ln)}`));
+			}
 		}
 
 		out.push(b(`├${"─".repeat(inner)}┤`));
-		const groupSel = this.cur()?.kind === "group";
+		const groupSel = cur?.kind === "group";
 		const help =
 			this.mode === "mcp"
 				? "↑↓ 移动 · 空格 勾选 · 回车 收起 · ctrl+s 保存"
@@ -466,29 +659,59 @@ export class FormPane implements Focusable {
 						: groupSel
 							? "↑↓ 移动 · 回车/←→ 展开收起 · ctrl+s 保存 · esc 取消"
 							: "↑↓ 选行 · 回车 改 · ←→ 收起/展开分组 · ctrl+s 保存 · esc 取消";
-		out.push(line(` ${t.fg("dim", help)}`));
+		out.push(full(` ${t.fg("dim", this.page().footer ?? help)}`));
 
 		if (this.mode === "mcp") {
 			out.push(b(`├${"─".repeat(inner)}┤`));
-			if (!this.mcp.length) out.push(line(` ${t.fg("dim", "（候选池是空的 —— 先 /ai 拉连接，或写 mcp-catalog.json）")}`));
-			this.mcp.forEach((it, i) => {
+			const pool = this.mcpPool();
+			if (!pool.length) out.push(full(` ${t.fg("dim", "（候选池是空的 —— 先 /ai 拉连接，或写 mcp-catalog.json）")}`));
+			pool.forEach((it, i) => {
 				const isSel = i === this.mcpSel;
-				const box = it.checked ? t.fg("success", "[x]") : t.fg("dim", "[ ]");
+				const box = it.checked ? t.fg("success", "[✓]") : t.fg("dim", "[ ]");
 				let row = `   ${isSel ? t.fg("accent", "▶") : " "} ${box} ${t.fg(isSel ? "accent" : "text", it.label)}`;
 				if (it.hint) row += `  ${t.fg("dim", it.hint)}`;
-				out.push(line(row));
+				out.push(full(row));
 			});
 		} else if (this.mode === "enum") {
 			out.push(b(`├${"─".repeat(inner)}┤`));
-			for (const [i, o] of (this.cur()?.options ?? []).entries()) {
+			const opts = this.cur()?.options ?? [];
+			// 模型列表可能几十个 —— 只开一扇窗，跟着光标滑动，别把终端顶爆
+			const MAXV = 8;
+			const start = Math.max(0, Math.min(this.enumSel - Math.floor(MAXV / 2), opts.length - MAXV));
+			const end = Math.min(opts.length, start + MAXV);
+			if (start > 0) out.push(full(t.fg("dim", `   ⋮ 上面还有 ${start} 个（↑ 继续翻）`)));
+			for (let i = start; i < end; i++) {
 				const isSel = i === this.enumSel;
-				out.push(line(`   ${isSel ? t.fg("accent", "▶") : " "} ${t.fg(isSel ? "accent" : "text", o)}`));
+				out.push(full(`   ${isSel ? t.fg("accent", "▶") : " "} ${t.fg(isSel ? "accent" : "text", opts[i] ?? "")}`));
 			}
+			if (end < opts.length) out.push(full(t.fg("dim", `   ⋮ 下面还有 ${opts.length - end} 个（↓ 继续翻）`)));
 		}
 
 		out.push(b(`╰${"─".repeat(inner)}╯`));
 		return out;
 	}
+}
+
+/**
+ * 弹出**分页**面板：pages[0] 是首页，往后是已经压好的层。
+ * 用户 esc 在最外层按一下才取消（返回 null）。
+ */
+export async function showFormPages(
+	ctx: ExtensionContext,
+	title: string,
+	pages: FormPage[],
+	focusKey?: string,
+): Promise<FormResult | null> {
+	const root = pages[0]!;
+	const r = await ctx.ui.custom<FormResult | null>(
+		(_tui, theme, _kb, done) => {
+			const pane = new FormPane(theme, title, root.fields, root.mcp ?? [], done, focusKey, root.detail);
+			pane.setPages(pages);
+			return pane;
+		},
+		{ overlay: true },
+	);
+	return r ?? null;
 }
 
 /** 弹出面板；用户 esc 取消就返回 null。focusKey 指定一开始光标停在哪一行 */
@@ -507,18 +730,92 @@ export async function showForm(
 	return r ?? null;
 }
 
-/** 按可见宽度折行（详情说明可能很长） */
-function wrapText(s: string, w: number): string[] {
-	const out: string[] = [];
-	let line = "";
-	for (const ch of s) {
-		if (visibleWidth(line + ch) > w) {
-			out.push(line);
-			line = ch;
-		} else {
-			line += ch;
+/**
+ * 弹窗版单选。
+ *
+ * 为什么不用 `ctx.ui.select`：它是 pi 的**输入框内联提示**（画在输入框下方），
+ * 跟我们的面板不是一套观感 —— 用起来就是「怎么突然掉到输入框下面去了」。
+ * 这里走 `ctx.ui.custom({ overlay: true })`，跟 `/aihelp` 面板是同一个弹窗。
+ */
+export class ListPicker implements Focusable {
+	focused = false;
+	private sel = 0;
+
+	constructor(
+		private theme: Theme,
+		private title: string,
+		private options: string[],
+		private done: (value: string | null) => void,
+	) {}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			this.done(null);
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			if (this.options.length) this.sel = (this.sel - 1 + this.options.length) % this.options.length;
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			if (this.options.length) this.sel = (this.sel + 1) % this.options.length;
+			return;
+		}
+		if (matchesKey(data, "return")) {
+			const v = this.options[this.sel];
+			this.done(v ?? null);
 		}
 	}
-	if (line) out.push(line);
-	return out.length ? out.slice(0, 3) : [""]; // 最多 3 行，别把面板撑爆
+
+	render(width: number): string[] {
+		const t = this.theme;
+		const w = Math.min(78, width);
+		const inner = w - 2;
+		const b = (s: string) => t.fg("border", s);
+		const out: string[] = [];
+		out.push(b(`╭${"─".repeat(inner)}╮`));
+		out.push(b("│") + padRight(" " + t.fg("accent", t.bold(this.title)), inner) + b("│"));
+		out.push(b(`├${"─".repeat(inner)}┤`));
+		this.options.forEach((o, i) => {
+			const isSel = i === this.sel;
+			const row = ` ${isSel ? t.fg("accent", "▶") : " "} ${t.fg(isSel ? "accent" : "text", o)}`;
+			const padded = padRight(truncateToWidth(row, inner), inner);
+			out.push(b("│") + (isSel ? t.bg("selectedBg", padded) : padded) + b("│"));
+		});
+		out.push(b(`├${"─".repeat(inner)}┤`));
+		out.push(b("│") + padRight(" " + t.fg("dim", "↑↓ 移动 · 回车 确定 · esc 取消"), inner) + b("│"));
+		out.push(b(`╰${"─".repeat(inner)}╯`));
+		return out;
+	}
+}
+
+/** 开一个**弹窗**让用户单选一行；esc / 异常 → undefined */
+export async function pickFromList(ctx: ExtensionContext, title: string, options: string[]): Promise<string | undefined> {
+	const r = await ctx.ui.custom<string | null>(
+		(_tui, theme, _kb, done) => new ListPicker(theme, title, options, done),
+		{ overlay: true },
+	);
+	return r ?? undefined;
+}
+
+/** 按可见宽度折行（详情说明可能很长） */
+function wrapText(s: string, w: number, maxLines = 3): string[] {
+	const out: string[] = [];
+	for (const para of String(s ?? "").split("\n")) {
+		let line = "";
+		if (!para) {
+			out.push("");
+			continue;
+		}
+		for (const ch of para) {
+			if (visibleWidth(line + ch) > w) {
+				out.push(line);
+				line = ch;
+			} else {
+				line += ch;
+			}
+		}
+		if (line) out.push(line);
+	}
+	return out.length ? out.slice(0, maxLines) : [""];
 }

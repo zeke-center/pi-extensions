@@ -14,7 +14,7 @@
  *
  * 三个来源（后者覆盖前者同名项）
  * -----------------------------
- *   <agentDir>/mcp-catalog.json   本地目录（自己手写的，不自动加载，当兜底/候选）
+ *   <agentDir>/mcp-catalog.json   候选池（自己手写的，不自动加载，只当候选）
  *   <agentDir>/mcp.json           用户级（所有会话都加载的那种）
  *   <cwd>/.pi/mcp.json            项目级（/ai 拉的线上连接会落到这里）
  */
@@ -69,7 +69,7 @@ function readMcpFile(file: string): Record<string, McpServerDef> {
 	}
 }
 
-/** 合并三处来源（本地目录 → 用户级 → 项目级，同名后者覆盖前者） */
+/** 合并三处来源（候选池 → 用户级 → 项目级，同名后者覆盖前者） */
 export function loadMcpPool(cwd: string): McpPool {
 	const servers: Record<string, McpServerDef> = {};
 	const origin: Record<string, string> = {};
@@ -79,7 +79,7 @@ export function loadMcpPool(cwd: string): McpPool {
 			origin[name] = label;
 		}
 	};
-	put(localCatalogPath(), "本地目录");
+	put(localCatalogPath(), "候选池");
 	put(join(getAgentDir(), "mcp.json"), "用户级");
 	put(join(cwd, ".pi", "mcp.json"), "项目级");
 	return { servers, origin };

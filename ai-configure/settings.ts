@@ -1,9 +1,9 @@
 /**
  * settings.ts —— 可视化配置面板（像 `/mcp` / `/assistants` 那样的**表单弹窗**）。
  *
- * 为什么要有它：配置项越来越多（26 个），全靠 `/voice clip xxx` 这种子命令记不住也没法浏览。
+ * 为什么要有它：配置项越来越多，全靠子命令记不住也没法浏览。
  * 这里做两件事：
- *   1. **注册表**：各模块（voice / delegate / board / gate …）把自己可配置的项注册进来，
+ *   1. **注册表**：各模块（delegate / board / gate …）把自己可配置的项注册进来，
  *      每项都要写清「这是干什么用的」——面板里会显示；
  *   2. **面板**：复用 `form.ts` 的 FormPane（和 `/assistants` 同一个外观）：
  *      `▸ 名称   值   (提示)` 一行一项，选中行的完整说明显示在下面那行；
@@ -13,7 +13,7 @@
  * 面板不用改一行 —— DIY 项（触发词这类）也走同一条路。
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type FormField, showForm } from "./form";
+import { type FormField, type FormPage, showForm, showFormPages } from "./form";
 
 // ======================= 注册表 =======================
 
@@ -38,12 +38,17 @@ export interface SettingDef {
 	unit?: string;
 	/** 行尾那句灰字（覆盖默认提示）——动作行用它显示「可派 · 通用助理」这种摘要 */
 	hint?: string;
+	/** 动作行在右栏末尾那句（默认「回车 = 立即执行」；助理行是「回车 = 打开编辑面板」） */
+	actionHint?: string;
+	/** 这一行回车翻到哪一页（助理行用它翻进编辑页；不传就是普通动作/配置） */
+	page?: () => FormPage | undefined;
 	/** 默认值（`r` 恢复用；面板里也有「恢复默认」这一行） */
 	def: string | number | boolean | string[];
 	/** 读当前值（内存里的 live 值，不是文件） */
 	get: () => string | number | boolean | string[];
 	/** 写：负责「改内存 + 写盘 + 立即生效」 */
-	set: (v: string | number | boolean | string[]) => void;
+	/** 写回一个值。动作行的实现常常是 async（要调命令），所以允许返回 Promise。 */
+	set: (v: string | number | boolean | string[]) => void | Promise<void>;
 	/** 只在本会话有效（不落盘） */
 	session?: boolean;
 }
@@ -146,23 +151,30 @@ export function fieldHint(d: SettingDef): string {
 	return bits.join(" · ");
 }
 
-/** 面板下方那行完整说明：干什么用的 + 取值 + 当前值 + 默认值 */
+/**
+ * 右栏（窄屏时是底部）那段完整说明。
+ * **分行写**，别糊成一段 —— 右栏只有 1/4 宽，一段话会折成一坨。
+ */
 export function fieldDetail(d: SettingDef): string {
 	const cur = d.get();
 	const curTxt = Array.isArray(cur) ? cur.join(", ") : String(cur);
+	if (d.kind === "action") {
+		return `${d.desc}\n\n${d.actionHint ?? "回车 = 立即执行（不存值，不参与 ctrl+s）"}`;
+	}
 	let range = "";
-	if (d.kind === "action") range = "回车 = 立即执行（不存值）";
-	else if (d.kind === "bool") range = "开 / 关";
+	if (d.kind === "bool") range = "开 / 关";
 	else if (d.kind === "enum") range = (d.options ?? []).join(" / ");
 	else if (d.kind === "number") range = `${d.min ?? "-∞"} ~ ${d.max ?? "+∞"}${d.unit ?? ""}`;
 	else if (d.kind === "list") range = "逗号分隔的多个词（例：发送, 投给pi）";
 	else range = "任意文本";
 	const defTxt = Array.isArray(d.def) ? d.def.join(", ") : String(d.def);
-	return `${d.desc}｜取值：${range}｜当前：${curTxt || "(空)"}｜默认：${defTxt || "(空)"}`;
+	return [d.desc, "", `取值：${range}`, `当前：${curTxt || "(空)"}`, `默认：${defTxt || "(空)"}`, d.session ? "仅本会话有效（重启复位）" : ""]
+		.filter((x, i) => i < 5 || x)
+		.join("\n");
 }
 
 /** 面板里的分组顺序（常用的在前，「会话级」这种偶尔用的压最后） */
-const GROUP_ORDER = ["助理", "委派", "看板", "会话级（重启复位）", "命令"];
+const GROUP_ORDER = ["助理", "委派", "看板", "会话级（重启复位）"];
 
 /** 按上面的顺序排一遍（未知分组排在最后，按注册顺序稳定） */
 export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {
@@ -183,14 +195,17 @@ export function settingsFields(defs: SettingDef[] = registry): FormField[] {
 			lastGroup = d.group;
 			out.push({ key: `__group:${d.group}`, label: d.group, value: "", kind: "group" });
 		}
+		// 动作行：值列显示**摘要**（「可派 · 通用助理」），行尾只留一句短提示。
+		// 以前值列全是 `→ 回车执行`，每行一模一样，白占地方还看不出这行是什么。
+		const isAction = d.kind === "action";
 		out.push({
 			key: d.key,
 			// 分组已经当表头显示过了 → 子行**不再重复前缀**（省地方，也免得 20 字被截断）
 			label: d.label,
-			value: fieldValue(d),
-			kind: d.kind === "action" ? "action" : d.kind === "bool" ? "bool" : d.kind === "enum" ? "enum" : "text",
+			value: isAction ? (d.hint ?? "") : fieldValue(d),
+			kind: isAction ? "action" : d.kind === "bool" ? "bool" : d.kind === "enum" ? "enum" : "text",
 			options: d.kind === "enum" ? d.options : undefined,
-			hint: fieldHint(d),
+			hint: isAction ? "回车执行" : fieldHint(d),
 		});
 	}
 	return out;
@@ -234,6 +249,11 @@ export function applySettingsValues(values: Record<string, string>, defs: Settin
 	const changes: SettingsChange[] = [];
 	for (const d of defs) {
 		if (!(d.key in values)) continue;
+		// 动作行（kind="action"）不是值 —— 它的 set 就是「跑起来」，只在面板的 actionKey
+		// 分支里单独执行**一次**。漏掉这个跳过会把面板里所有 hint 非空的动作行
+		// 当成「改过的配置」批量 set：实测选一个助理 → 4 个底座 edit 报警 +
+		// /resume-agent 弹出会话列表 + ESC 被后面的模态吃掉。
+		if (d.kind === "action") continue;
 		const text = values[d.key] ?? "";
 		// 没动过的行跳过（表单里 value 就是当前值）
 		if (text === fieldValue(d)) continue;
@@ -263,6 +283,9 @@ export function resetSettings(defs: SettingDef[] = registry): number {
 	let n = 0;
 	const changes: SettingsChange[] = [];
 	for (const d of defs) {
+		// 同 applySettingsValues：动作行的 set 是「跑起来」，不是「改值」——
+		// 否则一下「恢复全部默认」会把所有动作行挨个执行一遍。
+		if (d.kind === "action") continue;
 		try {
 			d.set(Array.isArray(d.def) ? [...d.def] : d.def);
 			n++;
@@ -287,48 +310,20 @@ export async function openSettings(ctx: ExtensionContext): Promise<void> {
 	} catch {
 		/* 刷新失败就用上次的，不影响打开面板 */
 	}
-	const defs = registry;
-	if (!defs.length) {
+	if (!registry.length) {
 		ctx.ui.notify("还没有注册任何配置项（插件没加载全？）", "warning");
 		return;
 	}
-	const byKey = new Map(defs.map((d) => [d.key, d]));
-	const fields = settingsFields(defs);
-	const r = await showForm(
-		ctx,
-		"⚙ ai-configure 配置 / 命令（按分类折叠，回车展开）",
-		fields,
-		[],
-		undefined,
-		(f) => {
-			// 分组表头：告诉它有项，以及怎么打开
-			if (f.kind === "group") {
-				const n = defs.filter((d) => d.group === f.label).length;
-				return `「${f.label}」共 ${n} 项 —— 回车（或 ←→）展开 / 收起`;
-			}
-			const d = byKey.get(f.key);
-			return d ? fieldDetail(d) : "";
-		},
-	);
-	if (!r) return; // esc = 取消，什么都不改
 
-	// 「命令」分组里是按**行动**不是配置：选中即立即执行，不写值。
-	if (r.actionKey) {
-		const d = byKey.get(r.actionKey);
-		// 先把同一面板里其它真的改了的项落地（用户可能一边改配置一边点了命令）
-		applySettingsValues(r.values, defs);
-		try {
-			d?.set(""); // action 行的 set 就是“跑起来”
-			ctx.ui.notify(`▶ 执行：${d?.label ?? r.actionKey}`, "info");
-		} catch (e) {
-			ctx.ui.notify(`✗ 执行失败：${e instanceof Error ? e.message : String(e)}`, "error");
-		}
-		return;
-	}
+	// 分页：总览 → 组 → 项（全程一个面板框，esc 逐层返回）
+	const r = await showFormPages(ctx, "⚙ ai-configure", [settingsHomePage()]);
+	if (!r) return; // 最外层 esc = 关掉面板
 
-	const { applied, failed } = applySettingsValues(r.values, defs);
-	const msg = applied.length ? `⚙ 已保存 ${applied.length} 项：${applied.slice(0, 6).join("、")}${applied.length > 6 ? "…" : ""}` : "没有改动";
-	ctx.ui.notify(failed.length ? `${msg}（${failed.length} 项没改成功：${failed.join("、")}）` : msg, failed.length ? "warning" : "info");
+	// 深层页的值已经由各页 save 钩子落地了；这里只兜一层"真配置键"（防将来加页忘了写 save）
+	const known = new Map(registry.map((d) => [d.key, d]));
+	const leftovers: Record<string, string> = {};
+	for (const [k, v] of Object.entries(r.values)) if (known.has(k)) leftovers[k] = v;
+	if (Object.keys(leftovers).length) applySettingsValues(leftovers);
 }
 
 /** 面板里想把「面板没打开时」的上下文留一份 */
@@ -338,3 +333,104 @@ export function settingsCtx(): ExtensionContext | undefined {
 
 /** 各模块的 setupXxx 风格一致性占位（注册项由模块自己 registerSettings） */
 export function setupSettings(_api: ExtensionAPI): void {}
+
+// ======================= 分页（首页 → 组 → 项） =======================
+
+/** 每组的「这一组是干什么的」—— 首页右栏用 */
+const GROUP_BLURB: Record<string, string> = {
+	助理: "每个助理一行。回车进去能看到它的角色、继承的底座、挂的 MCP、超时和提示词正文，改完 ctrl+s 直接落盘。",
+	委派: "派活的公共偏好，和具体哪个助理无关。",
+	看板: "任务看板的动作：清空计划、面板贴上方还是下方、右栏/中栏要不要显示。",
+	"会话级（重启复位）": "只在本会话有效：重启 pi 自动复位，不写进配置文件。",
+};
+
+/** 首页：每组一行（回车进组） */
+export function settingsHomePage(): FormPage {
+	const defs = registry;
+	const groups = [...new Set(orderedDefs(defs).map((d) => d.group))];
+	const fields: FormField[] = groups.map((g) => {
+		const items = defs.filter((d) => d.group === g);
+		const acts = items.filter((d) => d.kind === "action").length;
+		return {
+			key: `nav.group.${g}`,
+			label: g,
+			value: `${items.length} 项${acts ? ` · ${acts} 个动作` : ""}`,
+			kind: "text" as const,
+			readonly: true,
+			drill: true,
+			hint: "回车进入",
+		};
+	});
+	return {
+		title: "总览",
+		fields,
+		footer: "↑↓ 移动 · 回车 进入这一组 · ctrl+s 保存 · esc 退出",
+		detail: (f) => GROUP_BLURB[f.label] ?? `「${f.label}」共 ${defs.filter((d) => d.group === f.label).length} 项。`,
+		enter: (f) => settingsGroupPage(f.label.replace(/^nav\.group\./, "")),
+	};
+}
+
+/** 组页：只列这一组的行（顶部一个「← 返回总览」） */
+export function settingsGroupPage(group: string): FormPage {
+	const items = orderedDefs(registry).filter((d) => d.group === group);
+	const fields: FormField[] = [
+		{ key: "nav.back", label: "← 返回总览", value: "", kind: "text", readonly: true, drill: true },
+		...items.map(
+			(d): FormField => ({
+				key: d.key,
+				label: d.label,
+				value: d.kind === "action" ? (d.hint ?? "") : fieldValue(d),
+				// 动作行保持 action（回车执行）；配置行当成普通行（回车进编辑页）
+				kind: d.kind === "action" ? "action" : d.kind === "enum" ? "enum" : d.kind === "bool" ? "bool" : "text",
+				options: d.kind === "enum" ? d.options : undefined,
+				hint: d.page ? "回车编辑" : d.kind === "action" ? "回车执行" : "回车编辑",
+				drill: d.kind !== "action" || !!d.page,
+			}),
+		),
+	];
+	return {
+		title: group,
+		fields,
+		footer: "↑↓ 移动 · 回车 编辑/执行 · esc 返回总览 · ctrl+s 保存",
+		detail: (f) => {
+			if (f.key === "nav.back") return "回到总览（也可以直接按 esc）。";
+			const d = getSetting(f.key);
+			return d ? fieldDetail(d) : "";
+		},
+		enter: (f) => {
+			if (f.key === "nav.back") return null;
+			const d = getSetting(f.key);
+			return d && d.kind !== "action" ? settingsItemPage(d) : undefined;
+		},
+		runAction: (f) => {
+			const d = getSetting(f.key);
+			if (d?.kind === "action") void Promise.resolve(d.set(""));
+		},
+	};
+}
+
+/** 项页：单个配置项的「大视图」（回车改值，ctrl+s 保存并留在本页） */
+export function settingsItemPage(d: SettingDef): FormPage {
+	return {
+		title: d.label,
+		footer: "回车 改 · ctrl+s 保存（留在本页）· esc 返回上一层",
+		fields: [
+			{ key: "nav.back", label: "← 返回", value: "", kind: "text", readonly: true, drill: true },
+			{
+				key: d.key,
+				label: d.label,
+				value: fieldValue(d),
+				kind: d.kind === "enum" ? "enum" : d.kind === "bool" ? "bool" : "text",
+				options: d.kind === "enum" ? d.options : undefined,
+				hint: fieldHint(d),
+			},
+		],
+		detail: (f) => (f.key === "nav.back" ? "回到上一层（也可以直接按 esc）。" : fieldDetail(d)),
+		enter: (f) => (f.key === "nav.back" ? null : undefined),
+		save: (values) => {
+			const v = parseFieldValue(d, values[d.key] ?? "");
+			if (v !== undefined) d.set(v);
+			return true; // 存完留在本页（esc 才回上一层）
+		},
+	};
+}
