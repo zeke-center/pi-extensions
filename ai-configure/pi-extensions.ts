@@ -32,16 +32,41 @@ import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
 import { isExtDisabled, setupGate } from "./gate";
 import { openSettings } from "./settings";
+import { registerPanelActions } from "./actions";
 import { healthLine, markFail, markOk } from "./health";
 
 // 供测试/诊断用：把配置面板的注册表暴露出来（面板本体在 settings.ts）
 export { settingsSnapshot } from "./settings";
 
+/** 命令名 → handler（/aihelp 面板里的「命令」组靠它执行，不用重写一套） */
+export type CommandMap = Map<string, (args: string, ctx: ExtensionContext) => void | Promise<void>>;
+
+/**
+ * 包一层 api：模块注册的命令顺便记进 map。
+ * 为什么不改各模块：命令注册点有 11 处，包一层只碰入口一个文件。
+ */
+function withCommandIndex(api: ExtensionAPI, cmds: CommandMap): ExtensionAPI {
+	return new Proxy(api, {
+		get(target, prop, recv) {
+			if (prop === "registerCommand") {
+				return (name: string, def: { handler: (args: string, ctx: ExtensionContext) => void | Promise<void> }) => {
+					cmds.set(name, (args, ctx) => def.handler(args, ctx));
+					return (target as unknown as { registerCommand: (n: string, d: unknown) => void }).registerCommand(name, def);
+				};
+			}
+			const v = Reflect.get(target, prop, recv);
+			return typeof v === "function" ? v.bind(target) : v;
+		},
+	});
+}
+
 /** 装配全部模块（默认导出就是它；另起个名字是为了测试能直接调） */
 export function setupAll(api: ExtensionAPI): void {
-	// ⚠️ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
+	// ⚠ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
 	// 顺序也重要：① gate 最前（它的 session_start 要最先跑，否则会先画一帧再隐藏）
 	//            ② panel 必须在 board 之前（widget 按注册顺序从上往下排）。
+	const cmds: CommandMap = new Map();
+	const mApi = withCommandIndex(api, cmds);
 	const parts: Array<[string, (a: ExtensionAPI) => void]> = [
 		["gate", setupGate],
 		["config", setupConfig],
@@ -52,7 +77,7 @@ export function setupAll(api: ExtensionAPI): void {
 	];
 	for (const [name, setup] of parts) {
 		try {
-			setup(api);
+			setup(mApi);
 			markOk(name);
 		} catch (e) {
 			markFail(name, e);
@@ -73,10 +98,10 @@ export function setupAll(api: ExtensionAPI): void {
 		}
 	});
 
-	// ---------- /aihelp：可视化配置面板（类 /mcp）----------
-	// 文本版帮助仍然在 /ai help（没动）——面板里也会提示这一句。
+	// ---------- /aihelp：总控制台（配置项 + 助理 + 命令）----------
+	// 面板靠 actions.ts 把各命令挂成「动作行」；命令本身照旧能用，只是不再提倡手敲。
 	api.registerCommand("aihelp", {
-		description: "图形化配置面板：所有可配置项 + 每一项是干什么用的（文本版 = /ai help）",
+		description: "总控制台：配置项 / 助理 / 命令都能在这儿点（文本版 = /ai help）",
 		handler: async (_args: string, ctx: ExtensionContext) => {
 			if (isExtDisabled()) {
 				ctx.ui.notify("扩展已停用（/ai-ext on 恢复）", "info");
@@ -85,6 +110,15 @@ export function setupAll(api: ExtensionAPI): void {
 			await openSettings(ctx);
 		},
 	});
+
+	// 动作行要调各模块的命令 handler —— 这时它们都已注册完了
+	try {
+		registerPanelActions(cmds);
+		markOk("actions");
+	} catch (e) {
+		markFail("actions", e);
+		console.error("[ai-configure] 模块 actions 加载失败：", e);
+	}
 }
 
 export default function (api: ExtensionAPI): void {

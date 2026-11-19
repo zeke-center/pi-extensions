@@ -18,9 +18,13 @@ export const HELP_TEXT = `AI configure · 全部功能
   /ai project off         关掉项目级连接
   /ai project clear       清空项目级连接
   /ai help                就是你现在看的这个（文本版说明书）
-/aihelp                   **可视化配置面板**（表单式，和 /assistants 一样）：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消
-                           标签前缀就是分组（助理·/ 会话级·），
-                           每一项都写了「这是干什么用的」，改完立即生效并写进 ai-extensions.json
+/aihelp                   ★ **总控制台**（首选入口，日常都在这儿点）：↑↓ 选行 · 回车 改/执行 · ctrl+s 保存 · esc 取消
+                           5 组：助理 / 委派 / 看板 / 会话级 / 命令
+                           · 助理：**每个助理一行**，回车直接进它的编辑面板（名字 / 何时派它 /
+                             底座 / 工作目录 / 模型 / MCP / 超时 / AGENTS.md / 存哪儿 / 正文）
+                           · ＋新建助理：选个底座一键派生（自动 extends + 预勾它的 MCP）
+                           · 看板：清空 / 位置 / 栏位；命令：/ai /agents /ai-ext … 二级选单
+                           选中哪行，下面那行就写清它是干什么用的
 /ai-ext                   会话级停用 / 恢复整个扩展（不用卸载，本会话记住）
   /ai-ext off             停用：面板收起、progress/delegate 从工具表撤下、后台回投暂停
   /ai-ext on              恢复（后台已跑完的结果会立刻补投）
@@ -31,13 +35,12 @@ export const HELP_TEXT = `AI configure · 全部功能
   /board clear            清空任务列表
   /board above | below    面板放输入框上方 / 下方
   /board right | mid      显示 / 隐藏 右栏 / 中栏
-/assistants               助理模板
+/assistants               助理模板（⚠ 改配置请走 /aihelp 的「助理」组，命令保留但不再提倡）
   /assistants show <名>   展开全部字段 + 继承链 + 提示词正文
-  /assistants edit <名>   弹面板改：底座 / MCP / 超时 / AGENTS.md / 存哪儿 / 正文
-  /assistants mcp  <名>   同上，只是光标直接落在 MCP 那行
-  /assistants new  <名> [底座]   弹同一个面板新建；给了底座就自动 extends 它
+  /assistants edit <名>   （面板里点助理那一行即可，不用敲这个）
+  /assistants mcp  <名>   （同上，面板里 MCP 那行回车）
+  /assistants new  <名> [底座]   （用面板的「＋ 新建助理」）
   /assistants open <名>   用系统默认程序打开那个 .md
-  （面板：↑↓ 选行 · 回车 改 · ctrl+s 保存 · esc 取消）
 
   （底座（base）**只读 + 只能被 extends + 不能直接派** —— 要定制就
     /assistants new <你的名字> <底座key> ；demo 的样板不能派，只当字段写法参考；

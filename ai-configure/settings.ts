@@ -36,6 +36,8 @@ export interface SettingDef {
 	min?: number;
 	max?: number;
 	unit?: string;
+	/** 行尾那句灰字（覆盖默认提示）——动作行用它显示「可派 · 通用助理」这种摘要 */
+	hint?: string;
 	/** 默认值（`r` 恢复用；面板里也有「恢复默认」这一行） */
 	def: string | number | boolean | string[];
 	/** 读当前值（内存里的 live 值，不是文件） */
@@ -80,6 +82,24 @@ export function registerSettings(defs: SettingDef[]): void {
 	}
 }
 
+/** 按前缀撤掉一批注册项（**动态行**用：助理增删后要重新生成，不然还显示旧的） */
+export function unregisterSettings(prefix: string): void {
+	for (let i = registry.length - 1; i >= 0; i--) {
+		if (registry[i]!.key.startsWith(prefix)) registry.splice(i, 1);
+	}
+}
+
+/**
+ * 打开面板前的刷新钩子。
+ *
+ * 为什么需要：面板的注册表是**启动时**填的，可助理是文件、随时会新建/改名。
+ * 不刷新的话，新建完助理还得 `/reload` 才能在面板里看见 —— 那就不叫"统一在面板里编辑"了。
+ */
+let openRefresher: (() => void) | undefined;
+export function setOpenRefresher(fn: () => void): void {
+	openRefresher = fn;
+}
+
 export function settingKeys(): string[] {
 	return registry.map((d) => d.key);
 }
@@ -114,6 +134,7 @@ export function fieldValue(d: SettingDef): string {
 
 /** 值后面那句灰字（单位 / 范围 / 会话级标记） */
 export function fieldHint(d: SettingDef): string {
+	if (d.hint) return d.hint;
 	const bits: string[] = [];
 	if (d.kind === "action") bits.push("回车直接执行");
 	else if (d.kind === "number") bits.push(`${d.min ?? "-"}~${d.max ?? "+"}${d.unit ?? ""}`);
@@ -141,7 +162,7 @@ export function fieldDetail(d: SettingDef): string {
 }
 
 /** 面板里的分组顺序（常用的在前，「会话级」这种偶尔用的压最后） */
-const GROUP_ORDER = ["助理 / 委派", "会话级（重启复位）"];
+const GROUP_ORDER = ["助理", "委派", "看板", "会话级（重启复位）", "命令"];
 
 /** 按上面的顺序排一遍（未知分组排在最后，按注册顺序稳定） */
 export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {
@@ -261,6 +282,11 @@ let lastCtxRef: ExtensionContext | undefined;
 /** 打开配置面板（表单式）。改动在 ctrl+s 那一下统一生效并写盘。 */
 export async function openSettings(ctx: ExtensionContext): Promise<void> {
 	lastCtxRef = ctx;
+	try {
+		openRefresher?.(); // 动态行（助理列表）在这里重新生成
+	} catch {
+		/* 刷新失败就用上次的，不影响打开面板 */
+	}
 	const defs = registry;
 	if (!defs.length) {
 		ctx.ui.notify("还没有注册任何配置项（插件没加载全？）", "warning");

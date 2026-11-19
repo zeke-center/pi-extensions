@@ -751,7 +751,12 @@ allOk =
 			'ok("入口：/aihelp 注册上了（面板入口）", typeof cmds.aihelp === "function");',
 			'ok("入口：/ai help 的文本版还在（showHelp 没被拆）", typeof cmds.ai === "function");',
 			"const snap = settingsSnapshot();",
-			'ok("面板：装完后注册项 = 3（board 1 + gate 1 + delegate 1）", snap.length === 3);',
+			'ok("面板：装完后注册项 ≥ 14（新建 1 + 看板 3 + 命令 7 + 设置 3）", snap.length >= 14);',
+			// 测试用的 agentDir 是空的 → 没有助理模板，但也必须至少有「＋ 新建助理」那一行
+			'ok("面板：有「助理」分组（没有模板时也有「＋ 新建助理」）", snap.filter((s) => s.group === "助理").length >= 1);',
+			'ok("面板：有「看板」分组（3 个动作行）", snap.filter((s) => s.group === "看板").length === 3);',
+			'ok("面板：有「命令」分组（7 个动作行）", snap.filter((s) => s.group === "命令").length === 7);',
+			'ok("面板：动作行是 action 类型（选中就跑，不参与保存）", snap.filter((s) => s.kind === "action").length >= 11);',
 			'ok("面板：有「助理 / 委派」分组（delegate 注册上了）", snap.some((s) => s.group.includes("助理")));',
 			'ok("面板：有「会话级」分组（board/gate 注册上了）", snap.some((s) => s.group.includes("会话级")));',
 			'ok("面板：不是空板（每一项都有说明，打开就能看）", snap.every((s) => s.desc.length >= 12));',
@@ -768,7 +773,7 @@ allOk =
 // ---------- 静态检查：删掉的功能不许留"幽灵引用" ----------
 // （踩过：hud.ts 删掉后 voice.ts 还 calling answerPlan()/cardNotify()，打包能过、一 reload 才炸）
 {
-	const files = ["board.ts", "pi-extensions.ts", "config.ts", "panel.ts", "delegate.ts", "gate.ts", "help.ts", "doctor.ts", "shared.ts", "settings.ts", "form.ts", "live.ts", "mcp-pool.ts", "rpc.ts"];
+	const files = ["board.ts", "pi-extensions.ts", "config.ts", "panel.ts", "delegate.ts", "gate.ts", "help.ts", "doctor.ts", "shared.ts", "settings.ts", "form.ts", "live.ts", "mcp-pool.ts", "rpc.ts", "actions.ts"];
 	let src = "";
 	for (const f of files) {
 		src += readFileSync(join(ext, f), "utf8");
@@ -801,6 +806,24 @@ allOk =
 	} else {
 		allOk = false;
 		console.log("FAIL  静态：面板接线不完整 → 缺:" + miss.map((m) => m[0]).join(",") + " 入口:" + entry.includes("openSettings"));
+	}
+}
+{
+	// actions.ts：面板动作行必须真的注册了 action，且执行一律走命令表（不自己重写逻辑）
+	const actSrc = readFileSync(join(ext, "actions.ts"), "utf8");
+	const checks = {
+		"注册动作行": /registerSettings\(/.test(actSrc) && /registerPanelActions\(/.test(actSrc),
+		"助理一人一行": /ASSISTANT_PREFIX/.test(actSrc) && /loadTemplates\(/.test(actSrc),
+		"打开前刷新": /setOpenRefresher\(/.test(actSrc),
+		"命令走 handler": /cmds\.get\(name\)/.test(actSrc),
+		"入口接上了": readFileSync(join(ext, "pi-extensions.ts"), "utf8").includes("registerPanelActions(cmds)"),
+	};
+	const bad = Object.entries(checks).filter(([, ok]) => !ok).map(([k]) => k);
+	if (bad.length === 0) {
+		console.log("PASS  静态：面板动作 actions.ts 完整（助理行 / 命令表 / 打开前刷新 / 入口接线）");
+	} else {
+		allOk = false;
+		console.log("FAIL  静态：actions.ts 缺 → " + bad.join(", "));
 	}
 }
 {

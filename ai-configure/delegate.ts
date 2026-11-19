@@ -2475,7 +2475,7 @@ function registerDelegateSettings(): void {
 	registerSettings([
 		{
 			key: "assistantLingerMs",
-			group: "助理 / 委派",
+			group: "委派",
 			label: "助理保鲜期",
 			desc: "后台助理（子代理）跑完之后，它的小票还在面板上留多久 —— 留一会儿你回来还能看到它干了啥。0 = 跑完立刻撤掉。",
 			kind: "number",
