@@ -43,7 +43,6 @@ const entry = process.env.PI_SMOKE_ENTRY || join(root, "ai-configure", "pi-exten
 const EXPECT = [
 	"ai",
 	"ai-ext",
-	"voice",
 	"aihelp",
 	"aidoctor",
 	"board",

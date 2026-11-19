@@ -22,10 +22,9 @@ import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
 import { onGateApply } from "./gate";
-import { cardNotify } from "./notify";
 import { registerSettings } from "./settings";
-import { guardCtx, readExtCfg, patchExtCfg } from "./shared";
-import { closePlanAsk, getPlanCfg, isBackgroundTurn, openPlanAsk } from "./shared";
+import { guardCtx } from "./shared";
+import { getPlanCfg } from "./shared";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -119,35 +118,6 @@ let charsPerToken = 2.0; // 字符→token 比值（中文约 2；首次响应�
 
 // 会话累计 token（与 pi footer 同源：遍历 session entries，缓存避免每 300ms 重算）
 let sessTok = { input: 0, output: 0, cacheRead: 0 };
-
-/** 单价（元/百万 token）—— 只用于看板估算，改这里或面板都能生效 */
-const PRICE_DEFAULT = { in: 2.0, out: 8.0, cache: 0.5 };
-function price(): { in: number; out: number; cache: number } {
-	try {
-		const c = readExtCfg();
-		const n = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : d);
-		return {
-			in: n(c.boardPriceIn, PRICE_DEFAULT.in),
-			out: n(c.boardPriceOut, PRICE_DEFAULT.out),
-			cache: n(c.boardPriceCache, PRICE_DEFAULT.cache),
-		};
-	} catch {
-		return { ...PRICE_DEFAULT };
-	}
-}
-
-/** token 用量 → 估算花费（元） */
-function costOf(input: number, output: number, cacheRead: number): number {
-	const p = price();
-	return (input / 1e6) * p.in + (output / 1e6) * p.out + (cacheRead / 1e6) * p.cache;
-}
-
-function fmtCost(yuan: number): string {
-	if (!yuan) return "";
-	if (yuan < 0.01) return "¥<0.01";
-	if (yuan < 10) return `¥${yuan.toFixed(2)}`;
-	return `¥${yuan.toFixed(1)}`;
-}
 
 // 子代理用量 —— delegate 的返回值【不含用量】，子代理的消耗记在它自己的会话文件里，
 // 主会话 footer / getSessionStats 都看不到。想算全局账只能自己扫 assistant-sessions/。
@@ -439,8 +409,7 @@ function midLines(theme: Theme): string[] {
 			` ${t.fg("muted", "本轮")} ${t.fg("text", fmtDur(turnMs()))}` +
 				t.fg("text", ` ↑${fmtTok(runTokIn)}`) +
 				t.fg("accent", ` ↓${fmtTok(runTokOut)}`) +
-				t.fg("dim", ` R${fmtTok(runTokCache)}`) +
-				t.fg("muted", ` ${fmtCost(costOf(runTokIn, runTokOut, runTokCache))}`),
+				t.fg("dim", ` R${fmtTok(runTokCache)}`),
 		);
 	}
 
@@ -449,8 +418,7 @@ function midLines(theme: Theme): string[] {
 		` ${t.fg("muted", "会话")} ${t.fg("text", fmtDur(sessionActiveMs()))}` +
 			t.fg("text", ` ↑${fmtTok(sessTok.input)}`) +
 			t.fg("accent", ` ↓${fmtTok(sessTok.output)}`) +
-			t.fg("dim", ` R${fmtTok(sessTok.cacheRead)}`) +
-			t.fg("muted", ` ${fmtCost(costOf(sessTok.input, sessTok.output, sessTok.cacheRead))}`),
+			t.fg("dim", ` R${fmtTok(sessTok.cacheRead)}`),
 	);
 
 	// ── 子代理（delegate 的账，主会话看不到，得自己扫）──
@@ -989,42 +957,6 @@ export function boardSnapshot(): {
 function registerBoardSettings(): void {
 	registerSettings([
 		{
-			key: "boardPriceIn",
-			group: "配置项（落盘）",
-			label: "输入单价（元/百万 token）",
-			desc: "用于看板估算花费，不影响实际计费。默认 2.0。",
-			kind: "number",
-			min: 0,
-			max: 1000,
-			def: PRICE_DEFAULT.in,
-			get: () => price().in,
-			set: (v) => patchExtCfg({ boardPriceIn: Number(v) || 0 }),
-		},
-		{
-			key: "boardPriceOut",
-			group: "配置项（落盘）",
-			label: "输出单价（元/百万 token）",
-			desc: "输出单价，默认 8.0 元/百万 token。",
-			kind: "number",
-			min: 0,
-			max: 1000,
-			def: PRICE_DEFAULT.out,
-			get: () => price().out,
-			set: (v) => patchExtCfg({ boardPriceOut: Number(v) || 0 }),
-		},
-		{
-			key: "boardPriceCache",
-			group: "配置项（落盘）",
-			label: "缓存读单价（元/百万 token）",
-			desc: "默认 0.5。你的缓存读占比很大，这项影响最明显。",
-			kind: "number",
-			min: 0,
-			max: 1000,
-			def: PRICE_DEFAULT.cache,
-			get: () => price().cache,
-			set: (v) => patchExtCfg({ boardPriceCache: Number(v) || 0 }),
-		},
-		{
 			key: "boardOff",
 			group: "会话级（重启复位）",
 			label: "任务面板",
@@ -1119,29 +1051,21 @@ export function setupBoard(api: ExtensionAPI): void {
 					persist();
 				};
 
-				// 计划确认：分两种情况
-				//   · **剪贴板投递来的计划**（你在后台用输入法/复制文本）→ 默认直接执行，不打扰你
-				//   · 你在终端亲手派的计划 → 照旧弹终端确认（要改就先改）
-				// 另外「粘贴一句话」和「超时兜底」两条通道仍然管用（谁先答算谁）
-				const stepTexts = pending.map((x) => x.text);
-				const bgTurn = isBackgroundTurn();
+				// 计划确认：终端亲手派的计划才弹确认（skipConfirm / 无 UI 时直接执行）
 				const pcfg = getPlanCfg();
-				const needAsk = params.skipConfirm !== true && !bgTurn && ctx?.hasUI;
+				const needAsk = params.skipConfirm !== true && ctx?.hasUI;
 				let choice: string | undefined = "✅ 按这个执行";
 				if (needAsk) {
-					// ⚠ 终端那个选择框**必须能被别人关掉**：
-					//   以前只靠 `Promise.race` 选赢家 —— 剪贴板先答了，agent 确实继续跑了，
-					//   但 `ctx.ui.select` 那个浮层**没人去关** → 一直挂在屏幕上等你按（用户实测反馈）。
-					//   pi 的 `ui.select` 支持 `signal`（原话：“AbortSignal to programmatically dismiss the dialog”）。
+					// ⚠ 终端那个选择框**必须能被关掉**：以前只靠 `Promise.race` 选赢家，
+					//   abort 会让 select 以 `undefined` 结束，可能**抢先**把真实的答复吞掉。
+					//   pi 的 `ui.select` 支持 `signal`（AbortSignal 用来程序化关掉弹窗）。
 					const termAc = new AbortController();
 					const tuiAsk = ctx.ui.select(
 						`开始执行这个方案？${pendingTitle ? `（${pendingTitle}）` : ""} · 共 ${pending.length} 步`,
 						["✅ 按这个执行", "✏️ 我要改（输入意见）", "⛔ 先别做"],
 						{ signal: termAc.signal },
 					);
-					// “谁先答算谁”——用**幂等的 pick**，不用 Promise.race。
-					// 为什么：abort 会让 select 以 `undefined` 结束，如果跑 race，这个 undefined 可能
-					// **抢先**把 race 定成“取消了”，反而把剪贴板那条真实的答复吞了。
+					// “谁先答算谁”——用**幂等的 pick**
 					let picked = false;
 					let resolveChoice!: (v: string | undefined) => void;
 					const choicePromise = new Promise<string | undefined>((r) => {
@@ -1157,18 +1081,6 @@ export function setupBoard(api: ExtensionAPI): void {
 						(v) => pick(v),
 						() => pick(undefined),
 					);
-					const pasteAsk = new Promise<string | undefined>((res) => {
-						openPlanAsk(pendingTitle, stepTexts, (a, note) => {
-							if (a === "yes") res("✅ 按这个执行");
-							else if (a === "no") res("⛔ 先别做");
-							else if (a === "edit") res(`✏️ 我要改（输入意见）${note ? `|${note}` : ""}`);
-							else res(undefined);
-						});
-					});
-					void pasteAsk.then(
-						(v) => pick(v),
-						() => pick(undefined),
-					);
 					const timeoutAsk =
 						pcfg.timeoutSec > 0
 							? new Promise<string | undefined>((res) => {
@@ -1178,96 +1090,70 @@ export function setupBoard(api: ExtensionAPI): void {
 							: undefined;
 					if (timeoutAsk) void timeoutAsk.then((v) => pick(v));
 					choice = await choicePromise;
-					const answer = !choice || choice.startsWith("⛔") ? "no" : choice.startsWith("✏️") ? "edit" : "yes";
-					closePlanAsk(); // 谁先答都要把挂起状态清掉（否则下一轮计划会被误应答）
-				} else if (bgTurn) {
-					ctx.ui.notify(`📋 剪贴板投递的计划（${pending.length} 步）→ 默认开始执行：${pendingTitle || ""}`, "info");
-				}					if (choice && choice.startsWith("✏️") && choice.includes("|")) {
-						// 粘贴通道带来的修改意见：直接当"我要改"处理（不用再弹输入框）
-						const note = choice.split("|").slice(1).join("|").trim();
-						restore();
-						return {
-							content: [
-								{
-									type: "text" as const,
-									text: note
-										? `用户**不要**这个方案，改完再重新声明。\n用户原话：\n"${note}"\n\n请根据这个意见调整，先在对话里重新给详细计划，再重新 progress(action="plan") 声明步骤。`
-										: "用户在修改输入里取消了，没有执行方案。请等用户进一步指示。",
-								},
-							],
-							details: { revised: true, note: note || null },
-							isError: true,
-						};
-					}
-					if (choice?.startsWith("✏️")) {
-						const note = (await ctx.ui.editor("想怎么改？（Esc 取消）", ""))?.trim();
-						restore();
-						return {
-							content: [
-								{
-									type: "text" as const,
-									text: note
-										? `用户**不要**这个方案，改完再重新声明。\n用户原话：\n"${note}"\n\n请根据这个意见调整，先在对话里重新给详细计划，再重新 progress(action="plan") 声明步骤。`
-										: "用户在修改输入里取消了，没有执行方案。请等用户进一步指示。",
-								},
-							],
-							details: { revised: true, note: note || null },
-							isError: true,
-						};
-					}
-
-					if (!choice || choice.startsWith("⛔")) {
-						restore();
-						return {
-							content: [
-								{
-									type: "text" as const,
-									text: "用户没有确认该方案。请先询问用户想怎么调整，不要继续执行。",
-								},
-							],
-							details: { confirmed: false },
-							isError: true,
-						};
-					}
-
-				// 计划开跑 → 弹一张**常驻**的「执行弹窗」：把要干的事完整列出来（点 X 才关）
-				{
-					const lines = pending.map((x, i) => `  ${i + 1}. ${x.text}`).join("\n");
-					const tail = bgTurn ? "（剪贴板投递 → 默认执行；点 X 关掉这张）" : "（点 X 关掉这张）";
-					cardNotify(`pi · 已按这个计划开工（${pending.length} 步）`, `${pendingTitle ? pendingTitle + "\n" : ""}${lines}\n${tail}`, 0);
 				}
-				// ✅ 到这里才算确认通过 —— 现在才提交到面板和磁盘
-				title = pendingTitle;
-				steps = pending;
-				// 声明完就开始第一步，不然面板会一直停在 0/N
-				steps[0]!.status = "doing";
-				blocker = undefined;
-				lastProgressTurn = turnNo;
-				refresh();
-				persist();
-				return {
-					content: [{ type: "text" as const, text: `方案已确认，共 ${steps.length} 步。请逐步执行并更新状态。` }],
-					details: { steps },
-				};
-			}
-
-			if (params.action === "block") {
-				blocker = params.text ?? "遇到问题";
-				lastProgressTurn = turnNo;
-				refresh();
-				persist();
-				return { content: [{ type: "text" as const, text: `已记录卡点：${blocker}` }], details: { blocker } };
-			}
-
-			if (params.action === "step") {
-				const idx = (params.index ?? 0) - 1;
-				if (idx < 0 || idx >= steps.length) {
+				if (choice?.startsWith("✏️")) {
+					const note = (await ctx.ui.editor("想怎么改？（Esc 取消）", ""))?.trim();
+					restore();
 					return {
-						content: [{ type: "text" as const, text: `步骤序号无效：${params.index}` }],
-						details: { error: "bad index" },
+						content: [
+							{
+								type: "text" as const,
+								text: note
+									? `用户**不要**这个方案，改完再重新声明。\n用户原话：\n"${note}"\n\n请根据这个意见调整，先在对话里重新给详细计划，再重新 progress(action="plan") 声明步骤。`
+									: "用户在修改输入里取消了，没有执行方案。请等用户进一步指示。",
+							},
+						],
+						details: { revised: true, note: note || null },
 						isError: true,
 					};
 				}
+
+				if (!choice || choice.startsWith("⛔")) {
+					restore();
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: "用户没有确认该方案。请先询问用户想怎么调整，不要继续执行。",
+							},
+						],
+						details: { confirmed: false },
+						isError: true,
+					};
+				}
+
+			// ✅ 到这里才算确认通过 —— 现在才提交到面板和磁盘
+			title = pendingTitle;
+			steps = pending;
+			// 声明完就开始第一步，不然面板会一直停在 0/N
+			steps[0]!.status = "doing";
+			blocker = undefined;
+			lastProgressTurn = turnNo;
+			refresh();
+			persist();
+			return {
+				content: [{ type: "text" as const, text: `方案已确认，共 ${steps.length} 步。请逐步执行并更新状态。` }],
+				details: { steps },
+			};
+		}
+
+		if (params.action === "block") {
+			blocker = params.text ?? "遇到问题";
+			lastProgressTurn = turnNo;
+			refresh();
+			persist();
+			return { content: [{ type: "text" as const, text: `已记录卡点：${blocker}` }], details: { blocker } };
+		}
+
+		if (params.action === "step") {
+			const idx = (params.index ?? 0) - 1;
+			if (idx < 0 || idx >= steps.length) {
+				return {
+					content: [{ type: "text" as const, text: `步骤序号无效：${params.index}` }],
+					details: { error: "bad index" },
+					isError: true,
+				};
+			}
 				const st = params.status ?? "doing";
 				steps[idx]!.status = st;
 				if (st === "done" && blocker) blocker = undefined;

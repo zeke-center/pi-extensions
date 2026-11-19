@@ -141,7 +141,7 @@ export function fieldDetail(d: SettingDef): string {
 }
 
 /** 面板里的分组顺序（常用的在前，「会话级」这种偶尔用的压最后） */
-const GROUP_ORDER = ["剪贴板投递", "输入框投递", "通知与弹窗", "计划确认", "助理 / 委派", "配置项（落盘）", "会话级（重启复位）"];
+const GROUP_ORDER = ["助理 / 委派", "会话级（重启复位）"];
 
 /** 按上面的顺序排一遍（未知分组排在最后，按注册顺序稳定） */
 export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {

@@ -31,12 +31,10 @@ import { setupPanel } from "./panel";
 import { setupDelegate } from "./delegate";
 import { setupDoctor } from "./doctor";
 import { isExtDisabled, setupGate } from "./gate";
-import { setupVoice } from "./voice";
 import { openSettings } from "./settings";
 import { healthLine, markFail, markOk } from "./health";
 
 // 供测试/诊断用：把配置面板的注册表暴露出来（面板本体在 settings.ts）
-export { registerVoiceSettings } from "./voice";
 export { settingsSnapshot } from "./settings";
 
 /** 装配全部模块（默认导出就是它；另起个名字是为了测试能直接调） */
@@ -50,7 +48,6 @@ export function setupAll(api: ExtensionAPI): void {
 		["panel", setupPanel],
 		["board", setupBoard],
 		["delegate", setupDelegate],
-		["voice", setupVoice],
 		["doctor", setupDoctor],
 	];
 	for (const [name, setup] of parts) {
