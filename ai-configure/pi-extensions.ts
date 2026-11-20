@@ -29,6 +29,8 @@ import { setupConfig } from "./config";
 import { setupBoard } from "./board";
 import { setupPanel } from "./panel";
 import { setupDelegate } from "./delegate";
+import { setupSuperAgent } from "./superagent";
+import { setupGitRead } from "./gitread";
 import { setupDoctor } from "./doctor";
 import { isExtDisabled, setupGate } from "./gate";
 import { openSettings } from "./settings";
@@ -73,6 +75,8 @@ export function setupAll(api: ExtensionAPI): void {
 		["panel", setupPanel],
 		["board", setupBoard],
 		["delegate", setupDelegate],
+		["superagent", setupSuperAgent],
+		["gitread", setupGitRead],
 		["doctor", setupDoctor],
 	];
 	for (const [name, setup] of parts) {

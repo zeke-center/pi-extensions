@@ -43,6 +43,24 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, type FormPage, showForm, type PickItem, pickFromList } from "./form";
+import { parseReport, reportHeadline, reportRule, readSuperAgent, superagentEnabled, type WorkerReport } from "./superagent";
+import {
+	parsePerms,
+	permSummary,
+	permDetail,
+	permissionRule,
+	FS_OPTIONS,
+	FS_KEYS,
+	EXEC_OPTIONS,
+	EXEC_KEYS,
+	NET_OPTIONS,
+	NET_KEYS,
+	toLabel,
+	fromLabel,
+	type WorkerPermissions,
+	PERM_DEFAULTS,
+	permsDeclared,
+} from "./permissions";
 import { guardCtx } from "./shared";
 import { registerSettings } from "./settings";
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
@@ -111,6 +129,10 @@ interface Template {
 	envPassthrough?: string[];
 	/** 额外环境变量（frontmatter.env，写成 K=V, K2=V2） */
 	env: Record<string, string>;
+	/** 能力权限（frontmatter 的 fs/paths/exec/cmds/net/budget） */
+	perms: WorkerPermissions;
+	/** 子模板自己写过权限吗（没写就继承父模板的） */
+	permsDeclared: boolean;
 	/** 系统提示词正文（extends 时 = 父正文 + 子正文） */
 	body: string;
 	/** 模板文件路径 */
@@ -140,6 +162,8 @@ interface RunResult {
 	windDownLog: string[];
 	/** 最终回复被模型的输出上限截断（pi 1.2.0 起 `-p` 会因此在 stderr 报警并以 1 退出） */
 	truncated: boolean;
+	/** Worker 交回来的结构化回执（没交 / Super Agent 模式关着 = undefined） */
+	report?: WorkerReport;
 	elapsedMs: number;
 	exitCode: number | null;
 	stderrTail: string;
@@ -253,6 +277,8 @@ function parseTemplate(file: string, key: string): Template | null {
 		isolateEnv: meta.isolate_env ? parseBool(meta.isolate_env, false) : undefined,
 		envPassthrough: meta.env_passthrough ? splitList(meta.env_passthrough) : undefined,
 		env: meta.env ? splitEnv(meta.env) : {},
+		perms: parsePerms(meta),
+		permsDeclared: permsDeclared(meta),
 		body: body.trim(),
 		file,
 	};
@@ -891,6 +917,8 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		// pi 1.2.0：`-p` 模式下最终回复撞到输出上限时，会打印已产出的文本、
 		// stderr 写 "Response was truncated: the model reached its output token limit."、并以退出码 1 结束。
 		truncated: /output token limit/i.test(sink.stderr),
+		// 回执只从「最终回复」里解析（partial 是半截，不能当证据）
+		report: parseReport(sink.final),
 		elapsedMs: Date.now() - started,
 		exitCode,
 		stderrTail: clampTail(sink.stderr.trim(), STDERR_LIMIT),
@@ -932,7 +960,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// ⚠️ pi 1.0.4 起 `-t/--tools` 的语义：**MCP 工具默认保留**，只有白名单里出现
 	//    `mcp__` 开头的条目时才按它过滤 MCP。所以「列了 tools 就必须逐个列出 MCP 工具」
 	//    已经是旧说法（老版本会把 MCP 一起挡掉）。
-	const denyTools = ["delegate", "progress", ...(tpl.denyTools ?? [])];
+	const denyTools = ["delegate", "progress", "git_read", ...(tpl.denyTools ?? [])];
 	// RPC 模式：stdin 保持打开，才能在到点前发 steering 催它收尾（这是本次改造的全部理由）。
 	// 旧模式 `-p --mode json` 是单向的，写完 prompt 就只能等它自己跑完或被杀。
 	const useRpc = await rpcSupported(cli);
@@ -954,7 +982,12 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// 不继承的话 pi 会走自己的默认解析（settings.defaultModel → 内置默认 → models.json 第一个），未必是你在用的。
 	const modelArg = tpl.model || opt.mainModel;
 	if (modelArg) args.push("--model", modelArg);
-	const body = [tpl.body, deadlineRule(Math.round(opt.timeoutMs / 1000), opt.resumed)]
+	const body = [
+		tpl.body,
+		deadlineRule(Math.round(opt.timeoutMs / 1000), opt.resumed),
+		reportRule(), // Super Agent 开着时要求结构化回执（关着就是空串，等于没加）
+		superagentEnabled() ? permissionRule(tpl.perms, tpl.cwd) : "", // L2：先告诉它边界，别让它靠试
+	]
 		.filter(Boolean)
 		.join("\n\n");
 	if (body) args.push("--append-system-prompt", body);
@@ -1187,9 +1220,26 @@ function renderCard(r: RunResult): string {
 	let body: string;
 
 	switch (r.outcome) {
-		case "done":
+		case "done": {
 			head = HEADS.done(name, secs);
 			body = r.text || "(空)";
+			// Super Agent：把回执变成卡片头部的一眼可见结论
+			const sa = readSuperAgent();
+			if (sa.enabled && sa.report !== "off") {
+				if (r.report) {
+					head = `【${name}】${reportHeadline(r.report, sa.report === "strict" ? "strict" : "loose")}（${secs}s）`;
+					const ev: string[] = [];
+					if (r.report.changed.length)
+						ev.push(`改了：${r.report.changed.slice(0, 5).join(", ")}${r.report.changed.length > 5 ? ` …(+${r.report.changed.length - 5})` : ""}`);
+					if (r.report.ran.length) ev.push(`跑过：${r.report.ran.slice(0, 3).join(" ｜ ")}`);
+					if (r.report.blocked.length) ev.push(`被挡：${r.report.blocked.slice(0, 3).join(", ")}`);
+					if (r.report.notes) ev.push(`说明：${r.report.notes}`);
+					if (ev.length) body = `${ev.join("\n")}\n────────────\n${body}`;
+				} else if (sa.report === "strict") {
+					head = `【${name}】⚠️ 无回执（${secs}s）`;
+					body = `（它没按格式交 <result> 回执 —— 下面内容仅供参考，别当"已完成"用）\n────────────\n${body}`;
+				}
+			}
 			if (r.truncated) {
 				body +=
 					"\n\n⚠️ 它的最终回复撞到了模型的输出上限，被**截断**了（pi 1.2.0 起 `-p` 会因此以退出码 1 结束，" +
@@ -1197,6 +1247,7 @@ function renderCard(r: RunResult): string {
 					"\" 让它接着写，或者让它分成几段输出。";
 			}
 			break;
+		}
 		case "timeout": {
 			head = HEADS.timeout(name, secs);
 			// 到点前已经叫停过（abort + 追问）的那次，结论在 r.text 里；只有硬杀才是空的 r.partial。
@@ -1275,6 +1326,7 @@ function renderCard(r: RunResult): string {
 		`代理    ${name}（${r.tpl.key}${r.tpl.model ? ` · ${r.tpl.model}` : ""}）`,
 		`目录    ${r.tpl.cwd}`,
 		`连接    ${r.tpl.mcp.length ? r.tpl.mcp.join(", ") : "(不连 MCP)"}`,
+		`权限    ${permSummary(r.tpl.perms)}`,
 		`任务    ${oneLine(r.task, 40)}`,
 		`耗时    ${secs}s`,
 		`找回    /resume-agent 里挑${file ? `，或 pi --session "${file}"` : ""}`,
@@ -1496,7 +1548,7 @@ function projectAssistantDir(cwd: string): string {
 }
 
 /** 这个模板文件是不是放在「项目级」目录里 */
-function isProjectFile(file: string, cwd: string): boolean {
+export function isProjectFile(file: string, cwd: string): boolean {
 	const norm = (s: string): string => s.replace(/\\/g, "/").toLowerCase();
 	return norm(dirname(file)).startsWith(norm(join(cwd, ".pi")));
 }
@@ -1592,6 +1644,8 @@ function buildFields(o: {
 	dispatchable: boolean;
 	dispatchNote?: string;
 	scope: string;
+	/** 能力权限（面板里 6 行） */
+	perms: WorkerPermissions;
 	/** 提示词正文原文（面板里长文本编辑，值列显示摘要） */
 	body: string;
 	keyEditable: boolean;
@@ -1602,6 +1656,7 @@ function buildFields(o: {
 	/** 可选模型（provider/id）。非空 → 「模型」变成下拉，留空仍是继承主会话 */
 	modelOptions?: string[];
 }): FormField[] {
+	const P = o.perms ?? PERM_DEFAULTS;
 	const baseKeys = o.bases.map((b) => b.key);
 	// 手写的非底座 extends 也留在选项里，不然一编辑就被悄悄改掉
 	const extendsOptions = [
@@ -1653,6 +1708,51 @@ function buildFields(o: {
 			hint: "(关掉每次省约 1500 token)",
 		},
 		{ key: "mcp", label: "MCP", value: "", kind: "mcp", hint: "(回车勾选能连什么 —— 跟工作目录无关)" },
+		{
+			key: "fs",
+			label: "文件权限",
+			value: toLabel(FS_KEYS, FS_OPTIONS, P.fs),
+			kind: "enum",
+			options: FS_OPTIONS,
+			hint: "(默认只读；要改代码就选「可写」)",
+		},
+		{
+			key: "paths",
+			label: "可写目录",
+			value: P.paths.join(", "),
+			kind: "text",
+			hint: "(逗号分隔；`${cwd}` = 工作目录。留空 = 不限，谨慎)",
+		},
+		{
+			key: "exec",
+			label: "命令档",
+			value: toLabel(EXEC_KEYS, EXEC_OPTIONS, P.exec),
+			kind: "enum",
+			options: EXEC_OPTIONS,
+			hint: "(默认禁止；「白名单」= 只允许下面那行里的命令)",
+		},
+		{
+			key: "cmds",
+			label: "命令白名单",
+			value: P.cmds.join(", "),
+			kind: "text",
+			hint: "(逗号分隔，末尾 * 表示前缀匹配：`npm test*`)",
+		},
+		{
+			key: "net",
+			label: "网络",
+			value: toLabel(NET_KEYS, NET_OPTIONS, P.net),
+			kind: "enum",
+			options: NET_OPTIONS,
+			hint: "(装依赖 / 调外部接口才需要打开)",
+		},
+		{
+			key: "budget",
+			label: "预算",
+			value: P.budget ?? "",
+			kind: "text",
+			hint: "(如 `120k/10m`；留空 = 不限制，只做声明)",
+		},
 		{
 			key: "dispatchable",
 			label: "可派发",
@@ -1728,6 +1828,13 @@ async function commitForm(
 		mcp: (v.mcp ?? "").trim(),
 		demo: (v.dispatchable ?? "是") === "是" ? undefined : "true",
 		extends: (v.extends ?? "").trim() && (v.extends ?? "").trim() !== BASE_NONE ? (v.extends ?? "").trim() : undefined,
+		// 权限六项：面板里显示的是中文标签，落盘要转回真实值
+		fs: fromLabel(FS_KEYS, FS_OPTIONS, v.fs ?? "") || undefined,
+		paths: (v.paths ?? "").trim() || undefined,
+		exec: fromLabel(EXEC_KEYS, EXEC_OPTIONS, v.exec ?? "") || undefined,
+		cmds: (v.cmds ?? "").trim() || undefined,
+		net: fromLabel(NET_KEYS, NET_OPTIONS, v.net ?? "") || undefined,
+		budget: (v.budget ?? "").trim() || undefined,
 	};
 
 	// MCP 名字在三个来源里都找不到 → 问一声。
@@ -1836,6 +1943,19 @@ const ASSISTANT_FIELD_DOC: Record<string, string> = {
 	timeout: "超时：这个助理最长跑多久（`10m` / `90s` / `1.5h`，留空 = 5 分钟）。\n超时会被中止，结果标成 timeout。",
 	agents_md: "带 AGENTS.md：开 = 把全局/项目 AGENTS.md 塞进它的上下文（约 +1500 token/次）。\n关掉能省钱，但它就不知道项目规矩了。",
 	mcp: "MCP：这个助理能连哪些服务（回车勾选）。**跟工作目录无关**，是按需给的。\n不勾 = 一个都不连，只能用本地文件工具。",
+	fs: "**文件权限**：只读 = 一个文件都改不了（查数据、看服务器这类就用它）；可写 = 能改，但只限下面「可写目录」里。",
+	paths:
+		"**可写目录**：逗号分隔，相对工作目录（`${cwd}` = 工作目录本身）。留空 = 哪都能写，谨慎。\n" +
+		"插件源码、`~/.pi/agent`、`.git` 永久只读，写在这儿会被拒。",
+	exec:
+		"**命令档**：禁止 = 不给 bash（最安全）；白名单 = 只能跑下面列的命令；不限 = 等于给 shell。\n" +
+		"日常改代码选「白名单」，把 `npm test*` `npx tsc*` `git status*` 加进去就够。",
+	cmds:
+		"**命令白名单**：逗号分隔，末尾 `*` 表示前缀匹配（`npm test*` 能匹配 `npm test -- --run`）。\n" +
+		"白名单为空 = 等于不能执行。",
+	net: "**网络**：装依赖、调外部接口才需要开。关着时联网工具不会给它，MCP 也不会挂网络类服务。",
+	budget:
+		"**预算**：`120k/10m` = 12 万 token / 10 分钟。只做声明（写在提示词里让它自己控节奏），暂不强制中断；留空 = 不限制。",
 	dispatchable: "可派发：关掉 = 只当样板看，不能真的派活。\n底座自动是「否」；示例模板也建议关。",
 	scope: "存哪儿：全局 = `~/.pi/agent/assistants/`（所有项目都能用）；\n项目 = 当前项目的 `.pi/assistants/`（只在这个项目里出现）。",
 	body:
@@ -1847,6 +1967,7 @@ const ASSISTANT_FIELD_DOC: Record<string, string> = {
  * 抽出来是为了让 `/aihelp` 的面板能**在同一个框里翻到这一页**（不再弹新面板）。
  */
 export function assistantFormParts(
+	ctx: ExtensionContext,
 	cwd: string,
 	tpl: Template,
 	modelOptions: string[] = [],
@@ -1867,12 +1988,13 @@ export function assistantFormParts(
 		keyEditable: false,
 		extendsKey: tpl.extends ?? "",
 		bases: availableBases(cwd).map((b) => ({ key: b.key, name: b.name })),
+		perms: tpl.perms,
 		modelOptions,
 	});
 	return {
 		fields,
 		mcp: mcpItems(pool, tpl.mcp),
-		commit: (r) => commitForm({ form: r, cwd, original: tpl }),
+		commit: (r) => commitForm(ctx, { form: r, cwd, original: tpl }),
 	};
 }
 
@@ -1880,14 +2002,68 @@ export function assistantFormParts(
  * 面板里「助理」那一行回车 → 这一页（同一个框内翻页）。
  * 底座只读：页里所有字段 readonly，右栏直接说明为什么不能改。
  */
+/**
+ * 把全局助理「另存为本项目副本」：写到 `<cwd>/.pi/assistants/<key>.md`，cwd 改成项目根。
+ *
+ * 为什么需要：助理分全局/项目两级（项目级同名会覆盖全局）。改了全局的 general，
+ * **所有项目一起变** —— 而多数时候你只想改当前项目（尤其工作目录不一样）。
+ * 有了这个动作就能"就地派生一份"，全局那份原样不动。
+ */
+function copyToProject(ctx: ExtensionContext, cwd: string, tpl: Template): void {
+	const dest = join(cwd, ".pi", "assistants", `${tpl.key}.md`);
+	if (existsSync(dest)) {
+		ctx.ui.notify(
+			`本项目已经有「${tpl.key}」了：${dest}\n\n想改它：在面板里把「保存到」选成「项目级」再改。`,
+			"info",
+		);
+		return;
+	}
+	try {
+		writeTemplate(
+			dest,
+			{
+				name: tpl.name,
+				desc: tpl.desc,
+				cwd,
+				model: tpl.model ?? "",
+				timeout: tpl.timeoutMs ? `${Math.round(tpl.timeoutMs / 60000)}m` : "",
+				mcp: tpl.mcp.length ? tpl.mcp.join(", ") : "",
+				extends: tpl.extends ?? "",
+				agents_md: tpl.agentsMd === false ? "false" : "",
+				demo: tpl.demo === true ? "true" : "",
+				// 权限一起带过来（不然副本会退回"只读 + 不执行"的默认值）
+				fs: tpl.perms.fs,
+				// 原项目写死的绝对路径 → 改成 ${cwd}，副本才会跟着当前项目走
+				paths: tpl.perms.paths.map((p) => (p === tpl.cwd ? "${cwd}" : p)).join(", "),
+				exec: tpl.perms.exec,
+				cmds: tpl.perms.cmds.join(", "),
+				net: tpl.perms.net,
+				budget: tpl.perms.budget ?? "",
+			},
+			tpl.body,
+		);
+		ctx.ui.notify(
+			`✓ 已复制到本项目：${dest}\n\n全局那份没动。重新打开面板就能看到「本项目」的它（项目级会覆盖同名的全局）。`,
+			"info",
+		);
+	} catch (e) {
+		ctx.ui.notify(`✗ 复制失败：${e instanceof Error ? e.message : String(e)}`, "error");
+	}
+}
+
 export function assistantFormPage(ctx: ExtensionContext, cwd: string, key: string): FormPage | undefined {
 	const tpl = findTemplate(cwd, key);
 	if (!tpl) return undefined;
-	const parts = assistantFormParts(cwd, tpl, modelChoices(ctx));
+	const parts = assistantFormParts(ctx, cwd, tpl, modelChoices(ctx));
 	const readonly = tpl.base === true;
+	const isGlobal = !isProjectFile(tpl.file, cwd);
 	const fields: FormField[] = [
 		{ key: "nav.back", label: "← 返回助理列表", value: "", kind: "text", readonly: true, drill: true },
 		...parts.fields.map((f) => ({ ...f, readonly: readonly || f.readonly })),
+		// 全局助理才给这个动作：想只改本项目就派生一份（全局那份不动）
+		...(isGlobal && !readonly
+			? [{ key: "dup.project", label: "另存为本项目副本", value: "→ 复制一份到 .pi/assistants/", kind: "action" as const }]
+			: []),
 	];
 	return {
 		title: tpl.name,
@@ -1896,6 +2072,13 @@ export function assistantFormPage(ctx: ExtensionContext, cwd: string, key: strin
 		footer: readonly ? "这是底座（只读）· esc 返回上一层" : "回车 改 · ctrl+s 保存（退回列表）· esc 返回上一层",
 		detail: (f) => {
 			if (f.key === "nav.back") return "回到助理列表（也可以直接按 esc）。\n\n本页所有改动都要按 ctrl+s 才落盘。";
+			if (f.key === "dup.project")
+				return (
+					"把**当前这个全局助理**复制一份到本项目的 `.pi/assistants/`，并把工作目录改成当前项目。\n\n" +
+					"为什么：助理分全局/项目两级，**项目级同名覆盖全局**。直接改全局那份 → 所有项目一起变；"+L+
+					"派生一份本项目副本之后，改它只影响这个项目，全局那份原样不动。"+L+L+
+					"复制完重新打开面板就能看到（列表里标「项目」）。"
+				);
 
 			const doc = ASSISTANT_FIELD_DOC[f.key] ?? `${f.label}：${f.value}`;
 			// 长文本（描述 / 正文）：右栏直接给出前几行，不开编辑器也能看个大概
@@ -1909,6 +2092,10 @@ export function assistantFormPage(ctx: ExtensionContext, cwd: string, key: strin
 			return doc;
 		},
 		enter: (f) => (f.key === "nav.back" ? null : undefined),
+		runAction: (f) => {
+			if (f.key !== "dup.project") return;
+			copyToProject(ctx, cwd, tpl);
+		},
 		save: (values) => {
 			if (readonly) {
 				ctx.ui.notify(`「${tpl.key}」是底座（只读）：要定制请用「＋ 新建助理」派生一个。`, "warning");
@@ -1942,7 +2129,7 @@ async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, f
 		return;
 	}
 
-	const parts = assistantFormParts(cwd, tpl, modelChoices(ctx));
+	const parts = assistantFormParts(ctx, cwd, tpl, modelChoices(ctx));
 	if (!parts) return;
 	const r = await showForm(ctx, `${tpl.name} · 配置`, parts.fields, parts.mcp, focusKey);
 	if (!r) {
@@ -1976,6 +2163,7 @@ export function assistantNewPage(ctx: ExtensionContext, cwd: string, baseKey?: s
 		keyEditable: true,
 		extendsKey,
 		bases: bases.map((b) => ({ key: b.key, name: b.name })),
+		perms: baseTpl?.perms ?? PERM_DEFAULTS,
 		modelOptions: modelChoices(ctx),
 	});
 	const fields: FormField[] = [
@@ -2041,6 +2229,7 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string, bas
 		keyEditable: true,
 		extendsKey,
 		bases: bases.map((b) => ({ key: b.key, name: b.name })),
+		perms: baseTpl?.perms ?? PERM_DEFAULTS,
 		modelOptions: modelChoices(ctx),
 	});
 	const r = await showForm(

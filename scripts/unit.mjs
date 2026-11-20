@@ -657,6 +657,59 @@ allOk =
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-shared") },
 	) && allOk;
 
+// ---------- 套件：superagent（Worker 回执解析） ----------
+bundle("superagent.ts", "superagent.mjs");
+allOk =
+	runSuite(
+		"superagent：<result> 回执解析（正常 / 夹在正文 / 无 / 坏 JSON）",
+		join(tmp, "superagent.mjs"),
+		[
+			`const r1 = parseReport('干完 <result>{"ok":true,"verdict":"pass","changed":["a.ts"],"ran":["npm test → 3 passed"],"notes":"好了"}</result>');`,
+			`ok("回执：正常块解析出 pass", r1 && r1.verdict === "pass" && r1.changed.length === 1 && r1.ran.length === 1);`,
+			`ok("回执：notes 原样带出", r1 && r1.notes === "好了");`,
+			`const r2 = parseReport('说明<result>{"ok":true,"verdict":"pass","changed":[],"ran":[]}</result>完');`,
+			`ok("回执：夹在正文中间也能抓到", r2 && r2.verdict === "pass");`,
+			`ok("回执：没有回执 → undefined（别瞎猜）", parseReport("一段话，没有回执") === undefined);`,
+			`const r3 = parseReport('<result>{"ok":false,"verdict":"fail","changed":[],"ran":[],"notes":"依赖缺"}</result>');`,
+			`ok("回执：fail 不被当成 pass", r3 && r3.verdict === "fail" && r3.ok === false);`,
+			`const r4 = parseReport("<result>{ok:true, verdict:'pass', changed:[], ran:['pytest'],}</result>");`,
+			`ok("回执：坏 JSON（单引号/尾逗号）也能救回来", r4 && r4.verdict === "pass" && r4.ran.length === 1);`,
+			`ok("回执：多个块取最后一个", parseReport('<result>{"verdict":"fail"}</result>x<result>{"verdict":"pass","ran":["x"]}</result>').verdict === "pass");`,
+			`ok("回执：pass 但没跑命令 → 严格模式标证据不足", reportHeadline({ ok: true, verdict: "pass", changed: [], ran: [], blocked: [], notes: "" }, "strict").includes("无命令证据"));`,
+			`ok("回执：宽松模式不标证据", reportHeadline({ ok: true, verdict: "pass", changed: [], ran: [], blocked: [], notes: "" }, "loose").includes("无命令证据") === false);`,
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-superagent") },
+	) && allOk;
+
+// ---------- 套件：permissions（Worker 权限：解析 / 摘要 / 声明） ----------
+bundle("permissions.ts", "permissions.mjs");
+allOk =
+	runSuite(
+		"permissions：解析 / 摘要 / 注入声明",
+		join(tmp, "permissions.mjs"),
+		[
+			'const p1 = parsePerms({ fs: "write", paths: "src/, tests/", exec: "safe", cmds: "npm test*, npx tsc*", net: "allow", budget: "120k/10m" });',
+			'ok("解析：六项都读出来了", p1.fs === "write" && p1.paths.length === 2 && p1.exec === "safe" && p1.cmds.length === 2 && p1.net === "allow" && p1.budget === "120k/10m");',
+			'const p2 = parsePerms({});',
+			'ok("解析：什么都没写 → 安全默认（只读/不执行/无网）", p2.fs === "read" && p2.exec === "none" && p2.net === "none" && p2.paths.length === 0);',
+			'const p3 = parsePerms({ fs: "WRITE", exec: "随便", net: "yes" });',
+			'ok("解析：大小写能认", p3.fs === "write");',
+			'ok("解析：写错的值回默认（不猜）", p3.exec === "none" && p3.net === "none");',
+			'ok("摘要：只读 + 不执行 + 无网", permSummary(p2).includes("只读") && permSummary(p2).includes("不执行") && permSummary(p2).includes("无网"));',
+			'ok("摘要：可写目录数 + 白名单条数", permSummary(p1).includes("2 个目录") && permSummary(p1).includes("白名单 2 条"));',
+			'const rule = permissionRule(p2, "F:/proj");',
+			'ok("声明：写明只读且不许尝试写", rule.includes("只读") && rule.includes("不要尝试写"));',
+			'ok("声明：明确越界不会成功、不要绕过", rule.includes("越界不会成功") && rule.includes("不要"));',
+			'ok("声明：给了替代方案（找派你的人）", rule.includes("让派你的人决定"));',
+			'ok("声明：safe 档把白名单列出来", permissionRule(p1, "F:/proj").includes("npm test*"));',
+			'ok("预设：dev 能写能跑能联网", PERM_PRESETS.dev.fs === "write" && PERM_PRESETS.dev.exec === "safe" && PERM_PRESETS.dev.net === "allow");',
+			'ok("预设：reader 只读不跑", PERM_PRESETS.reader.fs === "read" && PERM_PRESETS.reader.exec === "none");',
+			'ok("声明判定：写了任意一项就算显式", permsDeclared({ fs: "read" }) === true && permsDeclared({}) === false);',
+			'ok("枚举互转：中文 ↔ 真实值", fromLabel(FS_KEYS, FS_OPTIONS, toLabel(FS_KEYS, FS_OPTIONS, "write")) === "write");',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-perms") },
+	) && allOk;
+
 // ---------- 套件：settings（/aihelp 面板通用渲染器：注册项 / 读写往返 / 夹范围） ----------
 // 面板是通用渲染器，配置项由各模块自己注册 —— 这里**自己塞一组合成项**，
 // 这样不管哪天又删了哪个模块，面板本身的读写/夹范围/解析都still有覆盖。
@@ -874,6 +927,8 @@ allOk =
 		"三页构建": ["settingsHomePage", "settingsGroupPage", "settingsItemPage"].every((n) => setSrc.includes(`function ${n}`)),
 		"助理页复用": /assistantFormPage/.test(readFileSync(join(ext, "delegate.ts"), "utf8")),
 		"入口不关面板": /runAction/.test(formSrc) && !/return openSettings\(ctx\)/.test(setSrc),
+		// 回归：assistantFormParts 的 commit 必须带 ctx（漏了会是 "Cannot read properties of undefined (reading 'form'）"
+		"助理页保存带ctx": !/commit: \(r\) => commitForm\(\{ form/.test(readFileSync(join(ext, "delegate.ts"), "utf8")),
 	};
 	const bad = Object.entries(checks).filter(([, ok]) => !ok).map(([k]) => k);
 	if (bad.length === 0) {

@@ -13,7 +13,7 @@
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pickFromList } from "./form";
-import { assistantFormPage, assistantNewPage, loadTemplates } from "./delegate";
+import { assistantFormPage, assistantNewPage, isProjectFile, loadTemplates } from "./delegate";
 import type { CommandMap } from "./pi-extensions";
 import { registerSettings, setOpenRefresher, settingsCtx, unregisterSettings, type SettingDef } from "./settings";
 
@@ -145,7 +145,9 @@ function assistantRows(): SettingDef[] {
 			},
 		);
 		// 行上显示「可派 · 简述」，比只显示 key 好认
-		row.hint = `${bits.join(" · ")}${brief ? ` · ${brief}` : ""}`;
+		// 来源徽标：一眼看出改它会影响所有项目（全局）还是只影响这个项目
+		const from = isProjectFile(t.file, cwd) ? "本项目" : "全局";
+		row.hint = `${from} · ${bits.join(" · ")}${brief ? ` · ${brief}` : ""}`;
 		// 面板里回车直接翻进这一页（同一个框，esc 返回），不另开面板
 		row.page = () => {
 			const c = settingsCtx();

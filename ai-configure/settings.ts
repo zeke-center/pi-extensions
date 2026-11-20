@@ -174,7 +174,7 @@ export function fieldDetail(d: SettingDef): string {
 }
 
 /** 面板里的分组顺序（常用的在前，「会话级」这种偶尔用的压最后） */
-const GROUP_ORDER = ["助理", "委派", "看板", "会话级（重启复位）"];
+const GROUP_ORDER = ["助理", "Super Agent", "委派", "看板", "会话级（重启复位）"];
 
 /** 按上面的顺序排一遍（未知分组排在最后，按注册顺序稳定） */
 export function orderedDefs(defs: SettingDef[] = registry): SettingDef[] {
@@ -339,6 +339,7 @@ export function setupSettings(_api: ExtensionAPI): void {}
 /** 每组的「这一组是干什么的」—— 首页右栏用 */
 const GROUP_BLURB: Record<string, string> = {
 	助理: "每个助理一行。回车进去能看到它的角色、继承的底座、挂的 MCP、超时和提示词正文，改完 ctrl+s 直接落盘。",
+	"Super Agent": "Router / Worker 双层模式的总开关（现在只记状态，行为逐项接上）：主会话负责对话与验收，助理各自独立上下文执行、干完交证据。",
 	委派: "派活的公共偏好，和具体哪个助理无关。",
 	看板: "任务看板的动作：清空计划、面板贴上方还是下方、右栏/中栏要不要显示。",
 	"会话级（重启复位）": "只在本会话有效：重启 pi 自动复位，不写进配置文件。",
