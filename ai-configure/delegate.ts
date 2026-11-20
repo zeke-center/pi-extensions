@@ -67,7 +67,7 @@ import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEn
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { isExtDisabled, onGateApply } from "./gate";
-import { assistantSessionRoot, buildShadow, ensureCatalog, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
+import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -1370,7 +1370,7 @@ function makeDelegateParams(hint: string) {
 				]),
 				{
 					description:
-						"多件互不依赖的事，并行跑，总耗时≈最慢那件。有依赖就分开派。给了就不用给 task。元素可以是字符串（用外层 assistant），也可以是 { assistant, task } —— 跨领域并行（如改代码 + 查库）时每件自带助理。",
+						"多件互不依赖的事，并行跑，总耗时≈最慢那件。有依赖就分开派。给了就不用给 task。元素可以是字符串（用外层 assistant），也可以是 { assistant, task } —— 跨领域并行（如改代码 + 查库）时每件自带助理。长时间任务请用 wait:false 异步派，避免主会话被阻塞。",
 				},
 			),
 		),
@@ -3065,6 +3065,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 					// 每次派发一个独立影子目录：同一个助理并发派发不再互相覆盖 mcp.json
 					runSuffix: Math.random().toString(36).slice(2, 8),
 				});
+				// L3 兜底：把守卫放进影子目录（**只在 Super Agent 模式开着时**；关着 = 保持老的全权限行为）。
+				// 装失败也不拦派活（fail-open）：没装成 = 退回老行为，比把活卡死好。
+				if (superagentEnabled()) {
+					installGuard(shadow.dir, { perms: tpl.perms, cwd: tpl.cwd, pluginDir: EXT_DIR });
+				}
 				// 关键配置没写成功 → 直接拒绝启动（否则可能挂着错的 MCP 还假装在干活）
 				if (shadow.errors.length) {
 					return {

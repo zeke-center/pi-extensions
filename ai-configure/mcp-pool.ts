@@ -19,7 +19,9 @@
  *   <cwd>/.pi/mcp.json            项目级（/ai 拉的线上连接会落到这里）
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { WorkerPermissions } from "./permissions";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 /** 一个 MCP server 的原始定义（直接透传 pi 的格式） */
@@ -201,6 +203,67 @@ export function buildShadow(
 	}
 
 	return { dir, names: Object.keys(chosen), missing, errors };
+}
+
+/**
+ * L3 兜底接线：把守卫装进影子目录（**只复制，不软链** —— 软链等于把源文件交给 Worker 改）。
+ *
+ * 写进去四样东西：
+ *   <影子>/permissions.json      这个 Worker 的权限（guard 运行时读）
+ *   <影子>/guard-config.json     { cwd, pluginDir, protectedPaths }
+ *   <影子>/extensions/guard-entry.ts + perm-guard.ts   （pi 会自动发现 extensions/*.ts）
+ *
+ * 只在 Super Agent 模式开着时调用；关着就什么都不做（保持老的全权限行为）。
+ * 返回写失败原因（非空也不致命：守卫缺失 = 退回老行为，别把派活搞挂）。
+ */
+export function installGuard(
+	dir: string,
+	opts: { perms: WorkerPermissions; cwd: string; pluginDir?: string; protectedPaths?: string[] },
+): string[] {
+	const errors: string[] = [];
+	const here = dirname(fileURLToPath(import.meta.url));
+	// 守卫源码从**插件源码目录**拿（delegate 传进来的 EXT_DIR）；没传就按本文件位置推
+	const srcDir = opts.pluginDir ?? here;
+	try {
+		writeFileSync(join(dir, "permissions.json"), `${JSON.stringify(opts.perms, null, 2)}\n`, "utf8");
+		writeFileSync(
+			join(dir, "guard-config.json"),
+			`${JSON.stringify(
+				{ cwd: opts.cwd, pluginDir: srcDir, protectedPaths: opts.protectedPaths ?? [] },
+				null,
+				2,
+			)}\n`,
+			"utf8",
+		);
+	} catch (e) {
+		errors.push(`guard 配置写入失败：${e instanceof Error ? e.message : String(e)}`);
+		return errors;
+	}
+
+	const extDir = join(dir, "extensions");
+	try {
+		mkdirSync(extDir, { recursive: true });
+		// ⚠️ perm-guard.ts 放进 **子目录**：pi 会把 `extensions/*.ts` 逐个当扩展加载，
+		//    纯函数模块没有默认导出 → 直接放平会报「does not export a valid factory function」把 Worker 打死。
+		//    自动发现只认 `extensions/*.ts` 和 `extensions/*/index.ts`，`extensions/guard/perm-guard.ts` 正好躲开。
+		const guardDir = join(extDir, "guard");
+		mkdirSync(guardDir, { recursive: true });
+		const plan: [string, string][] = [
+			["guard-entry.ts", join(extDir, "guard-entry.ts")],
+			["perm-guard.ts", join(guardDir, "perm-guard.ts")],
+		];
+		for (const [from, to] of plan) {
+			const src = join(srcDir, from);
+			if (!existsSync(src)) {
+				errors.push(`守卫源码缺失：${src}`);
+				continue;
+			}
+			copyFileSync(src, to);
+		}
+	} catch (e) {
+		errors.push(`守卫复制失败：${e instanceof Error ? e.message : String(e)}`);
+	}
+	return errors;
 }
 
 /** 助理会话根目录：刻意**不在** sessions/ 下，这样 pi 自带的 /resume 看不见助理会话 */

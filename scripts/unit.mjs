@@ -710,6 +710,53 @@ allOk =
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-perms") },
 	) && allOk;
 
+// ---------- 套件：perm-guard（L3 兜底守卫：protected / fs / exec / net） ----------
+// 这一层是「真到落盘/执行那一刻再判一次」的保险丝，它自己必须是纯函数（不吃环境、不写文件）。
+bundle("perm-guard.ts", "perm-guard.mjs");
+allOk =
+	runSuite(
+		"perm-guard：守卫判定（硬保护 / 可写范围 / 白名单 / 不误伤）",
+		join(tmp, "perm-guard.mjs"),
+		[
+			`const GC = ${JSON.stringify(join(tmp, "guard-cwd"))};`,
+			'const HOME = process.env.USERPROFILE || process.env.HOME || "/tmp";',
+			'const O = { cwd: GC, protectedPaths: [] };',
+			'const reader = { fs: "read", paths: [], exec: "none", cmds: [], net: "none" };',
+			'const writer = { fs: "write", paths: ["${cwd}"], exec: "safe", cmds: ["npm test*"], net: "none" };',
+			'const r1 = decideToolCall(reader, O, "write", { path: "a.txt", content: "x" });',
+			'ok("fs=read 写文件 → block kind=fs", r1.block === true && r1.kind === "fs" && !r1.logOnly);',
+			'ok("拒绝文案：EPERM[kind] + 策略性 + 给替代方案", r1.reason.startsWith("EPERM[fs]") && r1.reason.includes("策略性拒绝") && r1.reason.includes("可继续的动作"));',
+			'const r2 = decideToolCall(writer, O, "edit", { path: HOME + "/.pi/agent/extensions/x.ts", edits: [] });',
+			'ok("写 ~/.pi/agent/extensions/x.ts → block kind=protected", r2.block === true && r2.kind === "protected");',
+			'const r3 = decideToolCall(writer, O, "write", { path: ".git/config", content: "x" });',
+			'ok("写 .git/config → block kind=protected", r3.block === true && r3.kind === "protected");',
+			'const r3b = decideToolCall(writer, O, "write", { path: GC + "/.git/config", content: "x" });',
+			'ok("写 <cwd>/.git/config（绝对路径）→ 也拦", r3b.block === true && r3b.kind === "protected");',
+			'const r4 = decideToolCall(writer, O, "write", { path: GC + "/src/a.ts", content: "x" });',
+			'ok("fs=write + paths=[${cwd}] 写 <cwd>/src/a.ts → 放行", r4.block === false);',
+			'const r5 = decideToolCall(writer, O, "write", { path: "../outside.txt", content: "x" });',
+			'ok("fs=write 写 ../outside.txt → block", r5.block === true && r5.kind === "fs");',
+			'const r5b = decideToolCall({ ...writer, paths: ["src/"] }, O, "write", { path: "README.md", content: "x" });',
+			'ok("paths=[src/] 写 <cwd>/README.md → block", r5b.block === true && r5b.kind === "fs");',
+			'const r6 = decideToolCall(reader, O, "bash", { command: "ls" });',
+			'ok("exec=none + bash → block kind=exec（硬拦）", r6.block === true && r6.kind === "exec" && !r6.logOnly);',
+			'const r7 = decideToolCall(writer, O, "bash", { command: "npm test -- --run" });',
+			'ok("exec=safe + `npm test -- --run`（cmds 含 npm test*）→ 放行", r7.block === false);',
+			'const r8 = decideToolCall(writer, O, "bash", { command: "rm -rf /" });',
+			'ok("exec=safe + `rm -rf /` → logOnly=true（先只记录，不硬拦）", r8.block === true && r8.kind === "exec" && r8.logOnly === true);',
+			'ok("cmdMatches：末尾 * = 前缀；无 * = 整条命令（可带参数）", cmdMatches("npm test*", "npm test -- --run") && cmdMatches("git status", "git status -s") && !cmdMatches("git status", "gitk"));',
+			'const r9 = decideToolCall(reader, O, "write", { whatever: 1 });',
+			'ok("参数是奇怪结构（没路径）→ 不 block（不误伤）", r9.block === false);',
+			'const r10 = decideToolCall(reader, O, "mcp__weird__tool", null);',
+			'ok("不认识的工具/空参数 → 不 block", r10.block === false);',
+			'const r11 = decideToolCall(reader, O, "web_fetch", { url: "https://x" });',
+			'ok("net=none + web_fetch → logOnly（只记录）", r11.block === true && r11.kind === "net" && r11.logOnly === true);',
+			'const r12 = decideToolCall(reader, { cwd: GC, protectedPaths: ["${cwd}/plug"] }, "write", { path: GC + "/plug/x.ts", content: "x" });',
+			'ok("调用方传的 protectedPaths（插件源码目录）也算硬保护", r12.block === true && r12.kind === "protected");',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-guard") },
+	) && allOk;
+
 // ---------- 套件：settings（/aihelp 面板通用渲染器：注册项 / 读写往返 / 夹范围） ----------
 // 面板是通用渲染器，配置项由各模块自己注册 —— 这里**自己塞一组合成项**，
 // 这样不管哪天又删了哪个模块，面板本身的读写/夹范围/解析都still有覆盖。
