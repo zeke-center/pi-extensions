@@ -182,6 +182,27 @@ export function reportRule(): string {
 	].join("\n");
 }
 
+// ======================= Router 操作协议（system prompt 段） =======================
+
+/**
+ * 给 Router（主会话）的**静态规则**：写进 system prompt 的 `<superagent-router>` 段。
+ *
+ * ⚠️ 和看板的 `<task-board>` 段同理：段内容必须稳定，pi 会把段的变化当 transcript delta
+ *    追加进上下文。所以这里只放永远不变的规则，别塞任何随状态变化的东西。
+ */
+const ROUTER_PROTOCOL = `【你是 Router】
+- 你有 delegate；任何『执行』需求（跑命令 / 改文件 / 提交代码 / 查库）都派 Worker 去做。
+- **不要**向用户索要权限、不要请用户代劳。
+- 例外（必须停下问人）：① 要改插件源码 / 配置文件 / 助理权限本身 ② 不可逆操作（push、删除、发布）③ 需要人做取舍。
+- 派活前先看助理的权限摘要（卡片『权限』那行）：不够就换人，或明确说出『缺哪一条权限』。
+- 派活前**先按各助理 desc 挑专才**：数据库 → db，服务器 → server，前端 → frontend，后端 → backend。\`general\` 只用于没有专才对口的杂活。
+- **不要把数据库/服务器/前端/后端这类明确领域的活派给 general。**`;
+
+/** 给 Router 的协议段（模式关 → 空串，等于什么都不加） */
+export function routerProtocol(): string {
+	return superagentEnabled() ? ROUTER_PROTOCOL : "";
+}
+
 /** 从 Worker 的最终回复里抓回执（容忍 ``` 包裹、前后废话、坏 JSON） */
 export function parseReport(text: string): WorkerReport | undefined {
 	if (!text) return undefined;
@@ -515,6 +536,18 @@ export function setupSuperAgent(api: ExtensionAPI): void {
 		toolsSnapshot = undefined;
 		applyRouterTools();
 		refreshSuperAgentStatus();
+	});
+	// ---------- 提示词注入：只有模式开着才写 <superagent-router> 段 ----------
+	api.on("before_agent_start", async (event) => {
+		const rules = routerProtocol();
+		if (rules) {
+			if (event.systemPromptOptions.sections["superagent-router"] !== rules) {
+				event.systemPromptOptions.sections["superagent-router"] = rules;
+			}
+		} else if (event.systemPromptOptions.sections["superagent-router"]) {
+			// 模式在本会话里被关掉：把段摘掉，别留旧规则误导模型
+			delete event.systemPromptOptions.sections["superagent-router"];
+		}
 	});
 	setTimeout(() => {
 		refreshSuperAgentStatus();

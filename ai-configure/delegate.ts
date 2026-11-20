@@ -1356,12 +1356,23 @@ function assistantHint(cwd: string): string {
 
 function makeDelegateParams(hint: string) {
 	return Type.Object({
-		assistant: Type.String({ description: `助理模板名。${hint || "当前**没有**可派发的助理（都是 base / 示例模板），先用 /assistants 看看。"}` }),
+		assistant: Type.Optional(
+			Type.String({
+				description: `助理模板名。${hint || "当前**没有**可派发的助理（都是 base / 示例模板），先用 /assistants 看看。"} tasks 的每一项也可以自带 assistant 覆盖这里。`,
+			}),
+		),
 		task: Type.Optional(Type.String({ description: "一件事。写清目标 + 验收标准，别写「分析一下」这种模糊指令。" })),
 		tasks: Type.Optional(
-			Type.Array(Type.String(), {
-				description: "多件互不依赖的事，并行跑，总耗时≈最慢那件。有依赖就分开派。给了就不用给 task。",
-			}),
+			Type.Array(
+				Type.Union([
+					Type.String(),
+					Type.Object({ assistant: Type.Optional(Type.String()), task: Type.String() }),
+				]),
+				{
+					description:
+						"多件互不依赖的事，并行跑，总耗时≈最慢那件。有依赖就分开派。给了就不用给 task。元素可以是字符串（用外层 assistant），也可以是 { assistant, task } —— 跨领域并行（如改代码 + 查库）时每件自带助理。",
+				},
+			),
 		),
 		resume: Type.Optional(Type.String({ description: "续跑：填上次卡片里的「会话ID」，它会接着做而不是重做。只能配一个 task。" })),
 		timeoutMs: Type.Optional(
@@ -2929,7 +2940,14 @@ export function setupDelegate(api: ExtensionAPI): void {
 
 		async execute(
 			_toolCallId: string,
-			params: { assistant: string; task?: string; tasks?: string[]; resume?: string; timeoutMs?: number; wait?: boolean },
+			params: {
+				assistant?: string;
+				task?: string;
+				tasks?: (string | { assistant?: string; task: string })[];
+				resume?: string;
+				timeoutMs?: number;
+				wait?: boolean;
+			},
 			signal: AbortSignal,
 			_onUpdate: unknown,
 			ctx: ExtensionContext,
@@ -2945,134 +2963,167 @@ export function setupDelegate(api: ExtensionAPI): void {
 			const wait = params.wait ?? (readDelegateMode() === "sync");
 			const cwd = ctx.cwd ?? process.cwd();
 			const templates = loadTemplates(cwd);
-			const tpl = templates.find((t) => t.key === params.assistant || t.name === params.assistant);
-
-			if (!tpl) {
-				const can = templates.filter((t) => t.base !== true && t.demo !== true);
-				const have = can.length
-					? `可派的有：${can.map((t) => `${t.key}(${t.name})`).join(", ")}`
-					: `可是现在**一个能派的都没有**（只有 base 和示例模板，用 /assistants 看）`;
-				return {
-					content: [{ type: "text" as const, text: `找不到助理「${params.assistant}」。${have}` }],
-					details: { ok: false, reason: "template_not_found" },
-				};
-			}
-
-			// demo:true 是「示例模板」—— 只是拿来示范字段写法的，能看不能派
-			if (tpl.demo === true) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text:
-								`「${tpl.name}」是示例模板（demo: true），不能派。` +
-								`它只是给你看字段怎么写法的 —— 想去掉限制就把它 frontmatter 里的 demo 那行删了。`,
-						},
-					],
-					details: { ok: false, reason: "template_is_demo" },
-				};
-			}
-
-			// base:true 是「基础模板」，只给 extends 用，不能直接派
-			if (tpl.base === true) {
-				const kids = templates.filter((t) => t.extends === tpl.key).map((t) => t.key);
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text:
-								`「${tpl.name}」是基础模板（base: true），不能直接派。` +
-								(kids.length ? `请派继承了它的：${kids.join(", ")}` : `目前没有模板继承它，要去改它的子模板。`),
-						},
-					],
-					details: { ok: false, reason: "template_is_base" },
-				};
-			}
-
-			if (!existsSync(tpl.cwd)) {
-				return {
-					content: [{ type: "text" as const, text: `助理「${tpl.name}」的工作目录不存在：${tpl.cwd}` }],
-					details: { ok: false, reason: "cwd_not_found" },
-				};
-			}
-
-			// （旧代码在这里「白名单没列 mcp__ 工具 → 直接拒绝」，已删除：
-			//  pi 1.0.4 起 `-t/--tools` 默认**保留 MCP 工具**，只有白名单里出现 mcp__ 开头的
-			//  条目时才按它过滤 MCP —— 所以不列 mcp__ 工具不再会让 MCP 静默不可用，
-			//  那条拦截成了误报，会把正常模板挡在门外。）
-
 			const resumeId = params.resume?.trim() || undefined;
-			let list = (params.tasks ?? (params.task ? [params.task] : []))
-				.map((s) => String(s).trim())
-				.filter((s) => s.length > 0);
-			if (resumeId) list = list.slice(0, 1); // 续跑只能配一件
-			if (!list.length) {
+
+			// 任务列表：每项解析成 { assistant, task }
+			//   · 字符串        → 用外层 assistant
+			//   · {assistant,task} → 用自带的（没写才回落到外层）
+			const outer = params.assistant?.trim() || "";
+			const rawTasks = params.tasks ?? (params.task ? [params.task] : []);
+			let wants: { assistant: string; task: string }[] = rawTasks
+				.map((t) =>
+					t && typeof t === "object"
+						? { assistant: String(t.assistant ?? "").trim() || outer, task: String(t.task ?? "").trim() }
+						: { assistant: outer, task: String(t).trim() },
+				)
+				.filter((w) => w.task.length > 0);
+			if (resumeId) wants = wants.slice(0, 1); // 续跑只能配一件
+			if (!wants.length) {
 				return {
 					content: [{ type: "text" as const, text: "没给任务。用 task（一件）或 tasks（多件并行）。" }],
 					details: { ok: false, reason: "no_task" },
 				};
 			}
+			if (wants.some((w) => !w.assistant)) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								"没给助理。用 assistant（模板名）指定，或者在 tasks 的每一项里写 assistant。\n" +
+								"例：delegate(tasks=[{assistant:\"db\", task:\"查库\"}, {assistant:\"backend\", task:\"改接口\"}])",
+						},
+					],
+					details: { ok: false, reason: "no_assistant" },
+				};
+			}
 
+			// 每个助理一份模板 + 一份影子目录（同一助理派多件共用；跨助理各走各的 MCP 隔离）
+			const ready = new Map<string, { tpl: Template; shadow: ShadowResult }>();
+			for (const name of [...new Set(wants.map((w) => w.assistant))]) {
+				const tpl = templates.find((t) => t.key === name || t.name === name);
+
+				if (!tpl) {
+					const can = templates.filter((t) => t.base !== true && t.demo !== true);
+					const have = can.length
+						? `可派的有：${can.map((t) => `${t.key}(${t.name})`).join(", ")}`
+						: `可是现在**一个能派的都没有**（只有 base 和示例模板，用 /assistants 看）`;
+					return {
+						content: [{ type: "text" as const, text: `找不到助理「${name}」。${have}` }],
+						details: { ok: false, reason: "template_not_found" },
+					};
+				}
+
+				// demo:true 是「示例模板」—— 只是拿来示范字段写法的，能看不能派
+				if (tpl.demo === true) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									`「${tpl.name}」是示例模板（demo: true），不能派。` +
+									`它只是给你看字段怎么写法的 —— 想去掉限制就把它 frontmatter 里的 demo 那行删了。`,
+							},
+						],
+						details: { ok: false, reason: "template_is_demo" },
+					};
+				}
+
+				// base:true 是「基础模板」，只给 extends 用，不能直接派
+				if (tpl.base === true) {
+					const kids = templates.filter((t) => t.extends === tpl.key).map((t) => t.key);
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									`「${tpl.name}」是基础模板（base: true），不能直接派。` +
+									(kids.length ? `请派继承了它的：${kids.join(", ")}` : `目前没有模板继承它，要去改它的子模板。`),
+							},
+						],
+						details: { ok: false, reason: "template_is_base" },
+					};
+				}
+
+				if (!existsSync(tpl.cwd)) {
+					return {
+						content: [{ type: "text" as const, text: `助理「${tpl.name}」的工作目录不存在：${tpl.cwd}` }],
+						details: { ok: false, reason: "cwd_not_found" },
+					};
+				}
+
+				// （旧代码在这里「白名单没列 mcp__ 工具 → 直接拒绝」，已删除：
+				//  pi 1.0.4 起 `-t/--tools` 默认**保留 MCP 工具**，只有白名单里出现 mcp__ 开头的
+				//  条目时才按它过滤 MCP —— 所以不列 mcp__ 工具不再会让 MCP 静默不可用，
+				//  那条拦截成了误报，会把正常模板挡在门外。）
+
+				// 建影子 agentDir：只放进本模板声明的那些 MCP（真正的「按需给」）
+				const pool = loadMcpPool(tpl.cwd);
+				const shadow = buildShadow(tpl.key, tpl.mcp, pool, {
+					agentsMd: tpl.agentsMd !== false,
+					exposure: tpl.mcpExposure,
+					// 每次派发一个独立影子目录：同一个助理并发派发不再互相覆盖 mcp.json
+					runSuffix: Math.random().toString(36).slice(2, 8),
+				});
+				// 关键配置没写成功 → 直接拒绝启动（否则可能挂着错的 MCP 还假装在干活）
+				if (shadow.errors.length) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									`「${tpl.name}」的隔离配置没建成功，已拒绝启动：\n  ${shadow.errors.join("\n  ")}\n\n` +
+									`影子目录：${shadow.dir}\n` +
+									`检查那个目录能不能写（磁盘满 / 权限 / 杀软占用）。`,
+							},
+						],
+						details: { ok: false, reason: "shadow_build_failed", errors: shadow.errors },
+					};
+				}
+				// 要的 MCP 一个都找不到 → 直接拒绝。
+				// 为什么不只 warn：一个连不上库的「数据库助理」会假装在干活、给你编结果，
+				// 这比直接失败更吓人。此处还没进 Promise.all(runAssistant)，子进程一个都不会起。
+				if (shadow.missing.length) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									`「${tpl.name}」要的 MCP 找不到定义：${shadow.missing.join(", ")}\n` +
+									` 实际挂上：${shadow.names.join(", ") || "(一个都没有)"}\n` +
+									` 候选池里只有：${Object.keys(pool.servers).join(", ") || "(空)"}\n\n` +
+									`三个来源（同名后者覆盖）：\n` +
+									`  候选池    ${localCatalogPath()}\n` +
+									`  用户级    ${join(getAgentDir(), "mcp.json")}\n` +
+									`  项目级    ${join(tpl.cwd, ".pi", "mcp.json")}\n\n` +
+									`补法：把定义写进候选池（它不会被主会话自动加载，只当助理候选），` +
+									`或者 /assistants edit ${tpl.key} 改挂一个池子里已有的。`,
+							},
+						],
+						details: { ok: false, reason: "mcp_not_found", missing: shadow.missing },
+					};
+				}
+
+				ready.set(name, { tpl, shadow });
+			}
+			const plan = wants.map((w) => ({ ...w, ...ready.get(w.assistant)! }));
+
+			// 超时/默认值沿用第一个任务的模板（单助理派发时和以前完全一致）
 			const raw =
-				params.timeoutMs && params.timeoutMs > 0 ? params.timeoutMs : (tpl.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+				params.timeoutMs && params.timeoutMs > 0 ? params.timeoutMs : (plan[0].tpl.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 			const total = Math.min(Math.max(raw, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS);
 			const main = mainName(ctx);
 			rememberCurrentSession(ctx); // 刷新本会话身份（异步回投靠它认领）
-			const running = `${list.length > 1 ? `×${list.length} ` : ""}`;
-			// 建影子 agentDir：只放进本模板声明的那些 MCP（真正的「按需给」）
-			const pool = loadMcpPool(tpl.cwd);
-			const shadow = buildShadow(tpl.key, tpl.mcp, pool, {
-				agentsMd: tpl.agentsMd !== false,
-				exposure: tpl.mcpExposure,
-				// 每次派发一个独立影子目录：同一个助理并发派发不再互相覆盖 mcp.json
-				runSuffix: Math.random().toString(36).slice(2, 8),
-			});
-			// 关键配置没写成功 → 直接拒绝启动（否则可能挂着错的 MCP 还假装在干活）
-			if (shadow.errors.length) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text:
-								`「${tpl.name}」的隔离配置没建成功，已拒绝启动：\n  ${shadow.errors.join("\n  ")}\n\n` +
-								`影子目录：${shadow.dir}\n` +
-								`检查那个目录能不能写（磁盘满 / 权限 / 杀软占用）。`,
-						},
-					],
-					details: { ok: false, reason: "shadow_build_failed", errors: shadow.errors },
-				};
-			}
-			// 要的 MCP 一个都找不到 → 直接拒绝。
-			// 为什么不只 warn：一个连不上库的「数据库助理」会假装在干活、给你编结果，
-			// 这比直接失败更吓人。此处还没进 Promise.all(runAssistant)，子进程一个都不会起。
-			if (shadow.missing.length) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text:
-								`「${tpl.name}」要的 MCP 找不到定义：${shadow.missing.join(", ")}\n` +
-								` 实际挂上：${shadow.names.join(", ") || "(一个都没有)"}\n` +
-								` 候选池里只有：${Object.keys(pool.servers).join(", ") || "(空)"}\n\n` +
-								`三个来源（同名后者覆盖）：\n` +
-								`  候选池    ${localCatalogPath()}\n` +
-								`  用户级    ${join(getAgentDir(), "mcp.json")}\n` +
-								`  项目级    ${join(tpl.cwd, ".pi", "mcp.json")}\n\n` +
-								`补法：把定义写进候选池（它不会被主会话自动加载，只当助理候选），` +
-								`或者 /assistants edit ${tpl.key} 改挂一个池子里已有的。`,
-						},
-					],
-					details: { ok: false, reason: "mcp_not_found", missing: shadow.missing },
-				};
-			}
+			const running = `${plan.length > 1 ? `×${plan.length} ` : ""}`;
+			// 一个助理就显示它的名字；跨助理并列显示，别只报第一个（不然会误以为只派了一个）
+			const label = [...new Set(plan.map((p) => p.tpl.name))].join(" + ");
 
 			if (ctx.hasUI) {
-				ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", `📤 ${tpl.name} ${running}干活中…`));
+				ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", `📤 ${label} ${running}干活中…`));
 			}
 			// 清掉上一轮的旧账，面板上只留这一批
 			beginRun();
 			ensureAgentPanel(ctx);
-
 			// 主会话当前模型：给助理做「默认继承」（模板里的 model 仍优先）
 			const mainModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 
@@ -3080,17 +3131,17 @@ export function setupDelegate(api: ExtensionAPI): void {
 			if (wait) {
 				try {
 					results = await Promise.all(
-						list.map((task) => {
-							const seq = resumeId ? 0 : nextSeq(tpl.key);
-							const names = buildNames(main, tpl, seq, resumeId);
-							return runAssistant(tpl, task, {
+						plan.map(({ tpl: one, shadow: shadowOf, task }) => {
+							const seq = resumeId ? 0 : nextSeq(one.key);
+							const names = buildNames(main, one, seq, resumeId);
+							return runAssistant(one, task, {
 								timeoutMs: total,
 								signal,
 								names,
 								resumed: Boolean(resumeId),
 								mainModel,
-								shadowDir: shadow.dir,
-								sessionDir: ensureAssistantSessionDir(tpl.key),
+								shadowDir: shadowOf.dir,
+								sessionDir: ensureAssistantSessionDir(one.key),
 							});
 						}),
 					);
@@ -3103,31 +3154,31 @@ export function setupDelegate(api: ExtensionAPI): void {
 				// 异步：派完就走，登记后台任务；子进程后台跑，完成由轮询回投（见 pollBgTasks）
 				if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 				const ids: string[] = [];
-				for (const task of list) {
-					const seq = resumeId ? 0 : nextSeq(tpl.key);
-					const names = buildNames(main, tpl, seq, resumeId);
+				for (const { tpl: one, shadow: shadowOf, task } of plan) {
+					const seq = resumeId ? 0 : nextSeq(one.key);
+					const names = buildNames(main, one, seq, resumeId);
 					// bg 文件名加随机后缀：中文 key 会被 sanitize 掉，两个助理同一秒派发会撞 id、互相覆盖 .bg 文件
 					const bgId = `${names.id}-${Math.random().toString(36).slice(2, 8)}`;
 					ids.push(names.id);
 					writeBgTask({
-						id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
+						id: bgId, key: one.key, name: one.name, task, sessionId: names.id,
 						startedAt: Date.now(), status: "running",
 						ownerSessionFile: currentSessionFile,
 						ownerSessionId: currentSessionId,
 						// 2 分钟余量：收尾/追问/写盘都要时间，别卡在边界上误判
 						deadlineAt: Date.now() + total + 2 * 60 * 1000,
 					});
-					void runAssistant(tpl, task, {
+					void runAssistant(one, task, {
 						timeoutMs: total,
 						// 不传 signal：不随本轮 turn 结束被 abort
 						names,
 						resumed: Boolean(resumeId),
 						mainModel,
-						shadowDir: shadow.dir,
-						sessionDir: ensureAssistantSessionDir(tpl.key),
+						shadowDir: shadowOf.dir,
+						sessionDir: ensureAssistantSessionDir(one.key),
 						onSettle: (r) => {
 							const prev = readBgTask(bgId) ?? {
-								id: bgId, key: tpl.key, name: tpl.name, task, sessionId: names.id,
+								id: bgId, key: one.key, name: one.name, task, sessionId: names.id,
 								startedAt: Date.now(), status: "running" as const,
 								ownerSessionFile: currentSessionFile,
 								ownerSessionId: currentSessionId,
@@ -3148,7 +3199,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 						{
 							type: "text" as const,
 							text:
-								`已派发 ${list.length} 个任务给「${tpl.name}」（后台跑，完成后自动回投主会话）：\n` +
+								`已派发 ${plan.length} 个任务给「${label}」（后台跑，完成后自动回投主会话）：\n` +
 								ids.map((id) => `  · 会话ID ${id}`).join("\n") +
 								`\n\n中途想切同步/异步：/delegate-mode async | sync`,
 						},

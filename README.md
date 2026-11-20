@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.3.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.3.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
