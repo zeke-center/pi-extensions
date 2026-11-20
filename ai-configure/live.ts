@@ -27,10 +27,20 @@ export interface LiveLine {
 	segs: Seg[];
 }
 
-export type JobStatus = "running" | "done" | "failed" | "timeout";
+/**
+ * `queued` = 小票已建、但还没拿到并发槽位（就是排队）。
+ * 为什么要有它：以前是「拿到槽位才建小票」，排队中的任务在面板上**完全看不见**，
+ * 用户以为派出去的活丢了。现在先建小票再排队，排队期间就显示「⏳ 排队中」。
+ */
+export type JobStatus = "running" | "queued" | "done" | "failed" | "timeout";
 
-/** 终态（markEnd 只接受这几个，杜绝把 "running" 传进去） */
-export type EndStatus = Exclude<JobStatus, "running">;
+/** 终态（markEnd 只接受这几个，杜绝把 "running" / "queued" 传进去） */
+export type EndStatus = Exclude<JobStatus, "running" | "queued">;
+
+/** 还占着面板的（run/排队）—— prune / beginRun / 面板计时都按它判，别各写一份 */
+export function isActiveStatus(s: JobStatus): boolean {
+	return s === "running" || s === "queued";
+}
 /** 一次工具调用（含正在跑的那一次）。 */
 export interface ToolRun {
 	id: string;
@@ -127,9 +137,9 @@ export function liveJobs(): readonly LiveJob[] {
 	return jobs;
 }
 
-/** 有没有还在跑的。 */
+/** 有没有还在跑（含排队）的。 */
 export function hasRunningJob(): boolean {
-	return jobs.some((j) => j.status === "running");
+	return jobs.some((j) => isActiveStatus(j.status));
 }
 
 /** 收进一个 job（runAssistant 起进程前调）。 */
@@ -144,7 +154,8 @@ export function addJob(job: LiveJob): void {
  */
 export function beginRun(): void {
 	for (let i = jobs.length - 1; i >= 0; i--) {
-		if (jobs[i].status !== "running") jobs.splice(i, 1);
+		// 排队中的也要留着 —— 否则下一次派活会把还没起跑的活从面板上抹掉
+		if (!isActiveStatus(jobs[i].status)) jobs.splice(i, 1);
 	}
 	notifyLive();
 }
@@ -181,7 +192,7 @@ export function pruneFinishedJobs(now: number = Date.now()): number {
 	let removed = 0;
 	for (let i = jobs.length - 1; i >= 0; i--) {
 		const j = jobs[i]!;
-		if (j.status === "running") continue;
+		if (isActiveStatus(j.status)) continue; // 排队中也在「活着」，不能被保鲜期摘掉
 		// endedAt 没有就退回 lastEventAt（反正是终态，不会再有新事件）
 		const ended = j.endedAt ?? j.lastEventAt;
 		if (now - ended < lingerMs) continue;
@@ -198,7 +209,7 @@ function schedulePrune(): void {
 	if (pruneTimer) return;
 	let wait = Number.POSITIVE_INFINITY;
 	for (const j of jobs) {
-		if (j.status === "running") continue;
+		if (isActiveStatus(j.status)) continue;
 		const ended = j.endedAt ?? j.lastEventAt;
 		wait = Math.min(wait, ended + lingerMs - Date.now());
 	}
@@ -342,6 +353,8 @@ export function newJob(init: {
 	task: string;
 	sessionId: string;
 	startedAt?: number;
+	/** 默认 running；要排队时传 queued（拿到槽位后再改回 running） */
+	status?: JobStatus;
 }): LiveJob {
 	const now = init.startedAt ?? Date.now();
 	return {
@@ -350,7 +363,7 @@ export function newJob(init: {
 		taskBrief: oneLine(init.task, 120),
 		sessionId: init.sessionId,
 		startedAt: now,
-		status: "running",
+		status: init.status ?? "running",
 		tools: [],
 		text: "",
 		thinking: "",
@@ -526,6 +539,8 @@ export const STALE_MS = 25_000;
 
 function statusIcon(job: LiveJob): { text: string; tone: Tone } {
 	switch (job.status) {
+		case "queued":
+			return { text: "⏳", tone: "warn" };
 		case "done":
 			return { text: "✓", tone: "ok" };
 		case "failed":
@@ -598,14 +613,18 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const { width, now, detail } = opts;
 	const out: LiveLine[] = [];
 	const icon = statusIcon(job);
-	const elapsed = fmtDur((job.status === "running" ? now : job.lastEventAt) - job.startedAt);
+	const elapsed = fmtDur((isActiveStatus(job.status) ? now : job.lastEventAt) - job.startedAt);
 	const quiet = now - job.lastEventAt;
 
 	const head: Seg[] = [
 		{ text: `${icon.text} `, tone: icon.tone },
 		{ text: oneLine(job.name, Math.max(6, width - 10)), tone: "bold" },
 	];
-	if (job.status === "running") {
+	if (job.status === "queued") {
+		// 排队中：没有事件可看，所以不报「无动静」；时间算的是「已等多久」
+		head.push({ text: `  已等 ${elapsed}`, tone: "muted" });
+		head.push({ text: "  排队中", tone: icon.tone });
+	} else if (job.status === "running") {
 		head.push({ text: `  ${elapsed}`, tone: "muted" });
 		if (quiet > STALE_MS) head.push({ text: `  ⚠ ${fmtDur(quiet)}无动静`, tone: "warn" });
 	} else {

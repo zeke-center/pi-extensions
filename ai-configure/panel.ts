@@ -20,6 +20,7 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { type Component, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	clearJobs,
+	isActiveStatus,
 	liveJobs,
 	onLiveChange,
 	plainLines,
@@ -181,7 +182,10 @@ export class AgentPanel implements Component {
 		}
 
 		const running = jobs.filter((j) => j.status === "running").length;
-		const title = `🤖 子代理  ${running ? `${running} 个在跑` : `${jobs.length} 个已结束`}`;
+		const queued = jobs.filter((j) => j.status === "queued").length;
+		const title = `🤖 子代理  ${
+			running + queued ? `${running} 个在跑${queued ? ` · ${queued} 排队` : ""}` : `${jobs.length} 个已结束`
+		}`;
 		const bar = "─".repeat(Math.max(1, inner - visibleWidth(title) - 1));
 
 		const body = renderJobs(jobs, {
@@ -303,6 +307,7 @@ class WidgetPanel implements Component {
 		}
 
 		const running = jobs.filter((j) => j.status === "running").length;
+		const queued = jobs.filter((j) => j.status === "queued").length;
 		// 分栏轮播：超过 COLS 个时每 4 秒换一批（窗口起点用 now 算，渲染保持纯函数）
 		const COLS = 3;
 		const win = jobs.length > COLS ? Math.floor(now / 4000) % (jobs.length - COLS + 1) : 0;
@@ -311,7 +316,10 @@ class WidgetPanel implements Component {
 		const head =
 			this.theme.fg("accent", this.theme.bold("▛ 子代理")) +
 			" " +
-			this.theme.fg("muted", (running ? `${running} 个在跑` : `${jobs.length} 个已结束`) + extra);
+			this.theme.fg(
+				"muted",
+				(running + queued ? `${running} 个在跑${queued ? ` · ${queued} 排队` : ""}` : `${jobs.length} 个已结束`) + extra,
+			);
 		const lines = renderJobsColumns(shown, {
 			width: inner,
 			now,
@@ -354,7 +362,7 @@ export function setupPanel(api: ExtensionAPI): void {
 			widgetTimer = setInterval(() => {
 				try {
 					if (!visible) return;
-					if (!liveJobs().some((j) => j.status === "running")) return;
+					if (!liveJobs().some((j) => isActiveStatus(j.status))) return;
 					widgetTui?.requestRender();
 				} catch {
 					/* 吞掉 */
@@ -457,7 +465,7 @@ export function autoClosePanel(ctx: ExtensionContext, ms = 45_000): void {
 	autoCloseTimer = setTimeout(() => {
 		autoCloseTimer = undefined;
 		try {
-			if (liveJobs().some((j) => j.status === "running")) return;
+			if (liveJobs().some((j) => isActiveStatus(j.status))) return;
 			closeAgentPanel({ user: false });
 		} catch {
 			// 定时器里抛异常没人接 —— 自己吃掉

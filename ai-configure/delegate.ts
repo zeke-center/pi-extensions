@@ -63,7 +63,7 @@ import {
 } from "./permissions";
 import { guardCtx } from "./shared";
 import { registerSettings } from "./settings";
-import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, setLingerMs, type EndStatus, type LiveJob } from "./live";
+import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, notifyLive, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { isExtDisabled, onGateApply } from "./gate";
@@ -944,13 +944,38 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		return Promise.resolve(base("failed", null));
 	}
 
-	// 并发上限：超出的先排队（防一次派太多打爆机器 / 额度）
-	await acquireRunSlot();
-
-	// 实时视图：从 spawn 起，子进程每个 JSON 事件都会同时喂给它（面板据此实时画）
-	const job = newJob({ key: tpl.key, name: tpl.name, task, sessionId: opt.names.id, startedAt: started });
+	// 实时视图：**先建小票，再拿槽位**。
+	// 旧顺序是先 await 槽位再建小票 —— 排队的任务在面板上完全看不见，用户以为派出去的活丢了。
+	// 现在排队期间小票就挂在面板上（status=queued → 渲染成「⏳ 排队中」）。
+	// 注意：槽位已满的判断只是「预判」（用于决定小票初始状态），真正的计量在 acquireRunSlot() 里。
+	const willQueue = activeRuns >= MAX_CONCURRENT_RUNS;
+	const job = newJob({
+		key: tpl.key,
+		name: tpl.name,
+		task,
+		sessionId: opt.names.id,
+		startedAt: started,
+		status: willQueue ? "queued" : "running",
+	});
 	sink.live = job;
 	addJob(job);
+
+	// 并发上限：超出的先排队（防一次派太多打爆机器 / 额度）
+	await acquireRunSlot();
+	if (job.status !== "running") {
+		// 拿到槽位 → 正式起跑（面板从「⏳ 排队中」变成「● 在跑」）
+		job.status = "running";
+		job.lastEventAt = Date.now();
+		notifyLive();
+	}
+	// 排队期间可能已被中止（用户停掉 / 主会话退出）：拿到槽位也别再起进程 ——
+	// 但小票要收尾（否则面板上永远是「在跑」），槽位也要立即归还。
+	if (opt.signal?.aborted) {
+		markEnd(job, "failed", "排队期间被中止，未启动");
+		releaseSessionLock(opt.names.id);
+		releaseRunSlot();
+		return base("failed", null);
+	}
 
 	// -xt：助理不需要面板工具（影子目录下本来也没有 ai-configure，这里是双保险）
 	// 工具控制：
@@ -996,6 +1021,20 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		let timedOut = false;
 		let settled = false;
 
+		// ---------- 槽位释放：单次兜底 ----------
+		// 为什么要提前到「子进程退出的那一刻」：回执解析 / 落盘 / 面板收尾都占时间，
+		// 以前这些干完才 release，实测每个任务之间白空 ~3.7s（4 个槽位等于只跑 3 个）。
+		// ⚠️ released 必须是单次的：异常 / 超时 / 手动中断三条路径都可能重复走到释放，
+		//    重复 release 会把 activeRuns 减亏，以后就永远只剩 3 个槽。
+		let released = false;
+		const releaseSlot = (): void => {
+			if (released) return;
+			released = true;
+			releaseRunSlot();
+		};
+		/** kill 发出后等不到 close 的兜底（宁可信错，也绝不泄漏槽位） */
+		let escapeTimer: ReturnType<typeof setTimeout> | undefined;
+
 		// ---------- 到点前优雅收尾（RPC 专属状态）----------
 		let softTimer: ReturnType<typeof setTimeout> | undefined;
 		let hardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1024,8 +1063,10 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 				`${sink.stderr}\n[spawn 失败] ${e instanceof Error ? e.message : String(e)}`,
 				STDERR_LIMIT,
 			);
+			// 起不来的话小票也必须收尾 —— 否则面板上永远挂着一个假的「在跑/排队中」
+			markEnd(job, "failed", "子进程启动失败");
 			releaseSessionLock(opt.names.id);
-			releaseRunSlot();
+			releaseSlot();
 			done(base("failed", null));
 			return;
 		}
@@ -1077,6 +1118,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			if (softTimer) clearTimeout(softTimer);
 			if (hardTimer) clearTimeout(hardTimer);
 			if (wrapUpTimer) clearTimeout(wrapUpTimer);
+			if (escapeTimer) clearTimeout(escapeTimer);
 			opt.signal?.removeEventListener("abort", onAbort);
 			liveJobs.delete(child);
 			// 面板终态：写在这里而不是事件里 —— agent_end 不代表进程结束（可能还会重试/续跑）
@@ -1094,19 +1136,36 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			);
 			const r = base(outcome, exitCode);
 			releaseSessionLock(opt.names.id);
-			releaseRunSlot();
+			releaseSlot(); // 兜底：正常路径在 close/exit 里已经释放过，这里保证「无论如何都释放」
 			opt.onSettle?.(r);
 			done(r);
+		};
+
+		/**
+		 * kill 之后的逃生门：正常情况 close/exit 会先把槽位还回来；
+		 * 万一 kill 了却等不到 close（子进程卡死 / 平台差异），8 秒后自己收尾。
+		 * **宁可写一张失败卡，也绝不泄漏槽位**（漏一个 = 以后永远只剩 3 个并发）。
+		 */
+		const armEscape = (outcome: Outcome): void => {
+			if (escapeTimer || settled) return;
+			escapeTimer = setTimeout(() => {
+				escapeTimer = undefined;
+				finish(outcome, null);
+			}, ESCAPE_RELEASE_MS);
+			// 纯兜底定时器，不该拖着进程不让退
+			escapeTimer.unref?.();
 		};
 
 		const timer = setTimeout(() => {
 			timedOut = true;
 			killTree(child); // 到点就杀，绝不留孤儿；要接着做靠 resume 续跑
+			armEscape("timeout");
 		}, opt.timeoutMs);
 
 		const onAbort = (): void => {
 			timedOut = false;
 			killTree(child);
+			armEscape("failed");
 		};
 		opt.signal?.addEventListener("abort", onAbort);
 
@@ -1154,7 +1213,11 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			sink.stderr = clampTail(`${sink.stderr}\n[spawn 失败] ${e.message}`, STDERR_LIMIT);
 			finish("failed", null);
 		});
+		// 子进程一退出就还槽位（不等回执解析 / 落盘 / 面板收尾那一段）
+		// close 与 exit 谁先到就谁还；releaseSlot 是单次的，重复调无害
+		child.on("exit", releaseSlot);
 		child.on("close", (code) => {
+			releaseSlot();
 			if (settled) return;
 			if (opt.signal?.aborted) {
 				finish("failed", code);
@@ -1193,6 +1256,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		} catch (e) {
 			sink.stderr = clampTail(`${sink.stderr}\n[写入任务失败] ${e instanceof Error ? e.message : e}`, STDERR_LIMIT);
 			killTree(child);
+			armEscape("failed");
 		}
 	});
 }
@@ -2807,6 +2871,8 @@ function reapStaleLocks(): void {
 // ======================= 并发上限（信号量）=======================
 /** 同时最多跑几个助理（超出的排队）。防一次 tasks 派太多把机器/额度打爆。 */
 const MAX_CONCURRENT_RUNS = 4;
+/** kill 发出后等不到 close 的兕底时长：宁可报失败，也绝不泄漏槽位 */
+const ESCAPE_RELEASE_MS = 8_000;
 let activeRuns = 0;
 const runSlotWaiters: Array<() => void> = [];
 

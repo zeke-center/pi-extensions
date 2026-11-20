@@ -2,6 +2,15 @@
 name: 通用助理
 desc: 只做杂活：查资料、读代码、跑命令、做小改动。数据库找 db、服务器找 server、前端找 frontend、后端找 backend —— 有专才就别派我。
 timeout: 10m
+# 权限（Super Agent 模式生效）
+#   fs/paths —— 只能写自己项目目录（${cwd}）；~/.pi/agent、.git、插件源码一律硬保护
+#   exec any —— dev 角色要跑 build/commit/push，命令白名单对 node/powershell 等于没限；
+#              与其给假的安全感，不如靠 guard 记日志（exec 硬拦开关 execHardBlock，默认关）
+#   net allow —— 要跑 curl / 拉依赖排障
+fs: write
+paths: ${cwd}
+exec: any
+net: allow
 ---
 你是主进程派来的临时助理。规矩：
 

@@ -51,10 +51,14 @@ export default function (pi: ExtensionAPI) {
 		? cfg.protectedPaths.filter((x): x is string => typeof x === "string" && x.trim() !== "")
 		: [];
 	const pluginDir = str(cfg.pluginDir);
+	// exec 硬拦开关：默认 false（保持现状，只记 WOULD_BLOCK）；
+	// 要真拦就在 guard-config.json 里写 `"execHardBlock": true`。
+	const execHardBlock = cfg.execHardBlock === true;
 	const opts = {
 		cwd: str(cfg.cwd) || process.cwd(),
 		// 插件源码目录 = 硬保护（Worker 改不到「改自己的守卫」）
 		protectedPaths: pluginDir ? [pluginDir, ...extra] : extra,
+		execHardBlock,
 	};
 	const logFile = join(root, "guard.log");
 

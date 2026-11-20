@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.4.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.4.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -878,6 +878,26 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `isolate_env` | | `true` = **环境变量隔离**：子进程只拿一份白名单（系统必需变量 + `PI_*`/`NODE_*`/`npm_*`）。默认 `false`（继承全部）。⚠️ 模型 key 若只放在环境变量里，要用 `env_passthrough` 显式保留 |
 | `env_passthrough` | | `isolate_env: true` 时额外保留的环境变量名，逗号分隔（如 `ANTHROPIC_API_KEY`） |
 
+#### 权限（Super Agent 模式生效）
+
+frontmatter 里 6 个扁平键。**默认很保守**（`read` / `none` / `none`）—— 要写、要跑、要联网都得显式打开。
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `fs` | `read`（默认）/ `write` | 只读就不发 `write`/`edit` |
+| `paths` | 逗号分隔，支持 `${cwd}` | 可写范围。**留空 = 不限目录**（等于全盘可写） |
+| `exec` | `none`（默认）/ `safe` / `any` | `safe` = 只允许 `cmds` 里的命令 |
+| `cmds` | 逗号分隔，支持末尾 `*` | `exec: safe` 的白名单（`npm test*` / `npx tsc*`） |
+| `net` | `none`（默认）/ `allow` | 允许联网（拉依赖 / `curl` 排障） |
+| `budget` | `120k/10m` | 只做声明，不强制 |
+
+三层表达：**L1 工具面**（`fs: read` 就不发写工具）→ **L2 提示词**（把边界写进它的 system prompt，让它规划时就不越界）→ **L3 guard 兜底**（Worker 影子目录里装 `guard-entry.ts`，`tool_call` 那一刻再判一次）。
+
+**自带的 `general` 模板**：`fs: write` + `paths: ${cwd}`（只允许写自己项目目录）+ `exec: any` + `net: allow`。
+为什么 `exec` 不设白名单：dev 角色要跑 `build` / `commit` / `push`，命令白名单对 `node`/`powershell` 等于没限 —— 与其给一个假的安全感，不如靠 guard 记日志。
+
+**exec 硬拦开关**：`<影子目录>/guard-config.json` 里写 `"execHardBlock": true` 时，`exec` 命中外也硬拦；默认 `false` = 只往 `guard.log` 记一行 `WOULD_BLOCK`（观察期，先量误拦率）。`guard-config.json` 由派发时自动重写，所以长期生效要改的是模板/生成逻辑，不是影子目录里那一份。
+
 #### 配置面板（`/assistants new` · `/assistants edit <key>`）
 
 `new` 和 `edit` 弹的是**同一个面板**，不是一个字段问一次。`↑↓` 选行 · `回车` 改 · `ctrl+s` 保存 · `esc` 取消。
@@ -1063,7 +1083,9 @@ mcp: my-db
 - ⚠️ **插件层面做不到「安全沙箱」。** 助理是**你本人身份下的普通 pi 进程**：能读你能读的文件（`env` 和工具是能收窄，但收不成沙箱）。真要硬隔离得靠 OS —— 容器 / 受限用户 / 只读挂载。
 - ⚠️ **「只读」不是权限边界，只是「少给犯错机会」。** 现在能做三件事：① 用 `tools` 白名单 / `deny_tools` 精确控制它能用哪些工具；② 用 `mcp` 决定它连不连得上某台 MCP；③ SSH 白名单已经**去掉了有副作用的子命令**（`git branch`/`git remote`、`mount`、裸 `ip`）。但**真解**是：数据库用只读账号、服务器用受限用户。
 - 环境变量默认**全部继承**。要收窄就在模板里写 `isolate_env: true`（配 `env_passthrough` 保留模型 key）。
-- ⚠️ 同时最多跑 **4 个助理**（`delegate.ts` 的 `MAX_CONCURRENT_RUNS`），超出的**排队** —— 防一次 `tasks` 派太多把机器 / 额度打爆。
+- ⚠️ 同时最多跑 **4 个助理**（`delegate.ts` 的 `MAX_CONCURRENT_RUNS`），超出的**排队** —— 防一次 `tasks` 派太多把机器 / 额度打爆。排队中的任务在面板上显示为 **⏳ 排队中**（小票先建、拿到槽位才起进程），不是看不见。
+  - 槽位在**子进程退出（`close`/`exit`）那一刻**就归还，回执解析 / 落盘 / 面板收尾都在释放之后做 —— 否则每个任务之间会白占 ~3.7s（4 个槽位等于只跑 3 个）。
+  - 释放是**单次**的（`released` 标志 + `releaseSlot()`），异常 / 超时 / 手动中断三条路径都兜底；kill 之后 8 秒还等不到 `close` 也会强制收尾 —— 宁可报失败，绝不泄漏槽位（漏一个 = 以后永远只剩 3 个并发）。
 - **后台结果只回投派发它的那个主会话**（切走了就等回去才投）；同一子会话**运行中拒绝 `resume`**（返回「会话正忙」），不会起第二个进程交叉写文件。
 - **后台结果投递失败不会丢**：退避重试（封顶 30s），超 10 分钟标 `undelivered`；面板显示 `⚠ N 条没回投`，`/agents bg` 看原因、`/agents bg redeliver` 手动重投。
 - ⚠️ `delegate` 工具里列的那份「可用助理清单」是**扩展加载时算的**。新加 / 改名助理后要 `/reload` 才会出现在清单里（派发本身不缓存，`/assistants` 看到的就是最新的）。

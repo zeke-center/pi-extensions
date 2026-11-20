@@ -13,7 +13,8 @@
  * ------------------------------
  * 1. **fail-open**：参数结构不认识 → 放行。守卫的价值是拦「明确越界」，
  *    不是拦「我没看懂」。看不懂就拦会把 Worker 锁死，比不拦更糟。
- * 2. **exec / net 先只记录（logOnly）**：先观察一段时间真实误拦率，再切硬拦。
+ * 2. **exec / net 默认先只记录（logOnly）**：先观察一段时间真实误拦率，再切硬拦。
+ *    exec 要硬拦得显式在 `guard-config.json` 里写 `execHardBlock: true`（默认 false = 保持现状）。
  * 3. **拒绝文案要给出路**：只写 "EPERM" 模型就会开始穷举重试；写了替代方案才会收手。
  */
 import { realpathSync } from "node:fs";
@@ -224,6 +225,12 @@ export interface GuardOpts {
 	cwd: string;
 	/** 额外保护目录（调用方传：本插件源码目录等）；会与内置硬保护取并集 */
 	protectedPaths: string[];
+	/**
+	 * exec 也硬拦（= guard-config.json 的 `execHardBlock`）。
+	 * 默认 false：exec=safe 命中外只写 guard.log（观察期，量误拦率）。
+	 * true：真的拒（block 且 logOnly=false）。
+	 */
+	execHardBlock?: boolean;
 }
 
 /**
@@ -293,9 +300,9 @@ function decide(perms: WorkerPermissions, opts: GuardOpts, toolName: string, arg
 			// 全禁是「明确越界」，硬拦（L1 本来就不给它 bash，走到这儿已经是异常路径）
 			return deny("exec", `当前 Worker 是 exec=none（不能执行命令）：${cmd ?? "(未识别命令)"}`);
 		}
-		// exec=safe：先只记录，观察期结束再切硬拦
+		// exec=safe：默认只记录（观察期）；开了 execHardBlock 才真拦
 		if (cmd && !(perms.cmds ?? []).some((r) => cmdMatches(r, cmd))) {
-			return deny("exec", `命令不在白名单（cmds）里：${cmd}`, { logOnly: true });
+			return deny("exec", `命令不在白名单（cmds）里：${cmd}`, { logOnly: !opts.execHardBlock });
 		}
 	}
 
