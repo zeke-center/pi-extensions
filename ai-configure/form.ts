@@ -66,6 +66,24 @@ function countInGroup(fields: FormField[], groupKey: string): number {
 	return n;
 }
 
+/** 按**字符**切（不是按 UTF-16 码元）—— 中文 / emoji 才不会被劈成半个 */
+function charsOf(v: string): string[] {
+	return [...v];
+}
+
+/** 长文本行的值列摘要：压平换行 + 截断 + 补字数/行数（正文可能几千字，值列塞不下） */
+function longSummary(v: string, maxW: number): string {
+	const flat = v.replace(/\s+/g, " ").trim();
+	if (!flat) return "(空 — 回车写)";
+	const chars = [...v].length;
+	const lines = v.split("\n").length;
+	const suffix = `  (${chars} 字${lines > 1 ? ` · ${lines} 行` : ""})`;
+	const headW = Math.max(6, maxW - visibleWidth(suffix));
+	const head = truncateToWidth(flat, headW);
+	const tail = visibleWidth(head) < visibleWidth(flat) ? "…" : "";
+	return `${head}${tail}${suffix}`;
+}
+
 /** 右补空格到 w 列（按终端可见宽度算，中文算 2 列） */
 function padRight(s: string, w: number): string {
 	const vw = visibleWidth(s);
@@ -106,10 +124,11 @@ export interface FormField {
 	 * bool   回车切换 是/否
 	 * enum   回车展开候选（options）
 	 * mcp    回车展开多选（用 showForm 的 mcp 参数）
-	 * action 回车 = 立刻保存并置 openBody（给「去编辑正文」这种按钮用）
+	 * long   **多行长文本**：值列只显示摘要+字数，回车在本面板内切到编辑视图（不另开窗口）
+	 * action 回车 = 立刻执行（分页模式在本页跑；老模式置 openBody 并关面板）
 	 * group  **分组表头**：回车 / ←→ 展开收起（它自己不是一项配置）
 	 */
-	kind: "text" | "bool" | "enum" | "mcp" | "action" | "group";
+	kind: "text" | "bool" | "enum" | "mcp" | "long" | "action" | "group";
 	options?: string[];
 	readonly?: boolean;
 	/** 值后面那句灰字 */
@@ -137,6 +156,10 @@ export class MultiSelect implements Focusable {
 		private items: PickItem[],
 		private done: (values: string[] | null) => void,
 	) {}
+
+	invalidate(): void {
+		/* noop：同 FormPane，宿主遍历时别炸 */
+	}
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
@@ -200,6 +223,14 @@ export class FormPane implements Focusable {
 	private openBody = false;
 	/** 按下的 action 行的 key（kind="action"） */
 	private actionKey: string | undefined = undefined;
+	/** 面板内的长文本编辑视图（不另开窗口）：null = 正常列表视图 */
+	private edit: { key: string; label: string; lines: string[]; row: number; col: number } | null = null;
+	/**
+	 * 上一帧画了多少行。
+	 * 为什么需要：列表视图 32 行、编辑视图可能只有 7 行，高度一缩宿主不一定清屏，
+	 * 旧画面就留在下面变成"两个框叠在一起"。所以**永远按历史最高高度补空行**，只长不缩。
+	 */
+	private lastH = 0;
 	/** 页面栈（至少 1 层）；每层各自的 fields / mcp / detail / 翻页与保存钩子 */
 	private stack: FormPage[];
 	/** 每层各自的光标位置（返回上一层时能回到原来那行） */
@@ -242,6 +273,8 @@ export class FormPane implements Focusable {
 		focusKey?: string,
 		/** 可选：给选中的行显示一段完整说明（配置面板用它写「这是干什么用的」） */
 		private detail?: (f: FormField) => string,
+		/** 可选：TUI 句柄，用来在隐藏/恢复时主动重绘（没有就靠下一帧自然刷新） */
+		private tui?: { requestRender?: () => void },
 	) {
 		// 页面栈：首页 = 传进来的这张表；drill 行回车往里压页，esc 弹回上一层
 		this.stack = [{ title: "", fields, mcp, detail }];
@@ -299,6 +332,212 @@ export class FormPane implements Focusable {
 		return this.mcp.filter((i) => i.checked).map((i) => i.value).join(", ");
 	}
 
+	/** 把画面补到历史最高高度（少几行就在底边框前插几行空白），防止宿主留残影 */
+	private fit(out: string[], width: number): string[] {
+		const w = Math.min(108, width);
+		const inner = w - 2;
+		const blank = this.theme.fg("border", "│") + " ".repeat(inner) + this.theme.fg("border", "│");
+		while (out.length < this.lastH) out.splice(out.length - 1, 0, blank);
+		this.lastH = out.length;
+		return out;
+	}
+
+	/** 长文本行：**在本面板内**切到编辑视图（不开新窗口），保存后回填、ctrl+s 才落盘 */
+	private openText(f: FormField): void {
+		const lines = f.value.split("\n");
+		this.edit = {
+			key: f.key,
+			label: f.label,
+			lines,
+			// 光标停在正文末尾：打开就能接着写，不用先按一堆 ↓ 找末尾
+			row: Math.max(0, lines.length - 1),
+			col: charsOf(lines[lines.length - 1] ?? "").length,
+		};
+	}
+
+	/** 编辑视图的按键：回车换行、ctrl+s 保存、esc 取消 */
+	private handleTextInput(data: string): void {
+		const e = this.edit;
+		if (!e) return;
+		const line = () => e.lines[e.row] ?? "";
+		const chars = () => [...line()];
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			this.edit = null; // 放弃：值不动
+			return;
+		}
+		if (matchesKey(data, "ctrl+s") || matchesKey(data, "ctrl+enter")) {
+			const f = this.flds().find((x) => x.key === e.key);
+			if (f) f.value = e.lines.join("\n");
+			this.edit = null;
+			return;
+		}
+		if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+			const cs = chars();
+			e.lines[e.row] = cs.slice(0, e.col).join("");
+			e.lines.splice(e.row + 1, 0, cs.slice(e.col).join(""));
+			e.row++;
+			e.col = 0;
+			return;
+		}
+		if (matchesKey(data, "backspace")) {
+			if (e.col > 0) {
+				const cs = chars();
+				cs.splice(e.col - 1, 1);
+				e.lines[e.row] = cs.join("");
+				e.col--;
+			} else if (e.row > 0) {
+				const prev = [...(e.lines[e.row - 1] ?? "")];
+				e.col = prev.length;
+				e.lines[e.row - 1] = prev.join("") + line();
+				e.lines.splice(e.row, 1);
+				e.row--;
+			}
+			return;
+		}
+		if (matchesKey(data, "delete")) {
+			const cs = chars();
+			if (e.col < cs.length) {
+				cs.splice(e.col, 1);
+				e.lines[e.row] = cs.join("");
+			} else if (e.row < e.lines.length - 1) {
+				e.lines[e.row] = line() + (e.lines[e.row + 1] ?? "");
+				e.lines.splice(e.row + 1, 1);
+			}
+			return;
+		}
+		if (matchesKey(data, "left")) {
+			if (e.col > 0) e.col--;
+			else if (e.row > 0) {
+				e.row--;
+				e.col = charsOf(e.lines[e.row] ?? "").length;
+			}
+			return;
+		}
+		if (matchesKey(data, "right")) {
+			if (e.col < chars().length) e.col++;
+			else if (e.row < e.lines.length - 1) {
+				e.row++;
+				e.col = 0;
+			}
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			if (e.row > 0) {
+				e.row--;
+				e.col = Math.min(e.col, charsOf(e.lines[e.row] ?? "").length);
+			}
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			if (e.row < e.lines.length - 1) {
+				e.row++;
+				e.col = Math.min(e.col, charsOf(e.lines[e.row] ?? "").length);
+			}
+			return;
+		}
+		if (matchesKey(data, "home")) {
+			e.col = 0;
+			return;
+		}
+		if (matchesKey(data, "end")) {
+			e.col = chars().length;
+			return;
+		}
+		// 普通字符 / 中文输入法上屏的文字：插到光标处
+		if (data && !data.startsWith("") && !/^\p{Cc}$/u.test(data)) {
+			const cs = chars();
+			cs.splice(e.col, 0, ...charsOf(data));
+			e.lines[e.row] = cs.join("");
+			e.col += charsOf(data).length;
+		}
+	}
+
+	/**
+	 * 编辑视图：还是**同一个面板框**，只是内容换成多行文本。
+	 *
+	 * 为什么不用 ctx.ui.editor()：那是另开一个 overlay 窗口，会出现"两个面板"、
+	 * 退出/重绘时序也容易出问题（v2.2.0 踩过 pi 崩溃）。就地编辑没有这些副作用。
+	 */
+	private renderEditor(width: number): string[] {
+		const t = this.theme;
+		const e = this.edit!;
+		const w = Math.min(108, width);
+		const inner = w - 2;
+		const b = (s: string) => t.fg("border", s);
+		const full = (s: string) => b("│") + padRight(truncateToWidth(s, inner), inner) + b("│");
+		const W = inner - 2; // 正文可用宽度（左右各留一格）
+
+		// 软换行：长行折成多行显示（不折的话一行 100 多列会被截掉，根本读不全）
+		const vis: Array<{ text: string; caret?: number }> = [];
+		for (let i = 0; i < e.lines.length; i++) {
+			const cs = charsOf(e.lines[i] ?? "");
+			if (!cs.length) {
+				vis.push({ text: "", ...(i === e.row ? { caret: 0 } : {}) });
+				continue;
+			}
+			let pos = 0;
+			while (pos < cs.length) {
+				let seg = "";
+				let wsum = 0;
+				let idx = pos;
+				while (idx < cs.length) {
+					const cw = visibleWidth(cs[idx] ?? "");
+					if (wsum + cw > W) break;
+					seg += cs[idx];
+					wsum += cw;
+					idx++;
+				}
+				if (idx === pos) idx = pos + 1; // 单字比整行还宽（极窄终端）→ 至少前进一格
+				vis.push({ text: seg, ...(i === e.row && e.col >= pos && e.col <= idx ? { caret: e.col - pos } : {}) });
+				pos = idx;
+			}
+		}
+
+		const total = e.lines.reduce((n, l) => n + charsOf(l).length, 0);
+		const out: string[] = [];
+		out.push(b(`╭${"─".repeat(inner)}╮`));
+		out.push(
+			full(` ${t.fg("accent", t.bold(`✎ 编辑：${e.label}`))} ${t.fg("dim", `(${total} 字 · ${e.lines.length} 行)`)}`),
+		);
+		out.push(b(`├${"─".repeat(inner)}┤`));
+
+		// 视口跟着光标走
+		const VIEW = 21;
+		const curVis = Math.max(0, vis.findIndex((v) => v.caret !== undefined));
+		const from = Math.max(0, Math.min(curVis - Math.floor(VIEW / 2), vis.length - VIEW));
+		const to = Math.min(vis.length, from + VIEW);
+		if (from > 0) out.push(full(t.fg("dim", `   ⋮ 上面还有 ${from} 行`)));
+		for (let i = from; i < to; i++) {
+			const v = vis[i]!;
+			if (v.caret === undefined) {
+				out.push(full(` ${t.fg("text", v.text)}`));
+				continue;
+			}
+			const cs = charsOf(v.text);
+			out.push(
+				full(
+					" " +
+						t.fg("accent", cs.slice(0, v.caret).join("")) +
+						CURSOR_MARKER +
+						t.fg("text", cs.slice(v.caret).join("")),
+				),
+			);
+		}
+		if (to < vis.length) out.push(full(t.fg("dim", `   ⋮ 下面还有 ${vis.length - to} 行`)));
+
+		out.push(b(`├${"─".repeat(inner)}┤`));
+		out.push(
+			full(
+				" " +
+					t.fg("dim", "回车 换行 · ↑↓←→ 移动 · ") +
+					t.fg("accent", "ctrl+s 保存并回到面板") +
+					t.fg("dim", " · esc 取消（原值不动）"),
+			),
+		);
+		out.push(b(`╰${"─".repeat(inner)}╯`));
+		return out;
+	}
+
 	private finish(): void {
 		const values: Record<string, string> = {};
 		// 页面栈里每一页的值都收上来（助理页 / 配置页混着改也不会丢）
@@ -309,6 +548,10 @@ export class FormPane implements Focusable {
 	}
 
 	handleInput(data: string): void {
+		if (this.edit) {
+			this.handleTextInput(data); // 编辑视图自己吃按键
+			return;
+		}
 		const f = this.cur();
 
 		// ctrl+s 在任何模式下都能直接存（正在编辑的那格先落地）
@@ -484,6 +727,10 @@ export class FormPane implements Focusable {
 				this.mode = "enum";
 				return;
 			}
+			if (f.kind === "long") {
+				this.openText(f); // 同一个面板里切到编辑视图
+				return;
+			}
 			if (f.kind === "action") {
 				// 分页模式：在本页跑掉，面板不关（老行为是关面板 + 外面重开，很跳）
 				if (this.page().runAction) {
@@ -511,6 +758,8 @@ export class FormPane implements Focusable {
 	 * 窄屏（<90 列）自动退回单栏 + 底部说明 —— 两栏都挤成碎片更没法读。
 	 */
 	render(width: number): string[] {
+		// 编辑视图：同一个面板框里换内容，不另开窗口
+		if (this.edit) return this.fit(this.renderEditor(width), width);
 		const t = this.theme;
 		const twoCol = width >= 90;
 		const w = Math.min(twoCol ? 108 : 84, width);
@@ -523,6 +772,10 @@ export class FormPane implements Focusable {
 			22,
 			Math.max(8, ...this.flds().map((f) => visibleWidth(f.label) + 2)),
 		);
+
+		// 两栏宽度先算出来：左栏的值列要按**左栏**宽度截断，不能按整面板算（否则会顶到右边框外）
+		const leftW = twoCol ? Math.floor((inner - 1) * 0.75) : inner;
+		const rightW = twoCol ? inner - 1 - leftW : 0;
 
 		// ---------- 左栏：列表 ----------
 		const left: Array<{ text: string; sel: boolean; selIndex: number }> = [];
@@ -546,6 +799,8 @@ export class FormPane implements Focusable {
 			if (f.kind === "mcp") {
 				const names = this.mcpPool().filter((x) => x.checked).map((x) => x.value);
 				val = names.length ? `${names.length} 个：${names.join(", ")}` : "(不连)";
+			} else if (f.kind === "long") {
+				val = longSummary(f.value, Math.max(12, leftW - labelW - 6));
 			} else {
 				// 动作行的值列是摘要，空的就留白（别显示「(空)」，那不是配置）
 				val = f.value || (f.kind === "action" || f.drill ? "" : "(空)");
@@ -572,8 +827,6 @@ export class FormPane implements Focusable {
 		const more = left.length > MAX_ROWS ? { above: viewFrom, below: left.length - viewFrom - leftView.length } : undefined;
 
 		// ---------- 右栏：说明 ----------
-		const leftW = twoCol ? Math.floor((inner - 1) * 0.75) : inner;
-		const rightW = twoCol ? inner - 1 - leftW : 0;
 		const right: string[] = [];
 		const cur = this.cur();
 		if (twoCol && this.detail && cur) {
@@ -688,7 +941,7 @@ export class FormPane implements Focusable {
 		}
 
 		out.push(b(`╰${"─".repeat(inner)}╯`));
-		return out;
+		return this.fit(out, width);
 	}
 }
 
@@ -705,7 +958,7 @@ export async function showFormPages(
 	const root = pages[0]!;
 	const r = await ctx.ui.custom<FormResult | null>(
 		(_tui, theme, _kb, done) => {
-			const pane = new FormPane(theme, title, root.fields, root.mcp ?? [], done, focusKey, root.detail);
+			const pane = new FormPane(theme, title, root.fields, root.mcp ?? [], done, focusKey, root.detail, _tui);
 			pane.setPages(pages);
 			return pane;
 		},
@@ -724,7 +977,8 @@ export async function showForm(
 	detail?: (f: FormField) => string,
 ): Promise<FormResult | null> {
 	const r = await ctx.ui.custom<FormResult | null>(
-		(_tui, theme, _kb, done) => new FormPane(theme, title, fields, mcp, done, focusKey, detail),
+		(_tui, theme, _kb, done) =>
+			new FormPane(theme, title, fields, mcp, done, focusKey, detail, _tui),
 		{ overlay: true },
 	);
 	return r ?? null;

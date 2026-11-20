@@ -400,7 +400,12 @@ export function settingsGroupPage(group: string): FormPage {
 		enter: (f) => {
 			if (f.key === "nav.back") return null;
 			const d = getSetting(f.key);
-			return d && d.kind !== "action" ? settingsItemPage(d) : undefined;
+			if (!d) return undefined;
+			// 有二级页（助理行 = 那个助理的编辑页）→ **在同一个面板里翻页**。
+			// 这里必须优先判断 page：否则会落到 runAction 去执行 /assistants edit，
+			// 那条命令自己会再开一个面板 —— 就成了"两个窗口"（v2.2.0 踩过）。
+			if (d.page) return d.page();
+			return d.kind !== "action" ? settingsItemPage(d) : undefined;
 		},
 		runAction: (f) => {
 			const d = getSetting(f.key);

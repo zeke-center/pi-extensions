@@ -1592,7 +1592,8 @@ function buildFields(o: {
 	dispatchable: boolean;
 	dispatchNote?: string;
 	scope: string;
-	bodyChars: number;
+	/** 提示词正文原文（面板里长文本编辑，值列显示摘要） */
+	body: string;
 	keyEditable: boolean;
 	/** 当前挂的底座 key（"" = 没挂） */
 	extendsKey: string;
@@ -1622,8 +1623,8 @@ function buildFields(o: {
 			key: "desc",
 			label: "描述",
 			value: o.desc,
-			kind: "text",
-			hint: "(写「什么时候用我」，主 pi 靠它决定派谁)",
+			kind: "long",
+			hint: "(写「什么时候用我」，主 pi 靠它决定派谁 · 回车在面板内编辑)",
 		},
 		{
 			key: "extends",
@@ -1671,9 +1672,9 @@ function buildFields(o: {
 		{
 			key: "body",
 			label: "提示词正文",
-			value: `(${o.bodyChars} 字)`,
-			kind: "action",
-			hint: "回车 = 保存并打开编辑器",
+			value: o.body,
+			kind: "long",
+			hint: "(回车在面板内看全文并编辑 · ctrl+s 保存)",
 		},
 	];
 }
@@ -1713,12 +1714,9 @@ async function commitForm(
 			? join(projectAssistantDir(o.cwd), `${key}.md`)
 			: join(globalAssistantDir(), `${key}.md`);
 
-	// 只有「提示词正文」那行被按了回车，才动正文 —— 平时改 MCP 不该顺手把正文覆盖了
-	let body: string | undefined;
-	if (o.form.openBody) {
-		const edited = await ctx.ui.editor(`「${v.name || key}」的提示词正文`, o.original?.body ?? "");
-		if (typeof edited === "string") body = edited;
-	}
+	// 正文是面板里的长文本行（kind="long"）：改没改都照原样写回
+	// （不改时值就是原文，写回去等长 —— 顺便把首尾空白规整掉）
+	const body = typeof v.body === "string" ? v.body : undefined;
 
 	const updates: Record<string, string | undefined> = {
 		name: (v.name ?? "").trim() || key,
@@ -1829,7 +1827,8 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 const ASSISTANT_FIELD_DOC: Record<string, string> = {
 	key: "文件名 = 派活时用的 key（`delegate(assistant=db)` 里的 db）。\n改名字等于新建一个助理，原来的还留着。",
 	name: "显示名：面板和会话标题里显示的名字。中文也行，留空就用文件名。",
-	desc: "**什么时候该派它** —— 这句话会写进主会话的 delegate 工具描述，模型靠它决定派谁。\n写清「什么活找它、什么活别找它」，含糊了模型就会乱派。",
+	desc:
+		"**什么时候该派它** —— 这句话会写进主会话的 delegate 工具描述，模型靠它决定派谁。\n写清「什么活找它、什么活别找它」，含糊了模型就会乱派。\n\n回车在同一面板里切到编辑视图：能看全文、能分多段写；ctrl+s 保存、esc 取消。",
 	extends: "底座：继承它的正文、工作目录等默认值，再叠上你自己写的部分。\n底座只读（改它会连累所有继承它的助理），要定制就派生一个。",
 	cwd: "工作目录：文件读写、相对路径、项目 AGENTS.md 都按它算。\n留空则继承底座；都没有就用当前项目目录。",
 	model:
@@ -1839,7 +1838,8 @@ const ASSISTANT_FIELD_DOC: Record<string, string> = {
 	mcp: "MCP：这个助理能连哪些服务（回车勾选）。**跟工作目录无关**，是按需给的。\n不勾 = 一个都不连，只能用本地文件工具。",
 	dispatchable: "可派发：关掉 = 只当样板看，不能真的派活。\n底座自动是「否」；示例模板也建议关。",
 	scope: "存哪儿：全局 = `~/.pi/agent/assistants/`（所有项目都能用）；\n项目 = 当前项目的 `.pi/assistants/`（只在这个项目里出现）。",
-	body: "提示词正文：这个助理的角色设定。回车打开编辑器写。\n继承底座时，这里是「在底座基础上追加」的部分。",
+	body:
+		"提示词正文：这个助理的角色设定（几百上千字都写这儿）。\n继承底座时，这里是「在底座基础上追加」的部分。\n\n回车在同一面板里切到编辑视图：能看原文、能翻能改；ctrl+s 保存、esc 放弃（原值不动）。",
 };
 
 /**
@@ -1863,7 +1863,7 @@ export function assistantFormParts(
 		dispatchable: tpl.demo !== true,
 		dispatchNote: tpl.base === true ? "(base：底座，不能在这儿改)" : undefined,
 		scope: isProjectFile(tpl.file, cwd) ? SCOPE_PROJECT : SCOPE_GLOBAL,
-		bodyChars: tpl.body.length,
+		body: tpl.body,
 		keyEditable: false,
 		extendsKey: tpl.extends ?? "",
 		bases: availableBases(cwd).map((b) => ({ key: b.key, name: b.name })),
@@ -1897,20 +1897,18 @@ export function assistantFormPage(ctx: ExtensionContext, cwd: string, key: strin
 		detail: (f) => {
 			if (f.key === "nav.back") return "回到助理列表（也可以直接按 esc）。\n\n本页所有改动都要按 ctrl+s 才落盘。";
 
-			return ASSISTANT_FIELD_DOC[f.key] ?? `${f.label}：${f.value}`;
+			const doc = ASSISTANT_FIELD_DOC[f.key] ?? `${f.label}：${f.value}`;
+			// 长文本（描述 / 正文）：右栏直接给出前几行，不开编辑器也能看个大概
+			if (f.kind === "long") {
+				const lines = f.value.split("\n");
+				const head = lines.slice(0, 8).join("\n").trim();
+				const more = lines.length > 6 ? `\n……（还有 ${lines.length - 6} 行，回车看全文）` : "";
+				const chars = [...f.value].length;
+				return `${doc}\n\n──────────\n当前内容（${chars} 字 · ${lines.length} 行）：\n${head || "（空）"}${more}`;
+			}
+			return doc;
 		},
 		enter: (f) => (f.key === "nav.back" ? null : undefined),
-		// 「提示词正文」是动作行：回车当场开编辑器并保存（面板不关，和以前一样能用）
-		runAction: (f) => {
-			if (f.key !== "body") return;
-			const values: Record<string, string> = {};
-			for (const x of fields) {
-				values[x.key] = x.kind === "mcp" ? parts.mcp.filter((m) => m.checked).map((m) => m.value).join(", ") : x.value;
-			}
-			void parts.commit({ values, openBody: true }).catch((e: unknown) => {
-				ctx.ui.notify(`✗ 保存失败：${e instanceof Error ? e.message : String(e)}`, "error");
-			});
-		},
 		save: (values) => {
 			if (readonly) {
 				ctx.ui.notify(`「${tpl.key}」是底座（只读）：要定制请用「＋ 新建助理」派生一个。`, "warning");
@@ -1954,6 +1952,66 @@ async function editAssistant(ctx: ExtensionContext, cwd: string, what: string, f
 	await commitForm(ctx, { form: r, cwd, original: tpl });
 }
 
+/**
+ * 「＋ 新建助理」在**同一个面板里**翻一页（和线上 /assistants new 共用 buildFields）。
+ * 为什么要有：动作行如果去跑命令，命令里的 showForm 会再开一个面板 —— 就成两个窗口了。
+ */
+export function assistantNewPage(ctx: ExtensionContext, cwd: string, baseKey?: string): FormPage {
+	const bases = availableBases(cwd);
+	const wantBase = (baseKey ?? "").trim();
+	const extendsKey = wantBase && bases.some((b) => b.key === wantBase) ? wantBase : "";
+	const baseTpl = extendsKey ? bases.find((b) => b.key === extendsKey) : undefined;
+	const pool = loadMcpPool(cwd);
+	const parts = buildFields({
+		key: "",
+		name: "",
+		desc: "",
+		cwd,
+		model: "",
+		timeout: "",
+		agentsMd: true,
+		dispatchable: true,
+		scope: SCOPE_GLOBAL,
+		body: "",
+		keyEditable: true,
+		extendsKey,
+		bases: bases.map((b) => ({ key: b.key, name: b.name })),
+		modelOptions: modelChoices(ctx),
+	});
+	const fields: FormField[] = [
+		{ key: "nav.back", label: "← 返回助理列表", value: "", kind: "text", readonly: true, drill: true },
+		...parts,
+	];
+	return {
+		title: extendsKey ? `新建（基于 ${extendsKey}）` : "新建助理",
+		fields,
+		mcp: mcpItems(pool, baseTpl?.mcp ?? []),
+		footer: "回车 改 · ctrl+s 创建并回到列表 · esc 返回上一层",
+		detail: (f) => {
+			if (f.key === "nav.back") return "回到助理列表（也可以直接按 esc）。";
+			return ASSISTANT_FIELD_DOC[f.key] ?? `${f.label}：${f.value}`;
+		},
+		enter: (f) => (f.key === "nav.back" ? null : undefined),
+		save: (values) => {
+			const v = values;
+			const key = (v.key ?? "").trim();
+			if (!key) {
+				ctx.ui.notify("文件名（key）不能为空 —— 派活时用它。", "warning");
+				return true; // 留在本页，别关
+			}
+			if (existsSync(join(globalAssistantDir(), `${key}.md`))) {
+				ctx.ui.notify(`已经有个全局模板叫「${key}」了。
+想改它：/assistants edit ${key}`, "warning");
+				return true;
+			}
+			void commitForm(ctx, { form: { values, openBody: false }, cwd, original: null }).catch((e: unknown) => {
+				ctx.ui.notify(`✗ 创建失败：${e instanceof Error ? e.message : String(e)}`, "error");
+			});
+			return false; // 建完退回列表
+		},
+	};
+}
+
 async function newAssistant(ctx: ExtensionContext, cwd: string, key: string, baseKey?: string): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("这个命令需要交互界面（TUI）。", "warning");
@@ -1979,7 +2037,7 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string, bas
 		agentsMd: true,
 		dispatchable: true,
 		scope: SCOPE_GLOBAL,
-		bodyChars: 0,
+		body: "",
 		keyEditable: true,
 		extendsKey,
 		bases: bases.map((b) => ({ key: b.key, name: b.name })),

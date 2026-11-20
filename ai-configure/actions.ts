@@ -13,7 +13,7 @@
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { pickFromList } from "./form";
-import { assistantFormPage, loadTemplates } from "./delegate";
+import { assistantFormPage, assistantNewPage, loadTemplates } from "./delegate";
 import type { CommandMap } from "./pi-extensions";
 import { registerSettings, setOpenRefresher, settingsCtx, unregisterSettings, type SettingDef } from "./settings";
 
@@ -154,12 +154,22 @@ function assistantRows(): SettingDef[] {
 		return row;
 	});
 
-	rows.push(
-		action(`${ASSISTANT_PREFIX}__new`, "助理", "＋ 新建助理", "新建一个助理模板：可以选一个底座一键派生（自动 extends + 预勾它带的 MCP），也可以从空白开始。", async () => {
+	const newRow = action(
+		`${ASSISTANT_PREFIX}__new`,
+		"助理",
+		"＋ 新建助理",
+		"新建一个助理模板：可以选一个底座一键派生（自动 extends + 预勾它带的 MCP），也可以从空白开始。",
+		async () => {
 			const runner = runnerRef;
 			if (runner) await runner("assistants", "new");
-		}),
+		},
 	);
+	// 面板里回车 = 在同一个框里翻到「新建」页（不跑命令，否则又是两个面板）
+	newRow.page = () => {
+		const c = settingsCtx();
+		return c ? assistantNewPage(c, c.cwd ?? process.cwd()) : undefined;
+	};
+	rows.push(newRow);
 	return rows;
 }
 
