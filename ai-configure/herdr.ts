@@ -217,6 +217,22 @@ export function paneRename(paneId: string, label: string): boolean {
 	return run(["pane", "rename", paneId, label]) !== undefined;
 }
 
+/**
+ * 给 pane 发按键：`herdr pane send-keys <PANE_ID> <KEY>...`（失败返回 false，**绝不抛**）。
+ *
+ * 实测（herdr 0.9.5，Windows PowerShell pane）：`send-keys <id> ctrl+c` 可用 ——
+ * pane 里打出 `Control-C`、前台命令被中断、回到提示符；成功时 CLI 输出为空。
+ *
+ * 用途：失败 / 超时**保留 pane** 时先给里面那个交互式 pi 发 Ctrl+C 停掉。
+ * 交互式 pi 答完**不会退出**（停在输入框等下一句），不清掉就等于留一个活进程白占 pane，
+ * 用户切过去看到的是「卡住不动」，而不是「失败了、内容留着」。
+ */
+export function paneSendKeys(paneId: string, keys: string | string[]): boolean {
+	const list = Array.isArray(keys) ? keys : [keys];
+	if (!paneId || !list.length || list.some((k) => !k)) return false;
+	return run(["pane", "send-keys", paneId, ...list]) !== undefined;
+}
+
 export function paneClose(paneId: string): boolean {
 	if (!paneId) return false;
 	return run(["pane", "close", paneId]) !== undefined;
@@ -291,19 +307,21 @@ export function tabClose(tabId: string): boolean {
 
 // ======================= 命名（纯函数）=======================
 
-export type PaneKind = "run" | "ok" | "err" | "stalled";
+export type PaneKind = "run" | "ok" | "err" | "stalled" | "stopped";
 
 /**
  * pane 标题。三个状态各打一个记号 —— 用户在 tab 栏扫一眼就知道哪个跑完了、哪个挂了。
  *   run → `▶ sa:<name>#<idx>`
  *   ok  → `✅ sa:<name>#<idx>`
  *   err → `❌ sa:<name>#<idx>（按回车关闭）`
+ *   stopped → `❌ sa:<name>#<idx>（已停，回车关闭）` —— 失败的 pane 被保留了，但里面的 pi 已经 Ctrl+C 停掉
  *   stalled → `❌ sa:<name>#<idx>（卡死已降级）` —— 看门狗收掉的 pane（马上要关，所以不写「按回车关闭」）
  */
 export function paneLabel(kind: PaneKind, name: string, idx: number): string {
 	const who = `sa:${name || "worker"}#${idx}`;
 	if (kind === "ok") return `✅ ${who}`;
 	if (kind === "err") return `❌ ${who}（按回车关闭）`;
+	if (kind === "stopped") return `❌ ${who}（已停，回车关闭）`;
 	if (kind === "stalled") return `❌ ${who}（卡死已降级）`;
 	return `▶ ${who}`;
 }

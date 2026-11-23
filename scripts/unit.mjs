@@ -656,7 +656,7 @@ allOk =
 			'ok("回归：gone 路径必然产生终态（status !== running）", readBgTask(bg5).status === "done");',
 			'// ---- ⑥ 采集 pane 一直抛错 → promise 也不许 reject（以前就是静默 reject → 永不 settle）----',
 			'const boomKeepAlive = setInterval(() => {}, 50); // sleep() 内部 unref 了，测试里得自己撑着事件循环',
-			'const boomRes = await waitPaneDone({ index: 1, paneId: "w9:p2", where: "main" }, pd, "sid-boom", 5000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true });',
+			'const boomRes = await waitPaneDone({ index: 1, paneId: "w9:p2", where: "main" }, pd, "sid-boom", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 20 });',
 			'ok("回归：采集抛错不 reject，返回 failed + error", boomRes.outcome === "failed" && !!boomRes.error);',
 			'ok("回归：采集抛错也归因到日志（便于排查）", boomRes.stallLog.join(" ").includes("pane 已关闭"));',
 			'clearInterval(boomKeepAlive);',
@@ -676,6 +676,70 @@ allOk =
 			'ok("回归：正常收尾后取消计时器 → 不会补写一张假 timeout", fired2 === 0);',
 		],
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-pane") },
+	) && allOk;
+
+// ---------- 套件 1.6：pane 模式的**完成信号**（收尾误判回归）----------
+// 踩过的真 bug：worker 跑完了、git commit 5adc34b 已双推、工作区干净，但回执只写了人话
+// （`状态: 完成` / `结论: ...`）、没写 `<result>{...}</result>` → 旧逻辑永远等不到完成信号
+// → 判「失败（146s，退出码 1）」+ 把 pane 留着，里面交互式 pi 还停在输入框。
+// 这里钉死：回执正文也算完成（但要稳定 2s）；采集抛错不许早早判失败。
+bundle("delegate.ts", "delegate-receipt.mjs");
+allOk =
+	runSuite(
+		"delegate：pane 完成信号（回执正文 / 采集抛错）",
+		join(tmp, "delegate-receipt.mjs"),
+		[
+			// ---- ① 纯函数 paneHasReceiptText ----
+			'const rcpKeepAlive = setInterval(() => {}, 50); // sleep() 内部 unref 了，测试里得自己撑着事件循环',
+			'ok("回执文本：状态: 完成 → 命中", paneHasReceiptText("状态: 完成") === true);',
+			'ok("回执文本：状态：卡住（全角冒号）→ 命中", paneHasReceiptText("状态：卡住") === true);',
+			'ok("回执文本：状态: 需要信息 → 命中", paneHasReceiptText("状态: 需要信息") === true);',
+			'ok("回执文本：结论: xxx → 命中", paneHasReceiptText("结论: README 发版清单已提交并推送双远端") === true);',
+			'ok("回执文本：多行回执里的 证据: → 命中", paneHasReceiptText(["干完了", "证据: git commit 5adc34b 已双推", ""].join(String.fromCharCode(10))) === true);',
+			'ok("回执文本：状态: 完成中 → 不命中（模型还在写，早判会截正文）", paneHasReceiptText("状态: 完成中") === false);',
+			'ok("回执文本：空串 / 全空白 → 不命中", paneHasReceiptText("") === false && paneHasReceiptText("   " + String.fromCharCode(10)) === false);',
+			'ok("回执文本：普通正文（没回执形状）→ 不命中", paneHasReceiptText("thinking... 正在处理" + String.fromCharCode(10) + "> ") === false);',
+			'ok("回执文本：稳定窗口常量是 2s（别悄悄改小）", PANE_RECEIPT_STABLE_MS === 2000);',
+			'ok("回执文本：采集抛错阈值是 12 次（约 24s）", PANE_READ_FAIL_LIMIT === 12 && PANE_SAMPLE_MS === 2000);',
+			// ---- ② 回执正文 + 稳定窗口 → done（这就是本次修的那条路）----
+			'const rcpDir = join(tmpdir(), "receipt-sess-" + Math.random().toString(36).slice(2, 8));',
+			'mkdirSync(rcpDir, { recursive: true });',
+			'const receiptOnly = ["状态: 完成", "结论: README 发版清单已提交并推送双远端（github + gitee）。", "证据: git commit 5adc34b 已双推"].join(String.fromCharCode(10));',
+			'const putSess = (sid, body) => writeFileSync(join(rcpDir, "20260101-000000-1_" + sid + ".jsonl"), JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: body }] } }) + String.fromCharCode(10), "utf8");',
+			'putSess("sid-rcp", receiptOnly);',
+			'ok("完成信号：回执正文里没有 </result>（这就是当初被误判的那种回执）", !/<\\/result>/.test(receiptOnly) && paneHasReceiptText(receiptOnly));',
+			'const rcpStable = await waitPaneDone({ index: 1, paneId: "w9:pr", where: "main" }, rcpDir, "sid-rcp", 20000, undefined, true, { read: () => ({ ok: true, text: "π 输入框" }), alive: () => true, sampleMs: 30, receiptStableMs: 120 });',
+			'ok("完成信号：只有人话回执（无 <result>）+ 稳定窗口 → outcome=done（不再超时判失败）", rcpStable.outcome === "done");',
+			'ok("完成信号：done 时正文档被带出（卡片不空）", /README 发版清单/.test(rcpStable.text));',
+			// ---- ③ 回执文本但还在变（没稳定到窗口）→ 不许判 done ----
+			'let rcpN = 0;',
+			'const rcpChanging = await waitPaneDone({ index: 1, paneId: "w9:pc", where: "main" }, join(tmpdir(), "no-such-sess-x"), "sid-none", 400, undefined, true, { read: () => { rcpN += 1; return { ok: true, text: ["状态: 完成", "证据: 第" + rcpN + "版"].join(String.fromCharCode(10)) }; }, alive: () => true, sampleMs: 20, receiptStableMs: 120 });',
+			'ok("完成信号：回执文本一直在变（<稳定窗口）→ 不判 done", rcpChanging.outcome === "timeout");',
+			// ---- ④ 既没 <result> 也没回执 → 继续等（不提前判失败）----
+			'const rcpNone = await waitPaneDone({ index: 1, paneId: "w9:pn", where: "main" }, join(tmpdir(), "no-such-sess-y"), "sid-none", 400, undefined, true, { read: () => ({ ok: true, text: "正在执行..." }), alive: () => true, sampleMs: 20, receiptStableMs: 120 });',
+			'ok("完成信号：既没 <result> 也没回执 → 继续等（结果是 timeout，不是 failed）", rcpNone.outcome === "timeout");',
+			// ---- ⑤ 采集连续抛错 3 次 → 不判失败 ----------
+			'putSess("sid-three", receiptOnly);',
+			'let threeThrows = 0;',
+			'const rcpThree = await waitPaneDone({ index: 1, paneId: "w9:p3", where: "main" }, rcpDir, "sid-three", 20000, undefined, true, { read: () => { threeThrows += 1; if (threeThrows <= 3) throw new Error("pane 读不到"); return { ok: true, text: "π 输入框" }; }, alive: () => true, sampleMs: 20, receiptStableMs: 120 });',
+			'ok("采集抛错：连续 3 次 → 不判失败（继续采样）", rcpThree.outcome !== "failed" && threeThrows >= 4);',
+			'ok("采集抛错：3 次之后读到回执 → 照样判 done", rcpThree.outcome === "done");',
+			// ---- ⑥ 采集连续抛错 12 次 → 才放弃（有正文 done / 没正文 failed）----
+			'const rcpTwelve = await waitPaneDone({ index: 1, paneId: "w9:p12", where: "main" }, rcpDir, "sid-three", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 5 });',
+			'ok("采集抛错：12 次才放弃，且能读到正文 → outcome=done", rcpTwelve.outcome === "done" && !!rcpTwelve.error && rcpTwelve.stallLog.length >= 12);',
+			'ok("采集抛错：放弃时 error 说明是采集问题（不是任务失败）", /连续抛错 12 次/.test(String(rcpTwelve.error)));',
+			'const rcpEmpty = await waitPaneDone({ index: 1, paneId: "w9:p13", where: "main" }, join(tmpdir(), "no-such-sess-z"), "sid-none", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 5 });',
+			'ok("采集抛错：真读不到任何正文 → 才 failed", rcpEmpty.outcome === "failed" && !!rcpEmpty.error);',
+			// ---- ⑦ 失败保留 pane → 先停掉里面的 pi，标签写「已停」----------
+			'const skCalls = [];',
+			'let skLabel = "";',
+			'const sk = stopKeptPane("w9:pk", "general", 2, { sendKeys: (p, k) => { skCalls.push(p + "|" + k); return true; }, rename: (p, l) => { skLabel = l; return true; } });',
+			'ok("保留 pane：先给 pane 发 ctrl+c（桩断言被调用）", skCalls.length === 1 && skCalls[0] === "w9:pk|ctrl+c");',
+			'ok("保留 pane：标签含「已停」且是 ❌（用户一眼看出没活进程了）", sk.stopped === true && skLabel.includes("已停") && skLabel.startsWith("❌") && skLabel.includes("sa:general#2"));',
+			'ok("保留 pane：send-keys 抛错也不抛出去，标签照样改", (() => { let l2 = ""; const r2 = stopKeptPane("w9:pk", "x", 1, { sendKeys: () => { throw new Error("herdr 挂了"); }, rename: (p, l) => { l2 = l; return true; } }); return r2.stopped === false && l2.includes("已停"); })());',
+			'clearInterval(rcpKeepAlive);',
+		],
+		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-receipt") },
 	) && allOk;
 
 // ---------- 套件 1.4：后台任务记账（合并写 = 不重复投递的地基）----------
@@ -1586,7 +1650,8 @@ allOk =
 		"失败自动降级（mode===panel 直接返回 undefined）": /if \(mode === "panel"\) return undefined;/.test(delegateSrc),
 		"溢出 tab 第一格新开 tab、满了开下一个": /tabCreate\(ws, tabLabel\(n\)/.test(delegateSrc) && /herdrExtraTabs/.test(delegateSrc),
 		"槽位分配走串行队列（并发不抢同一格）": /function serializeSlotAlloc/.test(delegateSrc) && /await serializeSlotAlloc\(/.test(delegateSrc),
-		"成功改 ✅ / 失败改 ❌": delegateSrc.includes('paneLabel("ok"') && delegateSrc.includes('paneLabel("err"'),
+		"成功改 ✅ / 失败改 ❌（保留 pane 时改成「已停」）": delegateSrc.includes('paneLabel("ok"') && delegateSrc.includes('paneLabel("stopped"') && /kind === "stopped"/.test(herdrSrc),
+		"失败保留 pane 会先停掉里面的 pi（ctrl+c -> 已停）": /stopKeptPane\(slot\.paneId/.test(delegateSrc) && /export function stopKeptPane/.test(delegateSrc) && delegateSrc.includes('"ctrl+c"'),
 		"panel 里分屏 worker 压成一行": /function renderPaneJob/.test(liveSrc) && /job\.uiMode === "split"/.test(liveSrc),
 	};
 	const bad = Object.entries(checks)

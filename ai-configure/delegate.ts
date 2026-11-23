@@ -71,6 +71,7 @@ import {
 	paneReadEx,
 	paneRename,
 	paneRun,
+	paneSendKeys,
 	paneSplit,
 	planSlot,
 	readUiConfig,
@@ -852,6 +853,28 @@ export const PANE_IDLE_MS = 90_000;
  * 所以 pane 分支另起一个「最长 timeoutMs + 这个宽限」的强制收尾定时器。
  */
 export const HERDR_FINALIZE_GRACE_MS = 60_000;
+
+/**
+ * 回执正文的**稳定窗口**：看到 `状态: 完成` 这类回执之后，还要连续这么久不再变化才算真跑完。
+ *
+ * 为什么不是「看到就判完」：模型在写回执时是**流式**的 —— `状态: 完成` 往往先出现，
+ * `结论 / 证据` 还在往下写。早判 1 秒就会把正文截断（卡片上只剩半截）。
+ * 2000ms 是「足够盖住一次续写、又不会让用户白等」的折中。
+ */
+export const PANE_RECEIPT_STABLE_MS = 2_000;
+
+/** 采集 pane 状态的采样间隔（也是抛错后的重试间隔） */
+export const PANE_SAMPLE_MS = 2_000;
+
+/**
+ * 采集 pane 状态**连续抛错**多少次才放弃（每次 `PANE_SAMPLE_MS`，≈ 24s）。
+ *
+ * 以前是 3 次（≈ 6s）：pane 刚被关 / herdr 短暂抽风就判 `failed` ——
+ * 实战里把一次**已经跑成功**的活（已 commit、已双推）判成「失败（退出码 1）」，
+ * 还把 pane 留着。抛错只说明「读不到 pane」，不等于任务失败，所以放宽到 12 次，
+ * 且每次都用会话 jsonl 另找事实（见 `waitPaneDone`）。
+ */
+export const PANE_READ_FAIL_LIMIT = 12;
 
 /**
  * pane 屏幕上「正在执行」的迹象。
@@ -1651,8 +1674,16 @@ function lastAssistantTextIn(file: string | undefined): string {
 	return "";
 }
 
-/** pane 最后一行是不是又回到 shell 提示符了（= 我们丢进去的 pi 已经退出） */
-function paneAtShell(tail: string): boolean {
+/**
+ * pane 最后一行是不是又回到 shell 提示符了（= 我们丢进去的 pi 已经退出）。
+ *
+ * ⚠️ **不要拿它当 pane 模式的完成信号**（以前就是，结果误判）。原因：
+ * pane 里跑的是**交互式 pi**，它答完**不会退出** —— 停在输入框等下一句，
+ * 提示符永远不会回来，所以 `paneAtShell(tail)` 在真实分屏里恒为 false。
+ * 保留它只是为了将来「非交互」场景（比如直接 `pi -p '<task>'` 丢进 pane）。
+ * pane 模式的完成信号只有两个（见 `waitPaneDone`）：`</result>` 硬信号 + 回执正文稳定信号。
+ */
+export function paneAtShell(tail: string): boolean {
 	const lines = String(tail ?? "")
 		.split(/\r?\n/)
 		.map((l) => l.trimEnd())
@@ -1662,6 +1693,60 @@ function paneAtShell(tail: string): boolean {
 	if (/^[^\s]+@[^\s]+:[^\s]*\$\s*$/.test(last)) return true; // bash 常见 PS1
 	if (/^[A-Za-z]:\\[^>]*>\s*$/.test(last)) return true; // cmd
 	return false;
+}
+
+/**
+ * 输出里是不是已经有**回执正文**了（纯函数，不碰命令行 / 文件）。
+ *
+ * 这是 `</result>` 之外的**第二种完成信号**：worker 经常只写人话回执
+ * （`状态: 完成` / `结论: ...`）而**忘写** `<result>{...}</result>`。
+ * 旧逻辑只认 `</result>` → 一直等到超时 → 把成功的活判成「失败」，还留着 pane。
+ *
+ * 判据故意收得很紧：
+ *   - `状态: 完成` / `状态：卡住` / `状态: 需要信息`（半角 / 全角冒号都认）
+ *   - 行首的 `结论:` / `证据:`（多行回执的后半段，说明模型在正经写回执）
+ *   - **不认** `状态: 完成中` —— 后面紧跟汉字/字母/数字说明词还没写完，早判就把正文截了
+ *
+ * 这里只判断「有没有」；「稳定 2s」由 `waitPaneDone` 负责（要拿两次采样比）。
+ */
+export function paneHasReceiptText(output: string): boolean {
+	const t = String(output ?? "");
+	if (!t.trim()) return false;
+	if (/状态\s*[:：]\s*(完成|卡住|需要信息)(?![\u4e00-\u9fa5A-Za-z0-9_])/.test(t)) return true;
+	if (/^[ \t]*(结论|证据)\s*[:：]/m.test(t)) return true;
+	return false;
+}
+
+/**
+ * 「失败 / 超时 → 保留 pane」时的收尾：**先停掉里面的 pi**，再把标签改成「已停」。
+ *
+ * 为什么必须停：pane 里是交互式 pi，答完/报错都**不退出**，停在输入框。
+ * 保留 pane 却留个活进程，等于白占资源 + 用户切过去看到的是「卡住不动」，
+ * 而不是「这事儿失败了、内容还在，按回车就关」。
+ * 抽成函数是为了能单测（注入桩，断言真的发了 ctrl+c、标签带「已停」）。
+ */
+export function stopKeptPane(
+	paneId: string,
+	name: string,
+	idx: number,
+	deps: {
+		sendKeys?: (paneId: string, keys: string) => boolean;
+		rename?: (paneId: string, label: string) => boolean;
+	} = {},
+): { label: string; stopped: boolean } {
+	const label = paneLabel("stopped", name, idx);
+	let stopped = false;
+	try {
+		stopped = (deps.sendKeys ?? paneSendKeys)(paneId, "ctrl+c") === true;
+	} catch {
+		stopped = false; // 停不掉也得继续改标签
+	}
+	try {
+		(deps.rename ?? paneRename)(paneId, label);
+	} catch {
+		/* 标签改不动不影响结果 */
+	}
+	return { label, stopped };
 }
 
 /**
@@ -1675,6 +1760,10 @@ export interface PaneWaitOps {
 	read(paneId: string): { ok: boolean; text: string };
 	/** pane 还在吗 */
 	alive(paneId: string): boolean;
+	/** 采样 / 抛错重试间隔（默认 `PANE_SAMPLE_MS`；单测注入小值，生产别改） */
+	sampleMs?: number;
+	/** 回执稳定窗口（默认 `PANE_RECEIPT_STABLE_MS`；单测注入小值，生产别改） */
+	receiptStableMs?: number;
 }
 
 const realPaneWaitOps: PaneWaitOps = {
@@ -1683,7 +1772,12 @@ const realPaneWaitOps: PaneWaitOps = {
 };
 
 /**
- * 等一个 pane 里的 pi 跑完（每 2s 看一次；pane 没了 / 回到 shell / 交了回执 / 到点 / **卡死**）。
+ * 等一个 pane 里的 pi 跑完（pane 没了 / 交了回执 / 到点 / **卡死**）。
+ *
+ * **完成信号只有两个**（别再拿「回到 shell 提示符」当信号，交互式 pi 答完不退出）：
+ *   ① 硬信号：会话正文里出现完整的 `</result>`
+ *   ② 软信号：出现**回执正文**（`paneHasReceiptText`）且连续 `PANE_RECEIPT_STABLE_MS` 没变化
+ *      —— 用来救「回执写全了、但忘了写 `<result>`」的活（以前这种必然超时 → 误判失败）
  *
  * 卡死看门狗（`outcome: "stalled"`）就是在这个循环里顺带做的：
  * 每轮已经读了一次屏幕，拿它和上一次比，记住「最后一次变化」的时刻；
@@ -1701,15 +1795,21 @@ export async function waitPaneDone(
 	ops: PaneWaitOps = realPaneWaitOps,
 ): Promise<{ outcome: PaneOutcome; text: string; tail: string; stallLog: string[]; error?: string }> {
 	const started = Date.now();
+	const sampleMs = Number.isFinite(ops.sampleMs) ? Number(ops.sampleMs) : PANE_SAMPLE_MS;
+	const receiptStableMs = Number.isFinite(ops.receiptStableMs) ? Number(ops.receiptStableMs) : PANE_RECEIPT_STABLE_MS;
 	let text = "";
 	// ---- 卡死看门狗的账 ----
 	let lastSeen = ""; // 上一次看到的「屏幕 + 会话正文」指纹
 	let lastChangeAt = started; // 最后一次变化时刻（初始 = 开跑那一刻）
 	const stallLog: string[] = [];
 	let lastReason = "";
+	// ---- 回执正文的稳定窗口账（和看门狗分开算：那只盯整屏，这里只盯「回执这段文字」）----
+	let receiptSrc = "";
+	let receiptSinceAt = 0;
 	// 采集异常计数：读 pane / paneList 对已关闭的 pane 真机上会抛错。
 	// 以前它直接把 waitPaneDone 的 promise 拒掉 → run 永不 settle → `.bg` 永远 running。
-	// 现在最多连续失败 3 次就带着「已有正文」果断返回。
+	// 也不再把「连续 3 次抛错」当失败：抛错只说明**读不到**，不等于活失败。
+	// 现在最多连续 `PANE_READ_FAIL_LIMIT` 次（≈ 24s）才放弃，且放弃时按「有没有正文」定终态。
 	let readFails = 0;
 	while (true) {
 		try {
@@ -1718,8 +1818,6 @@ export async function waitPaneDone(
 			if (t) text = t;
 			const read = ops.read(slot.paneId);
 			const tail = clampTail(read.text, STDERR_LIMIT);
-			const finished = paneAtShell(tail) && Date.now() - started > 3000;
-			const reported = /<\/result>/.test(text);
 			const alive = ops.alive(slot.paneId);
 
 			// 屏幕或会话正文只要变了 → 刷新「最后一次变化」
@@ -1730,12 +1828,30 @@ export async function waitPaneDone(
 				lastReason = "";
 			}
 
-			if (reported) return { outcome: "done", text, tail, stallLog };
+			// ---- ① 硬信号：会话正文里有完整的 <result>...</result> ----
+			if (/<\/result>/.test(text)) return { outcome: "done", text, tail, stallLog };
+
+			// ---- ② 软信号：回执正文（人话回执、没写 <result>）+ 连续稳定窗口没变化 ----
+			// 注意「稳定」看的是**回执这段文字**本身（不是整屏）：模型续写「证据 / 改了哪些文件」
+			// 会让文字延长 → 窗口重置 → 不会把正文截掉。
+			const receipt = paneHasReceiptText(text) || paneHasReceiptText(read.text);
+			if (receipt) {
+				const src = paneHasReceiptText(text) ? text : read.text;
+				if (src !== receiptSrc) {
+					receiptSrc = src;
+					receiptSinceAt = Date.now();
+				} else if (Date.now() - receiptSinceAt >= receiptStableMs) {
+					return { outcome: "done", text: text || tail, tail, stallLog };
+				}
+			} else {
+				receiptSrc = "";
+				receiptSinceAt = 0;
+			}
+
 			if (!alive) {
 				// pane 被关了：有正文就当跑完（可能用户手动关的），没正文算失败
 				return { outcome: text ? "done" : "failed", text, tail, stallLog };
 			}
-			if (finished) return { outcome: text ? "done" : "empty", text, tail, stallLog };
 			if (signal?.aborted) return { outcome: "failed", text, tail, stallLog };
 			if (Date.now() - started > timeoutMs) return { outcome: "timeout", text, tail, stallLog };
 
@@ -1758,13 +1874,28 @@ export async function waitPaneDone(
 			readFails += 1;
 			const msg = e instanceof Error ? e.message : String(e);
 			stallLog.push(`[收尾] 采集 pane 状态抛错（第 ${readFails} 次）：${msg}`);
-			if (readFails >= 3) {
-				return { outcome: text ? "done" : "failed", text, tail: "", stallLog, error: `采集 pane 状态连续抛错：${msg}` };
+			// 抛错时**优先用会话 jsonl 当事实来源**：pane 读不到 ≠ 活没跑完。
+			// pi 自己写的会话文件是另一条独立渠道，读得到正文就先记下来（放弃时据此判 done）。
+			try {
+				const file = findSessionFileIn(sessionDir, sessionId);
+				const t = lastAssistantTextIn(file);
+				if (t) text = t;
+			} catch {
+				/* 会话文件也读不到 → 只能靠计数兜底 */
+			}
+			if (readFails >= PANE_READ_FAIL_LIMIT) {
+				return {
+					outcome: text ? "done" : "failed",
+					text,
+					tail: "",
+					stallLog,
+					error: `采集 pane 状态连续抛错 ${readFails} 次：${msg}`,
+				};
 			}
 		}
 		if (signal?.aborted) return { outcome: "failed", text, tail: "", stallLog };
 		if (Date.now() - started > timeoutMs) return { outcome: "timeout", text, tail: "", stallLog };
-		await sleep(readFails ? 500 : 2000);
+		await sleep(sampleMs);
 	}
 }
 
@@ -2021,7 +2152,10 @@ async function tryRunInHerdr(
 				paneRename(slot.paneId, paneLabel("ok", tpl.key, slot.index));
 				setTimeout(() => releaseHerdrSlot(slot, true), 2000).unref?.();
 			} else if (cfg.paneKeepOnError && res.outcome !== "empty") {
-				paneRename(slot.paneId, paneLabel("err", tpl.key, slot.index));
+				// 保留 pane（内容还在，用户能看），但**先把里面的 pi 停掉**：
+				// 交互式 pi 答完/报错都不退出，留着就是活进程白占 pane（切过去像「卡住」）。
+				// 顺序：先 Ctrl+C（失败忽略）→ 再把标签改成「已停」。
+				stopKeptPane(slot.paneId, tpl.key, slot.index);
 				releaseHerdrSlot(slot, false);
 			} else {
 				releaseHerdrSlot(slot, true);
