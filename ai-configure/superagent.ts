@@ -16,6 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { registerSettings, settingsCtx, type SettingDef } from "./settings";
 import { patchExtCfg, readExtCfg } from "./shared";
+import { readUiConfig, UI_DEFAULTS, type UiMode } from "./herdr";
 
 /** 面板里的组名（和文章里的写法一致，带空格） */
 export const SUPERAGENT_GROUP = "Super Agent";
@@ -406,6 +407,24 @@ export function setSuperAgentOption(patch: Partial<{ report: ReportMode; retry: 
  */
 const EXTRA_DEFS: SettingDef[] = [];
 
+// ---------- UI 模式（Herdr 分屏）----------
+// 值存在 `ai-extensions.json` 的 `superagent` 块下：
+//   ui / mainSlots / overflowSlots / splitRatio / paneKeepOnError
+const UI_OPTIONS = [
+	"panel = 只在面板里显示卡片（默认，哪里都能用）",
+	"split = Herdr 左主右子分屏（需 Herdr）",
+	"tab = 每个子助理一个 Herdr 标签（需 Herdr）",
+	"auto = ≤2 个用 split，更多溢出到 tab；非 Herdr 自动降级 panel（**必须显式选**）",
+];
+const UI_VALUES: UiMode[] = ["panel", "split", "tab", "auto"];
+
+/** 改 superagent 块里的键（合并写回，不动别的） */
+function patchSuperAgent(patch: Record<string, unknown>): void {
+	const cur = readExtCfg().superagent;
+	const blk = cur && typeof cur === "object" ? (cur as Record<string, unknown>) : {};
+	patchExtCfg({ superagent: { ...blk, ...patch } });
+}
+
 function registerSuperAgentSettings(): void {
 	const defs: SettingDef[] = [
 		{
@@ -505,6 +524,79 @@ function registerSuperAgentSettings(): void {
 				routerSession = undefined; // 面板里改档位 = 回到配置值
 				setSuperAgentOption({ router: (ROUTER_VALUES.includes(v as RouterMode) ? v : "readonly") as RouterMode });
 			},
+		},
+		{
+			key: "superagent.ui",
+			group: SUPERAGENT_GROUP,
+			label: "UI 模式",
+			desc:
+				"子助理到底怎么显示出活的过程：\n\n" +
+				"- **panel**：只在面板里显示卡片（**默认**，哪里都能用）\n" +
+				"- **split**：Herdr 左主右子分屏 —— 主会话在左，右边竖切两格放子助理\n" +
+				"- **tab**：每个子助理一个 Herdr 标签\n" +
+				"- **auto**：≤2 个用 split，更多溢出到一个「sa:extra」标签里（2×2 四宫格），非 Herdr 自动降级 panel\n\n" +
+				"默认是 panel：分屏/auto 要你自己选（这条链依赖外部 CLI 与交互式进程，走错会把任务派成空的）。\n" +
+				"Super Agent 全局关掉时也会强制回到 panel。\n\n" +
+				"全部 pane/tab 都用 `sa:<助理>#<序号>` 命名；跑成功自动收起，失败保留（按回车关闭）。",
+			kind: "enum",
+			options: UI_OPTIONS,
+			values: UI_VALUES,
+			def: UI_DEFAULTS.ui,
+			get: () => readUiConfig().ui,
+			set: (v) => patchSuperAgent({ ui: UI_VALUES.includes(v as UiMode) ? v : UI_DEFAULTS.ui }),
+		},
+		{
+			key: "superagent.mainSlots",
+			group: SUPERAGENT_GROUP,
+			label: "主窗口格数",
+			desc: "主窗口右侧最多放几个子助理（默认 2，上限 2）。超出就溢出到 `sa:extra` 标签里。",
+			kind: "number",
+			min: 0,
+			max: 2,
+			def: UI_DEFAULTS.mainSlots,
+			get: () => readUiConfig().mainSlots,
+			set: (v) => patchSuperAgent({ mainSlots: Math.max(0, Math.min(2, Math.round(Number(v) || 0))) }),
+		},
+		{
+			key: "superagent.overflowSlots",
+			group: SUPERAGENT_GROUP,
+			label: "溢出标签格数",
+			desc: "`sa:extra` 标签里最多放几个子助理（默认 4 = 2×2 四宫格，上限 4）。再多的排队等槽位。",
+			kind: "number",
+			min: 0,
+			max: 4,
+			def: UI_DEFAULTS.overflowSlots,
+			get: () => readUiConfig().overflowSlots,
+			set: (v) => patchSuperAgent({ overflowSlots: Math.max(0, Math.min(4, Math.round(Number(v) || 0))) }),
+		},
+		{
+			key: "superagent.splitRatio",
+			group: SUPERAGENT_GROUP,
+			label: "主会话占比",
+			desc:
+				"切第一刀时**主会话保留的比例**（默认 0.6 = 主会话留 60%，子助理占右边 40%）。\n" +
+				"范围 0.05 ~ 0.95。改完下一次派活生效（已经切好的 pane 不会重排）。",
+			kind: "number",
+			min: 0.05,
+			max: 0.95,
+			def: UI_DEFAULTS.splitRatio,
+			get: () => readUiConfig().splitRatio,
+			set: (v) => {
+				const n = Number(v);
+				patchSuperAgent({ splitRatio: Number.isFinite(n) ? Math.min(0.95, Math.max(0.05, n)) : UI_DEFAULTS.splitRatio });
+			},
+		},
+		{
+			key: "superagent.paneKeepOnError",
+			group: SUPERAGENT_GROUP,
+			label: "失败保留 pane",
+			desc:
+				"子助理失败/超时时**不自动关它的 pane**（默认开）。\n\n" +
+				"留着你能切过去看它到底卡在哪；关掉就是失败也立刻收起。成功的 pane 无论如何都会自动收起。",
+			kind: "bool",
+			def: UI_DEFAULTS.paneKeepOnError,
+			get: () => readUiConfig().paneKeepOnError,
+			set: (v) => patchSuperAgent({ paneKeepOnError: v === true || v === "true" }),
 		},
 		{
 			key: "superagent.release",

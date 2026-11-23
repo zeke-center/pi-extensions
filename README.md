@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.4.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1165,6 +1165,27 @@ mcp: my-db
 - 事件流節流：实测 40 秒 429 条 `message_update`（≈ 10 条/秒），所以重画通知做了
   **100ms 合并**（`notifyLive()`），面板本来就是按秒刷的。
 - `/agents text` 能在无 TUI 环境（RPC / 调试）把当前状态打成纯文本。
+
+---
+
+## 模块 5 · Herdr 分屏模式（v2.5.0）
+
+派出去的活不只在面板里看 —— 装了 Herdr（终端分屏 CLI）的话，可以直接开窗看子助理跑。
+
+配置项：`superagent.ui`（写在 `~/.pi/agent/ai-extensions.json` 的 `superagent` 块下）
+
+| 值 | 行为 |
+|---|---|
+| `panel` | 只在面板里显示卡片（**默认**，哪里都能用） |
+| `split` | Herdr 分屏：主窗口 = **左主 + 右侧上下两格** |
+| `tab` | 每个子助理一个 Herdr tab |
+| `auto` | ≤2 个走 `split`，更多溢出到 tab |
+
+- **降级**：`split` / `tab` / `auto` 都需要 Herdr；非 Herdr 环境（没装 CLI / 不是交互式 TUI）**自动降级回 `panel`**，不会派成空任务。Super Agent 全局关掉时也强制 `panel`。
+- **布局**：主窗口右侧竖切两格（`mainSlots = 2`，比例 `splitRatio`）；放不下的进溢出 tab **`sa:extra#n`**，每个 tab **2×2 四宫格**，可多个（`sa:extra#2`、`#3`…）。pane/tab 一律命名 `sa:<助理>#<序号>`，跑成功自动收起，失败保留（按回车关）。
+- **回投**：同一次 `delegate(tasks)` 整批 settle 后**只回投 1 张汇总卡**（每条结论一行），不会一个助理一张。
+- **槽位**：拿不到格子会**排队等 60s**，仍无位 → 降级 rpc（卡片备注「槽位等待 60s 超时已降级 rpc」，不是派失败）。
+- **卡死判定**：pane **90s 无输出** → 判卡死，自动降级 rpc 重跑（备注「pane 卡死 90s（无输出）已降级 rpc」）。
 
 ---
 

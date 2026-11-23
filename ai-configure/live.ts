@@ -83,6 +83,14 @@ export interface LiveJob {
 	note?: string;
 	/** 终态落地时刻（面板“保鲜期”从这一刻算） */
 	endedAt?: number;
+	/**
+	 * Herdr 分屏模式专用：pane / tab / 模式 / 槽位号。
+	 * 都为空（undefined）= 老的 panel 模式（卡片画完整工具列表）。
+	 */
+	paneId?: string;
+	tabId?: string;
+	uiMode?: "panel" | "split" | "tab";
+	slotIndex?: number;
 }
 
 const TEXT_LIMIT = 2000;
@@ -608,8 +616,37 @@ function toolLine(t: ToolRun, width: number, now: number): LiveLine {
 	return { segs };
 }
 
+/**
+ * 分屏模式（split / tab）的 job：**只画一行**。
+ * 为什么不再画工具列表：用户在真 pane 里能看全—— 面板再列一遍只是把对话区挤没。
+ *   例：`▶ sa:general#1  改 delegate.ts  12s  → pane w2:pQ`
+ */
+function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
+	const { width, now, detail } = opts;
+	const icon = statusIcon(job);
+	const idx = job.slotIndex ?? 1;
+	const mark = job.status === "done" ? "✅" : job.status === "failed" || job.status === "timeout" ? "❌" : icon.text;
+	const tone: Tone = job.status === "done" ? "ok" : job.status === "failed" || job.status === "timeout" ? "err" : icon.tone;
+	const elapsed = fmtDur((isActiveStatus(job.status) ? now : (job.endedAt ?? job.lastEventAt)) - job.startedAt);
+	const target = job.paneId ? `  → pane ${job.paneId}` : job.tabId ? `  → tab ${job.tabId}` : "";
+	const lead = `  sa:${job.name}#${idx}`;
+	const tail = `  ${elapsed}${target}`;
+	const room = Math.max(8, width - widthOf(`${mark} ${lead}`) - widthOf(tail));
+	const segs: Seg[] = [
+		{ text: `${mark} `, tone },
+		{ text: `sa:${job.name}#${idx}`, tone: "bold" },
+		{ text: job.taskBrief ? `  ${oneLine(job.taskBrief, room)}` : "", tone: "muted" },
+		{ text: `  ${elapsed}`, tone: "muted" },
+	];
+	if (target) segs.push({ text: target, tone: "muted" });
+	if (job.note && detail) segs.push({ text: `  ${oneLine(job.note, Math.max(8, Math.floor(width / 3)))}`, tone: "warn" });
+	return [{ segs }];
+}
+
 /** 把一个 job 渲染成若干行。 */
 export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
+	// 分屏模式：一行收工（用户在真 pane 里看细节）
+	if (job.uiMode === "split" || job.uiMode === "tab") return renderPaneJob(job, opts);
 	const { width, now, detail } = opts;
 	const out: LiveLine[] = [];
 	const icon = statusIcon(job);

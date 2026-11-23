@@ -18,7 +18,19 @@
  *   <agentDir>/mcp.json           用户级（所有会话都加载的那种）
  *   <cwd>/.pi/mcp.json            项目级（/ai 拉的线上连接会落到这里）
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { WorkerPermissions } from "./permissions";
@@ -37,6 +49,104 @@ export interface McpPool {
 /** 影子目录要复制过去的「小配置」 */
 const SHADOW_COPY = ["models.json", "auth.json", "models-store.json"];
 // settings.json 单独处理：**不能整份复制** —— 里面的 packages 会让助理去重新克隆插件。
+
+/**
+ * 影子目录必须能看见这两个本地二进制。
+ * 缺了它们，pane 里起 pi 会打印 `fd not found. Downloading... / ripgrep not found. Downloading...`，
+ * 卡几秒再 timeout（用户没梯子），每个子助理都要来一遍 —— 压测里最响的报警就是这个。
+ */
+const SHADOW_BINS = process.platform === "win32" ? ["fd.exe", "rg.exe"] : ["fd", "rg"];
+
+/** 文件存在、是文件、非空（断链/空目录/半个复制都会在这里被判死） */
+function binFileOk(p: string): boolean {
+	try {
+		const st = statSync(p);
+		return st.isFile() && st.size > 0;
+	} catch {
+		return false;
+	}
+}
+
+/** 目录项存在（含断链：断链的 existsSync 是 false，但 lstat 能看见） */
+function entryExists(p: string): boolean {
+	try {
+		lstatSync(p);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function shadowBinReady(binDir: string): boolean {
+	return SHADOW_BINS.every((n) => binFileOk(join(binDir, n)));
+}
+
+/**
+ * 保证 `<dir>/bin/{fd,rg}` 可用：优先 **目录 junction**（零成本，Windows 不需要管理员权限），
+ * 建不成 / 建成了却读不到 → 退化成复制两个 exe。
+ *
+ * 返回 warning 列表（**绝不抛**）：这一步失败只是「启动时联网下载、慢几秒」，
+ * 不该把整条派活搞挂（errors 是给「宁可不起」用的，别混）。
+ */
+export function ensureShadowBin(dir: string, agentDir: string): string[] {
+	const warnings: string[] = [];
+	const src = join(agentDir, "bin");
+	const dest = join(dir, "bin");
+
+	// 已经可用（上一次的 junction，或上次退化复制的）→ 什么都不动
+	if (shadowBinReady(dest)) return warnings;
+
+	// 存在但不可用（空目录 / 断链 / 只拷了一半）→ 先摘干净，否则 junction 会 EEXIST
+	if (entryExists(dest)) {
+		try {
+			// 先 unlink：目录 junction 用 unlink 摘最安全（不会顺着链接去动目标）
+			try {
+				unlinkSync(dest);
+			} catch {
+				rmSync(dest, { recursive: true, force: true });
+			}
+		} catch (e) {
+			warnings.push(`shadow bin 清不掉（残留）：${e instanceof Error ? e.message : String(e)}`);
+			return warnings;
+		}
+	}
+
+	// ① junction：一次就能让所有影子目录共享同一份 bin
+	if (existsSync(src)) {
+		try {
+			symlinkSync(src, dest, process.platform === "win32" ? "junction" : "dir");
+			if (shadowBinReady(dest)) return warnings;
+			// 链建成了但目标里没有那两个 exe → 摘掉，走复制
+			try {
+				unlinkSync(dest);
+			} catch {
+				/* ignore */
+			}
+		} catch (e) {
+			warnings.push(`shadow bin junction 失败：${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	// ② 退化：复制两个 exe（约 8MB，只在 junction 不可用时发生）
+	if (existsSync(src)) {
+		try {
+			mkdirSync(dest, { recursive: true });
+			for (const n of SHADOW_BINS) {
+				const from = join(src, n);
+				if (!existsSync(from)) continue;
+				copyFileSync(from, join(dest, n));
+			}
+		} catch (e) {
+			warnings.push(`shadow bin 复制失败：${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	if (!shadowBinReady(dest)) {
+		const lack = SHADOW_BINS.filter((n) => !binFileOk(join(dest, n))).join("/");
+		warnings.push(`shadow bin 缺 ${lack}（子助理启动时会联网下载，且没网就 timeout）`);
+	}
+	return warnings;
+}
 
 export function localCatalogPath(): string {
 	return join(getAgentDir(), "mcp-catalog.json");
@@ -96,6 +206,8 @@ export interface ShadowResult {
 	missing: string[];
 	/** 关键配置写失败的原因（非空 = 应该拒绝启动，别拿半截配置去跑） */
 	errors: string[];
+	/** 不致命的问题（例如 bin 没接上 → 启动时会联网下载）：只记，不拦启动 */
+	warnings: string[];
 }
 
 /**
@@ -135,10 +247,18 @@ export function buildShadow(
 ): ShadowResult {
 	const agentDir = getAgentDir();
 	const errors: string[] = [];
+	const warnings: string[] = [];
 	// 目录名加「本次派发」后缀：同一个助理并发派发时不再互相覆盖 mcp.json
 	const suffix = opts.runSuffix ? `-${opts.runSuffix}` : "";
 	const dir = join(agentDir, "shadow", `${safeName(key)}${suffix}`);
 	mkdirSync(dir, { recursive: true });
+
+	// bin：不给它接上 fd/rg，每个子助理启动都要联网下载一次（慢 + 报警）
+	try {
+		warnings.push(...ensureShadowBin(dir, agentDir));
+	} catch (e) {
+		warnings.push(`shadow bin 准备失败：${e instanceof Error ? e.message : String(e)}`);
+	}
 
 	for (const f of SHADOW_COPY) {
 		const src = join(agentDir, f);
@@ -202,7 +322,7 @@ export function buildShadow(
 		errors.push(`mcp.json 写入失败：${e instanceof Error ? e.message : String(e)}`);
 	}
 
-	return { dir, names: Object.keys(chosen), missing, errors };
+	return { dir, names: Object.keys(chosen), missing, errors, warnings };
 }
 
 /**

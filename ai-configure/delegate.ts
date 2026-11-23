@@ -38,7 +38,7 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
@@ -62,12 +62,34 @@ import {
 	permsDeclared,
 } from "./permissions";
 import { guardCtx } from "./shared";
+import {
+	mainPaneId,
+	herdrAvailable,
+	paneClose,
+	paneLabel,
+	paneList,
+	paneReadEx,
+	paneRename,
+	paneRun,
+	paneSplit,
+	planSlot,
+	readUiConfig,
+	resolveUiMode,
+	tabBaseIndex,
+	tabClose,
+	tabCreate,
+	tabLabel,
+	workspaceId,
+	type UiConfig,
+	type UiMode,
+} from "./herdr";
 import { registerSettings } from "./settings";
 import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEnd, newJob, notifyLive, setLingerMs, type EndStatus, type LiveJob } from "./live";
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { isExtDisabled, onGateApply } from "./gate";
 import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
+import { AUTO_DELIVER_MAX_ATTEMPTS, autoDeliverSkipReason, bgPruneReason, mergeBgTask, type BgTaskFile, type BgTaskNext } from "./bg-store";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -147,6 +169,8 @@ interface Names {
 }
 
 type Outcome = "done" | "timeout" | "failed" | "empty" | "busy";
+/** pane 里等到的结局：多一个 "stalled"（看门狗收掉的）—— 它不对应 RunResult.outcome，而是**转降级 rpc 重跑** */
+type PaneOutcome = Outcome | "stalled";
 
 interface RunResult {
 	outcome: Outcome;
@@ -171,6 +195,8 @@ interface RunResult {
 	tpl: Template;
 	task: string;
 	resumed: boolean;
+	/** pane 这条路降级过（派发失败 / 卡死 / 槽位等不到）→ 批次汇总卡里标 ⚠️ */
+	degradeNote?: string;
 }
 
 // ======================= 模板加载 =======================
@@ -735,6 +761,50 @@ ${task}
 不要猜，不要编。做不到就说做不到。`;
 }
 
+/**
+ * 一次运行里 `type:"prompt"` 的**闸门** —— 碎片事故的防回归。
+ *
+ * 事故现象（真事，见 README 的 Herdr 一节）：worker 会话里出现一长串**碎片** user 消息
+ * （`test` / `→` / `12` / reportRule 中段…），每段都被 pi 当成一条独立 prompt 跑掉。
+ * 也就是「同一次运行被投递了多次 prompt」，而**谁都不报错**。
+ *
+ * 所以把「发 prompt」收敛成一个可计数的对象：
+ *   - 任务正文：**只准 1 条**；第二次直接拒绝（宁可少发，也不许把半截文本再投一遍）
+ *   - 到点追问：只有「硬收尾真的开火了」（allowWrapUp）之后才准发第 2 条，且只准一次
+ * 单测直接断言 count / 拒绝行为，不用起子进程。
+ */
+function makePromptGate(): {
+	task(message: string): boolean;
+	wrapUp(message: string): boolean;
+	allowWrapUp(): void;
+	readonly count: number;
+	readonly messages: string[];
+} {
+	const messages: string[] = [];
+	let wrapUpAllowed = false;
+	return {
+		task(message: string): boolean {
+			if (messages.length > 0) return false;
+			messages.push(message);
+			return true;
+		},
+		wrapUp(message: string): boolean {
+			if (!wrapUpAllowed || messages.length !== 1) return false;
+			messages.push(message);
+			return true;
+		},
+		allowWrapUp(): void {
+			wrapUpAllowed = true;
+		},
+		get count(): number {
+			return messages.length;
+		},
+		get messages(): string[] {
+			return messages;
+		},
+	};
+}
+
 /** 一条工具调用的耗时（卡片用） */
 interface ToolRunBrief {
 	id: string;
@@ -758,6 +828,321 @@ interface Sink {
 
 function clampTail(s: string, limit: number): string {
 	return s.length > limit ? s.slice(-limit) : s;
+}
+
+/** 派活降级的卡片备注（必须让用户看出「本来想分屏，退回来了」） */
+const PANE_DEGRADED_NOTE = "pane 派发失败已降级";
+/** 卡死看门狗降级的卡片备注 */
+const PANE_STALLED_NOTE = "pane 卡死 90s（无输出）已降级 rpc";
+/** 槽位等不到（60s 超时）降级的卡片备注 */
+const SLOT_WAIT_NOTE = "pane 槽位等待 60s 超时已降级 rpc";
+/** 等「任务真的送到 worker」的上限 */
+const TASK_DELIVER_TIMEOUT_MS = 20_000;
+/**
+ * 卡死看门狗阈值：pane 连续这么久**一个字符都没变** → 判定卡死 → 收 pane + 降级 rpc。
+ * 实测：8 个并发里有 4 个挂到 12 分钟硬超时才判失败（pane 建好、pi 起来，然后静默卡住）。
+ * 90s 是「明显不正常，但又给了慢模型足够余地」的折中。要调就改这一个常量（别写死在多处）。
+ */
+export const PANE_IDLE_MS = 90_000;
+
+/**
+ * pane 分支的**兜底收尾**宽限：`waitPaneDone` 自己会在 timeoutMs 到点时返回，
+ * 但它前后任何一段（读 pane 抛错没人接 / finally 里又抛）都可能把 promise 挂住，
+ * 一旦挂住 run 就永远不 settle → `.bg` 一直 `running` → 回执永远不投。
+ * 所以 pane 分支另起一个「最长 timeoutMs + 这个宽限」的强制收尾定时器。
+ */
+export const HERDR_FINALIZE_GRACE_MS = 60_000;
+
+/**
+ * pane 屏幕上「正在执行」的迹象。
+ *
+ * 为什么需要它：任务本身可能在跑一个**长时间不出输出**的命令（装包、跑测试、等网络），
+ * 屏幕不变 ≠ 进程卡死。**只能在没有执行迹象时才判卡死**。
+ * 反过来，只要看到一条迹象就不判 —— 宁可漏杀（慢），也绝不误杀（把好好的活干掉）。
+ */
+const PANE_BUSY_HINTS: RegExp[] = [
+	/[\u2801-\u28ff]/, // ⠋⠙⠹ 这类 spinner 字形（TUI 在画界面）
+	/正在执行|执行中|运行中|思考中|等待中/, // 中文状态词
+	/\b(running|executing|thinking|waiting|installing)\b/i,
+	/esc to interrupt|按\s*esc\s*中断/i,
+];
+
+/** pane 屏幕上有没有「正在执行」的迹象（纯函数） */
+export function paneShowsActivity(output: string): boolean {
+	const t = String(output ?? "");
+	if (!t.trim()) return false;
+	return PANE_BUSY_HINTS.some((re) => re.test(t));
+}
+
+export interface PaneStallCtx {
+	/** pane 还在吗（paneList 里能看到）—— 已经消失就不叫「卡死」，走结束路径 */
+	alive?: boolean;
+	/** 这次 pane read 成功了吗？失败 = 拿不到判断依据 */
+	readable?: boolean;
+	/** 最新一次读到的屏幕内容 */
+	output?: string;
+	/** 阈值（默认 PANE_IDLE_MS，单测可注入小值） */
+	idleMs?: number;
+}
+
+/**
+ * 卡死判定的**纯函数**（不读时间、不碰 herdr，只做算术 + 字符串判断 → 可单测）。
+ *
+ * 判卡死必须**同时**满足：
+ *   ① pane 还活着（消失 → 交给「pane 被关」的结束路径）
+ *   ② 这次读取成功（读不到 → 没有判断依据 → 只记日志不杀）
+ *   ③ 任务已经送到过（没送到 → 交给任务送达校验那套，别抢它的活）
+ *   ④ 连续 idleMs 毫秒内容完全没变
+ *   ⑤ 屏幕上**看不到**「正在执行」迹象（看得到 → 可能只是在跑长命令，不杀）
+ *   ⑥ 屏幕不是空白（空屏啥也说明不了 → 同样算「没有判断依据」，不杀）
+ *
+ * 任何一条不满足都返回 false —— 默认不杀。
+ */
+export function isPaneStalled(
+	lastChangeAt: number,
+	now: number,
+	hasDelivered: boolean,
+	ctx: PaneStallCtx = {},
+): boolean {
+	const alive = ctx.alive !== false;
+	const readable = ctx.readable !== false;
+	const output = String(ctx.output ?? "");
+	const idleMs = Number.isFinite(ctx.idleMs) ? Number(ctx.idleMs) : PANE_IDLE_MS;
+	if (!alive) return false; // ① 已消失 → 结束路径
+	if (!readable) return false; // ② 拿不到输出 → 只记日志
+	if (!hasDelivered) return false; // ③ 未送达 → 送达校验负责
+	if (!output.trim()) return false; // ⑥ 空屏 → 没有判断依据
+	const idle = Number(now) - Number(lastChangeAt);
+	if (!(idle >= idleMs)) return false; // ④ 还没到阈值
+	if (paneShowsActivity(output)) return false; // ⑤ 有执行迹象 → 不杀
+	return true;
+}
+
+/** 卡死判定的「为什么不杀」——只用于记日志（拿不到依据时也留证据） */
+export function paneStallReason(
+	lastChangeAt: number,
+	now: number,
+	hasDelivered: boolean,
+	ctx: PaneStallCtx = {},
+): "stalled" | "gone" | "no-read" | "undelivered" | "empty" | "busy" | "idle" {
+	if (isPaneStalled(lastChangeAt, now, hasDelivered, ctx)) return "stalled";
+	if (ctx.alive === false) return "gone";
+	if (ctx.readable === false) return "no-read";
+	if (!hasDelivered) return "undelivered";
+	if (!String(ctx.output ?? "").trim()) return "empty";
+	if (paneShowsActivity(String(ctx.output ?? ""))) return "busy";
+	return "idle";
+}
+
+/** `finalizeHerdrRun()` 的入参 */
+export interface HerdrFinalizeInput {
+	/** 运行结果（和 `RunResult.outcome` 同源） */
+	outcome: Outcome;
+	/** 会话 jsonl 里抓到的最终文本（可能空 / 可能没有 `<result>`） */
+	text?: string;
+	/** 收尾异常信息 / 不属于任务本身的原因（写 lastError） */
+	error?: string;
+	/** 兜底计时器到点强制收尾（不是正常收尾） */
+	forced?: boolean;
+	/** 现在时刻（单测可注入） */
+	now?: number;
+}
+
+/** `finalizeHerdrRun()` 的产出：**应该写进 `.bg` 的终态字段** */
+export interface HerdrFinalizeFields {
+	/** 终态（绝不会是 `running`） */
+	status: BgTaskFile["status"];
+	/** 卡片正文（调用方已有更漂亮的卡片时不要覆盖它） */
+	resultText?: string;
+	/** 落盘这一刻**一定还没投递**（投递由 pollBgTasks 做，之后单独写 true） */
+	delivered: boolean;
+	/** 结束时刻 */
+	finishedAt: number;
+	/** 排查线索（没交回执 / 收尾异常 / 兜底计时器） */
+	lastError?: string;
+	/** 判定依据，只用于日志/单测 */
+	reason: string;
+}
+
+/**
+ * pane 分支的终态判定（**纯函数**：不读时间、不碰文件、不碰 herdr → 可单测）。
+ *
+ * 回归背景：pane 模式的收尾曾经只写在 rpc 分支里 —— pane 跑完后
+ * 「解析 `<result>` → markEnd → 写 `.bg` 终态 → 投递」整段没跑，
+ * `.bg` 永远停在 `running`，回执永远不投（rpc 那 1 个任务正常，正好说明问题在收尾路径）。
+ * 现在 pane / rpc 两条路径都过这里，保证判定口径一致。
+ */
+export function finalizeHerdrRun(input: HerdrFinalizeInput): HerdrFinalizeFields {
+	const text = String(input.text ?? "");
+	const receipt = parseReport(text);
+	const now = Number.isFinite(input.now) ? Number(input.now) : Date.now();
+	const finishedAt = now;
+	const fields = (status: BgTaskFile["status"], reason: string, lastError?: string): HerdrFinalizeFields => ({
+		status,
+		// 有正文就有卡片（没正文也给一句人话，别让 .bg 只剩 status）
+		resultText: text.trim() ? text : lastError ? `（没有正文）${lastError}` : undefined,
+		delivered: false, // 写终态这一刻一定还没投；投递成功后会再写一次 true
+		finishedAt,
+		...(lastError ? { lastError } : {}),
+		reason,
+	});
+
+	// ① 兜底计时器：pane 收尾没跑完 → 按超时算（任务没结束，不是 done）
+	if (input.forced) return fields("timeout", "forced", input.error ?? "兜底计时器到点强制收尾");
+	// ② 收尾自己抛了：判 failed（除非本来就是超时/空跑，那是更准确的口径）
+	if (input.error) {
+		if (input.outcome === "timeout") return fields("timeout", "error", input.error);
+		if (input.outcome === "empty") return fields("empty", "error", input.error);
+		return fields("failed", "error", input.error);
+	}
+	switch (input.outcome) {
+		case "done":
+			// 跑完了但**没交 `<result>`**：以前会被当成 done 混过去（卡片上看起来“成功”），
+			// 现在明确标 empty —— 既不是 failed，也绝不留在 running。
+			return receipt
+				? { ...fields("done", "receipt"), resultText: text }
+				: fields("empty", "no-receipt", "pane 跑完了但没交 <result> 回执");
+		case "timeout":
+			return fields("timeout", "timeout");
+		case "empty":
+			return fields("empty", "empty");
+		case "busy":
+		default:
+			return fields("failed", "failed");
+	}
+}
+
+/**
+ * 把 `finalizeHerdrRun()` 算出来的终态写进 `.bg`（**合并写**，不覆盖已有卡片，不回退 `delivered`）。
+ *
+ * 为什么需要它：`opt.onSettle` 是调用方注册的回调，万一它没注册 / 自己抛了，
+ * 或者根本没有异步记账（同步模式），`.bg` 就会重新卡回 `running`。这里是死守的一道。
+ * 另外：`writeBgTask` 内部自己 try/catch 过，这里再包一层 —— 它必须是最后一根稻草，不能再抛。
+ */
+export function writeHerdrBgTerminal(bgId: string | undefined, fields: HerdrFinalizeFields): BgTaskFile | undefined {
+	if (!bgId) return undefined;
+	try {
+		const prev = readBgTask(bgId);
+		if (!prev) return undefined;
+		return writeBgTask({
+			...prev,
+			status: fields.status,
+			delivered: prev.delivered === true, // 单向：已经投过就永远是 true
+			resultText: prev.resultText ?? fields.resultText,
+			finishedAt: prev.finishedAt ?? fields.finishedAt,
+			...(fields.lastError ? { lastError: fields.lastError } : {}),
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * pane 分支的兜底计时器（**到点必然收尾**，自己绝不抛）。
+ *
+ * 为什么不直接用 `setTimeout`：收尾逻辑可能把 promise 挂住（读 pane 抛错没人接），
+ * 到点回调里如果又抛，就真的什么都没发生。这里把回调包进 try/catch 并 `unref()`。
+ */
+export function armHerdrFinalizeGuard(ms: number, onFire: () => void): { clear: () => void } {
+	const t = setTimeout(() => {
+		try {
+			onFire();
+		} catch {
+			/* 兜底回调自己抛了就没别的手段了，但绝不再往外抛 */
+		}
+	}, Math.max(0, Number.isFinite(ms) ? ms : 0));
+	t.unref?.();
+	return {
+		clear: () => {
+			try {
+				clearTimeout(t);
+			} catch {
+				/* ignore */
+			}
+		},
+	};
+}
+
+/** 降级过的卡片：把「已降级」标记接在终态备注前面（不让 markEnd 把它抹掉） */
+function withDegrade(job: LiveJob, note: string | undefined): string | undefined {
+		// 两种降级备注都要保住：派发失败 / 卡死看门狗收掉 / 槽位等不到（都用 rpc 接着跑）
+	if (job.note !== PANE_DEGRADED_NOTE && job.note !== PANE_STALLED_NOTE && job.note !== SLOT_WAIT_NOTE) return note;
+	return note ? `${job.note}；${note}` : job.note;
+}
+
+/** 删掉 launcher 的两个临时文件（脚本 + JSON） */
+function dropLauncher(script: string | undefined): void {
+	if (!script) return;
+	for (const f of [script, launcherJsonPath(script)]) {
+		try {
+			rmSync(f, { force: true });
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** 会话 jsonl 里第一条 user 消息的正文（= 派活时塞进去的任务文本；没有就 undefined） */
+function firstUserTextIn(file: string | undefined): string | undefined {
+	return userTextIn(file, "first");
+}
+
+/** 会话 jsonl 里最后一条 user 消息的正文（resume 时新任务追加在末尾） */
+function lastUserTextIn(file: string | undefined): string | undefined {
+	return userTextIn(file, "last");
+}
+
+function userTextIn(file: string | undefined, which: "first" | "last"): string | undefined {
+	if (!file) return undefined;
+	let lines: string[];
+	try {
+		lines = readFileSync(file, "utf8").split(/\r?\n/);
+	} catch {
+		return undefined;
+	}
+	const forward = which === "first";
+	for (let n = 0; n < lines.length; n++) {
+		const s = lines[forward ? n : lines.length - 1 - n]!.trim();
+		if (!s) continue;
+		let o: Record<string, unknown>;
+		try {
+			o = JSON.parse(s) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		if (o.type !== "message") continue;
+		const m = (o.message ?? {}) as Record<string, unknown>;
+		if (m.role !== "user") continue;
+		return extractText(m.content);
+	}
+	return undefined;
+}
+
+/**
+ * 等 worker 会话里出现「任务文本」。
+ *   相等    → 送到了
+ *   不相等  → 任务被吃掉（立即 false，不用等满 20s）
+ *   文件没出现 / 一直等不到 → 超时 false
+ * resume（启动前文件已存在）看**最后一条** user 消息，否则看**第一条**。
+ */
+async function waitTaskDelivered(
+	sessionDir: string,
+	sessionId: string,
+	task: string,
+	resumed: boolean,
+	timeoutMs = TASK_DELIVER_TIMEOUT_MS,
+): Promise<boolean> {
+	const want = String(task ?? "").trim();
+	const started = Date.now();
+	while (true) {
+		const file = findSessionFileIn(sessionDir, sessionId);
+		const got = resumed ? lastUserTextIn(file) : firstUserTextIn(file);
+		if (got !== undefined) return String(got).trim() === want;
+		if (Date.now() - started > timeoutMs) return false;
+		// 这里用**不 unref** 的定时器：正在等一个真实 I/O 结果，不能因为“没别的事干”
+		// 就把进程提前送走（那会变成「任务送没送到」永远没有结论）。
+		await new Promise((r) => setTimeout(r, 500));
+	}
 }
 
 function extractText(content: unknown): string {
@@ -863,6 +1248,842 @@ function summarizeTools(tools: string[]): string {
 	return [...m].map(([k, v]) => (v > 1 ? `${k}×${v}` : k)).join(" → ");
 }
 
+// ======================= Herdr 分屏（split / tab）—— Super Agent 的可见 UI =======================
+//
+// 布局规则（用户定的）：
+//   主窗口：左边主会话不动，右侧竖切两格 → 最多 2 个子助理
+//   超过 2 个：另开一个 tab（叫 sa:extra#n）放子助理，2×2 四宫格 → 最多 4 个
+//   再多：溢出 tab 也满了 → 再开一个 `sa:extra#2`、`#3`…（每个 tab 最多 overflowSlots 个 pane）
+//   还拿不到格（例如主窗口满 + tab 建不出来 / 全是别人留着没关的失败 pane）→ 等槽位，
+//   最多等 HERDR_SLOT_WAIT_MS，超时才降级成 rpc 无头模式
+//
+// 所有 herdr 调用都走 herdr.ts 的薄封装 —— 它**绝不抛**。
+// 任何一步失败（没有 herdr / 切不出来 / pane run 失败）→ 返回 undefined，
+// runAssistant 自动退回原来的 rpc 无头模式（原逻辑**一行不改**，留作 fallback）。
+
+interface HerdrSlot {
+	/** 全局第几格（1-based，planSlot 用的就是它） */
+	index: number;
+	paneId: string;
+	tabId?: string;
+	where: "main" | "overflow";
+}
+
+/** 进程内槽位表（split / tab 两种模式共用）：key = 全局第几格（planSlot 的 index） */
+const herdrSlots = new Map<number, HerdrSlot>();
+/**
+ * 溢出 tab：key = tab 编号 n（1-based，标签就是 `sa:extra#<n>`），value = herdr 的 tabId。
+ * 「tab n 的第 m 格」= tabBaseIndex(n, cfg) + m - 1（和 planSlot 共用同一个公式）。
+ */
+const herdrExtraTabs = new Map<number, { tabId: string }>();
+/** tab 模式（每个子助理一个标签）的序号 */
+let herdrTabModeSeq = 0;
+
+/** 拿不到槽位时最多等多久（到点才降级 rpc；期间每 HERDR_SLOT_POLL_MS 轮询一次） */
+export const HERDR_SLOT_WAIT_MS = 60_000;
+/** 等槽位时的轮询间隔（每次先 prune 掉已关闭 pane 的账，再看有没有空格） */
+export const HERDR_SLOT_POLL_MS = 300;
+/** 「不是满了、只是切 pane 抖了一下」的重试间隔（沿用旧行为：只补一次） */
+const HERDR_SLOT_RETRY_MS = 300;
+
+/** 等槽位时可以注入时间 / 轮询（单测用：不用真等 60s） */
+export interface SlotWaitDeps {
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+	/** 总等待上限（默认 HERDR_SLOT_WAIT_MS） */
+	waitMs?: number;
+}
+
+/**
+ * 槽位分配要用的 herdr 操作。
+ * 单独抽一层是为了**单测能注入假桩**（真 herdr 没法在 CI 里跑，但它正是并发撞车的地方）。
+ */
+interface HerdrSlotOps {
+	mainPaneId(): string | undefined;
+	workspaceId(): string | undefined;
+	paneList(): { paneId: string }[];
+	paneSplit(target: string, dir: "right" | "down", ratio: number, cwd: string): string | undefined;
+	tabCreate(workspace: string, label: string, cwd: string): { tabId: string; paneId: string } | undefined;
+	tabClose(tabId: string): boolean;
+	/** 可选：归还槽位时关 pane（单测注入用；不传就走真的 paneClose） */
+	paneClose?(paneId: string): boolean;
+}
+
+const realHerdrSlotOps: HerdrSlotOps = { mainPaneId, workspaceId, paneList, paneSplit, tabCreate, tabClose, paneClose };
+let herdrSlotOps: HerdrSlotOps = realHerdrSlotOps;
+
+/** 单测用：注入假 herdr 桩 / 传 undefined 复位 */
+export function setHerdrSlotOps(ops?: HerdrSlotOps): void {
+	herdrSlotOps = ops ?? realHerdrSlotOps;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const t = setTimeout(resolve, ms);
+		t.unref?.();
+	});
+}
+
+/** 启动脚本对应的数据文件（同名的 .json） */
+function launcherJsonPath(script: string): string {
+	return script.replace(/\.mjs$/i, ".json");
+}
+
+/**
+ * 把「跑这个 worker 的完整命令行」写成 **JSON 数据 + 纯 ASCII Node 启动脚本**，再用 pane run 启动脚本。
+ *
+ * 事故史：
+ *   1) 命令行直接拼进 .ps1 —— PowerShell 按 ANSI（GBK）而不是 UTF-8 读脚本，
+ *      即使加 BOM 也不保险（`pane run` 那层会把命令串再穿一遍），中文全乱、
+ *      位置参数（任务文本）被吃掉，worker 只收到几个碎片后空跑一趟。
+ *   2) 改成 .ps1 读 JSON —— 仍是 PowerShell 解析：`--name` 存成 `涓昏繘绋?閫氱敤鍔╃悊2`，
+ *      任务文本照样丢。根因是「让 shell 帮忙传字符串」这件事本身。
+ *
+ * 现在（不经任何 shell 解析）：
+ *   sa-pane-<tag>.json —— { node, args, env }，UTF-8 **无 BOM**，中文/换行/引号全由 JSON 保证原样
+ *   sa-pane-<tag>.mjs  —— **纯 ASCII**，只做三件事：读 JSON → 合并 env → spawn 子进程
+ * pane run 的命令 = `node "<mjs>" "<json>"`：纯 ASCII、无反斜杠、无引号嵌套 → 编码/转义无坑可踩。
+ */
+type EnvPairs = Array<[string, string]>;
+
+/** launcher 的数据部分（单独一个函数，方便单测直接断言「中文原样」） */
+function paneLauncherPayload(
+	node: string,
+	args: string[],
+	env: EnvPairs,
+): { node: string; args: string[]; env: Record<string, string> } {
+	const envObj: Record<string, string> = {};
+	for (const [k, v] of env) {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+		envObj[k] = String(v);
+	}
+	return { node, args: [...args], env: envObj };
+}
+
+function writePaneLauncher(tpl: Template, argv: string[], opt: RunOptions, tag: string): string | undefined {
+	try {
+		const stem = join(tmpdir(), `sa-pane-${tag}`);
+		const jsonFile = `${stem}.json`;
+		const file = `${stem}.mjs`;
+		const envs: EnvPairs = [
+			["PI_CODING_AGENT_DIR", opt.shadowDir],
+			["PI_SKIP_VERSION_CHECK", "1"],
+			...Object.entries(tpl.env ?? {}),
+		];
+		// argv[0] = pi 的 cli.js；用 node 跑它（和 spawnWatched 里的约定一致）
+		const payload = paneLauncherPayload(process.execPath, argv, envs);
+		// 数据文件：UTF-8 **无 BOM**（JSON.parse 直接读得对；中文/换行/引号全由 JSON 保证原样）
+		writeFileSync(jsonFile, JSON.stringify(payload), "utf8");
+
+		// 脚本本体是常量、一个中文字符都没有（纯 ASCII），两个平台通用。
+		// 路径不写进脚本：由 `pane run` 的命令串当参数传（命令里一律正斜杠）。
+		writeFileSync(file, launcherSource(), "utf8");
+		return file;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 启动脚本源码（纯 ASCII：不写路径、不拼命令行，只读 JSON 后 spawn） */
+function launcherSource(): string {
+	return [
+		'import { readFileSync } from "node:fs";',
+		'import { spawn } from "node:child_process";',
+		"const cfgPath = process.argv[2];",
+		'const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));',
+		'const child = spawn(cfg.node, cfg.args, { stdio: "inherit", env: { ...process.env, ...cfg.env } });',
+		'child.on("exit", (code) => process.exit(code ?? 0));',
+		'child.on("error", () => process.exit(1));',
+		"",
+	].join("\n");
+}
+
+/** pane run 的命令：`node "<mjs>" "<json>"`（纯 ASCII、无反斜杠、无引号嵌套、不经 PowerShell） */
+function paneLaunchCommand(script: string): string {
+	// ⚠️ 实测：`pane run` 的命令串里反斜杠会被吃（C:\Users\x → C:Usersx），所以一律正斜杠。
+	const s = script.replace(/\\/g, "/");
+	const j = launcherJsonPath(s);
+	return `node "${s}" "${j}"`;
+}
+
+/**
+ * 记一笔槽位。
+ *
+ * 断言：**同一个 paneId 绝不允许被两个槽位同时引用**。
+ * 压测里就是这样撞的车：两个任务都看到「#1 空」，都往同一个 pane 里灌命令，
+ * 结果第二个任务失败 → 整条 pane 路径返回 undefined → 降级 rpc。
+ * 真撞上了宁可丢掉这一格（调用方降级 / 重试），也不能两个任务共用一个 pane。
+ */
+function recordHerdrSlot(slot: HerdrSlot): HerdrSlot | undefined {
+	for (const s of herdrSlots.values()) {
+		if (s.paneId === slot.paneId && s.index !== slot.index) return undefined;
+		// 同一格也不许被两笔账先后覆盖（覆盖 = 前一笔的 pane 从此没人回收）
+		if (s.index === slot.index && s.paneId !== slot.paneId) return undefined;
+	}
+	herdrSlots.set(slot.index, slot);
+	return slot;
+}
+
+/** 某个溢出 tab 里现存的槽位（按全局编号排序 = 切 pane 的先后顺序） */
+function slotsInTab(tabId: string): HerdrSlot[] {
+	return [...herdrSlots.values()].filter((s) => s.tabId === tabId).sort((a, b) => a.index - b.index);
+}
+
+/**
+ * 溢出 tab 里一个 pane 都不剩了 → 关掉该 tab（用户切过去不会看到空标签）。
+ * 如果这个 tab 是我们记在账上的，账也一起销掉（编号会被下个溢出 tab 复用）。
+ */
+function closeTabIfEmpty(tabId: string | undefined): void {
+	if (!tabId) return;
+	if (slotsInTab(tabId).length > 0) return;
+	for (const [n, t] of [...herdrExtraTabs]) if (t.tabId === tabId) herdrExtraTabs.delete(n);
+	const close = herdrSlotOps.tabClose ?? tabClose;
+	close(tabId);
+}
+
+/** 一次分配的结果：`full` = 「格子真的满了，等会儿可能就空出来」（其它失败都是 herdr 抽风） */
+type SlotAttempt = { slot?: HerdrSlot; full: boolean };
+
+/** 挑一个槽位并真把它切出来。拿不到（没 herdr / 切失败 / 撞车 / 满了）→ 给出原因 */
+function allocHerdrSlotOnce(cwd: string, cfg: UiConfig, mode: UiMode): SlotAttempt {
+	const main = herdrSlotOps.mainPaneId();
+	const ws = herdrSlotOps.workspaceId();
+	if (!main || !ws) return { full: false };
+	pruneHerdrSlots(); // 先把「用户已经关掉的 pane」从账上抹掉
+
+	// tab 模式：每个子助理一个标签（自带一格）
+	if (mode === "tab") {
+		herdrTabModeSeq += 1;
+		const t = herdrSlotOps.tabCreate(ws, tabLabel(herdrTabModeSeq), cwd);
+		if (!t) return { full: false };
+		return { slot: recordHerdrSlot({ index: herdrTabModeSeq, paneId: t.paneId, tabId: t.tabId, where: "overflow" }), full: false };
+	}
+
+	const mainSlots = Math.max(0, Math.min(2, Math.round(Number(cfg.mainSlots) || 0)));
+	const overflowSlots = Math.max(0, Math.min(4, Math.round(Number(cfg.overflowSlots) || 0)));
+
+	// ---- 1) 主窗口：最小的空格 ----
+	for (let i = 1; i <= mainSlots; i++) {
+		if (herdrSlots.has(i)) continue;
+		const plan = planSlot(i, cfg);
+		if (plan.where !== "main" || !plan.split) continue;
+		const target = plan.anchor === "root" ? main : herdrSlots.get(Number(plan.anchor))?.paneId;
+		if (!target) continue;
+		const paneId = herdrSlotOps.paneSplit(target, plan.split, plan.ratio ?? cfg.splitRatio, cwd);
+		if (!paneId) return { full: false };
+		const slot = recordHerdrSlot({ index: i, paneId, where: "main" });
+		return { slot, full: false };
+	}
+
+	// 主窗口满了但用户显式关了溢出（overflowSlots=0）→ 这就是「满了」，等用户腾格子
+	if (overflowSlots < 1) return { full: true };
+
+	// ---- 2) 溢出：先补已有 tab 里还没用的格子（不重开 tab）----
+	for (const n of [...herdrExtraTabs.keys()].sort((a, b) => a - b)) {
+		const tab = herdrExtraTabs.get(n);
+		if (!tab) continue;
+		const panes = slotsInTab(tab.tabId);
+		if (panes.length >= overflowSlots) continue; // 这个 tab 满了 → 看下一个 / 新建
+		const pos = panes.length + 1;
+		const index = tabBaseIndex(n, cfg) + pos - 1;
+		if (herdrSlots.has(index)) continue; // 记账有洞，这个 tab 不再补（宁缺不错位）
+		const plan = planSlot(index, cfg);
+		if (!plan.split) continue;
+		const anchor = plan.anchor === "root" || plan.anchor === undefined ? undefined : herdrSlots.get(Number(plan.anchor))?.paneId;
+		if (!anchor) {
+			// 该 tab 的锚点 pane 已经不在了（用户手动关了一格）→ 这个 tab 不能再切，关掉重开
+			for (const [k, t] of [...herdrExtraTabs]) if (t.tabId === tab.tabId) herdrExtraTabs.delete(k);
+			closeTabIfEmpty(tab.tabId);
+			continue;
+		}
+		const paneId = herdrSlotOps.paneSplit(anchor, plan.split, plan.ratio ?? 0.5, cwd);
+		if (!paneId) return { full: false };
+		const slot = recordHerdrSlot({ index, paneId, tabId: tab.tabId, where: "overflow" });
+		return { slot, full: false };
+	}
+
+	// ---- 3) 现有 tab 都满了 → 新开一个 `sa:extra#n`（n 取最小的、格子全空的编号）----
+	for (let n = 1; n <= 64; n++) {
+		if (herdrExtraTabs.has(n)) continue;
+		const base = tabBaseIndex(n, cfg);
+		let free = true;
+		for (let i = base; i < base + overflowSlots; i++) if (herdrSlots.has(i)) free = false;
+		if (!free) continue;
+		const t = herdrSlotOps.tabCreate(ws, tabLabel(n), cwd);
+		if (!t) return { full: true }; // 建不出 tab（herdr 不让再开）→ 等会儿再试
+		herdrExtraTabs.set(n, { tabId: t.tabId });
+		const slot = recordHerdrSlot({ index: base, paneId: t.paneId, tabId: t.tabId, where: "overflow" });
+		if (!slot) {
+			closeTabIfEmpty(t.tabId);
+			return { full: false };
+		}
+		return { slot, full: false };
+	}
+	return { full: true };
+}
+
+/**
+ * 槽位分配的**进程内互斥**：从「找空槽」到「split + 记账」必须是一个整体。
+ * 不互斥时：两个并发任务都看到「#1 空」→ 都去切同一个 pane → 第二个失败 → 降级。
+ * 一个 Promise 链就够（不需要引依赖）。
+ */
+let slotAllocQueue: Promise<unknown> = Promise.resolve();
+
+function serializeSlotAlloc<T>(fn: () => T): Promise<T> {
+	// 前一个失败也要继续排（用同一个 fn 当 onRejected）
+	const run = slotAllocQueue.then(fn, fn);
+	slotAllocQueue = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	return run;
+}
+
+/**
+ * 拿一个槽位（**满的时候排队等，不再立刻降级 rpc**）：
+ *   1. 先直接试一次；
+ *   2. 不是「满了」的失败（切 pane / 建 tab 抖了一下）→ 300ms 后补一次，拿不到就降级；
+ *   3. 真的满了 → 每 300ms 轮询（每次先 prune 掉已关 pane 的账），最多等 HERDR_SLOT_WAIT_MS；
+ *      中途有人关掉 pane / 有 tab 腾出来 → 立刻拿到；到点还是没有 → 返回 undefined（降级 rpc）。
+ */
+async function allocHerdrSlot(
+	cwd: string,
+	cfg: UiConfig,
+	mode: UiMode,
+	deps: SlotWaitDeps = {},
+): Promise<HerdrSlot | undefined> {
+	const now = deps.now ?? Date.now;
+	const nap = deps.sleep ?? sleep;
+	const waitMs = Number.isFinite(deps.waitMs) ? Math.max(0, Number(deps.waitMs)) : HERDR_SLOT_WAIT_MS;
+
+	const first = await serializeSlotAlloc(() => allocHerdrSlotOnce(cwd, cfg, mode));
+	if (first.slot) return first.slot;
+	if (!first.full) {
+		// ⚠️ 这里的等一下**不能 unref**：否则事件环空了进程会先退（单测里就会“卡在未决 await”）
+		await new Promise<void>((resolve) => setTimeout(resolve, HERDR_SLOT_RETRY_MS));
+		const again = await serializeSlotAlloc(() => allocHerdrSlotOnce(cwd, cfg, mode));
+		return again.slot;
+	}
+
+	const deadline = now() + waitMs;
+	while (now() < deadline) {
+		await nap(Math.min(HERDR_SLOT_POLL_MS, Math.max(0, deadline - now())));
+		const r = await serializeSlotAlloc(() => allocHerdrSlotOnce(cwd, cfg, mode));
+		if (r.slot) return r.slot;
+		if (!r.full) return undefined; // 结构性失败：别空等 60s
+	}
+	return undefined;
+}
+
+/** 归还槽位（closePane=true 时把 pane 也关了；溢出 tab 里没人了就关 tab） */
+function releaseHerdrSlot(slot: HerdrSlot | undefined, closePane: boolean): void {
+	if (!slot) return;
+	if (!closePane) return; // 失败保留：账**也不销**（槽位留着，下次分配前用 pruneHerdrSlots 回收）
+	const close = herdrSlotOps.paneClose ?? paneClose;
+	close(slot.paneId);
+	herdrSlots.delete(slot.index);
+	closeTabIfEmpty(slot.tabId);
+}
+
+/**
+ * 回收「用户已经把 pane 关了」的槽位。
+ * 为什么要这一步：失败保留的 pane（paneKeepOnError）会一直占着槽位，
+ * 用户手动关掉后账要对得上 —— 不然槽位永远不释放，以后全降级成无头模式。
+ */
+function pruneHerdrSlots(): void {
+	if (herdrSlots.size === 0) {
+		// 账上没槽位但有「建了 tab 却没记上格」的残留 → 清掉（编号会给下个溢出 tab 复用）
+		for (const n of [...herdrExtraTabs.keys()].sort((a, b) => b - a)) {
+			const t = herdrExtraTabs.get(n);
+			if (!t) continue;
+			herdrExtraTabs.delete(n);
+			const close = herdrSlotOps.tabClose ?? tabClose;
+			close(t.tabId);
+		}
+		return;
+	}
+	const alive = new Set(herdrSlotOps.paneList().map((p) => p.paneId));
+	if (alive.size === 0) return; // herdr 刚挂/刚重启 —— 这轮先不下结论
+	const touchedTabs = new Set<string>();
+	for (const [idx, s] of [...herdrSlots]) {
+		if (alive.has(s.paneId)) continue;
+		herdrSlots.delete(idx);
+		if (s.tabId) touchedTabs.add(s.tabId);
+	}
+	// 整 tab 的 pane 都没了 → 关 tab（用户切过去不会看到空标签）
+	for (const tabId of touchedTabs) closeTabIfEmpty(tabId);
+}
+
+/** 按会话 ID 找会话文件（不依赖 assistant-sessions 目录结构，直接用本次的 sessionDir） */
+function findSessionFileIn(dir: string, id: string): string | undefined {
+	try {
+		const hit = readdirSync(dir).find((f) => f.endsWith(`_${id}.jsonl`));
+		return hit ? join(dir, hit) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 会话文件里**最后一条助手正文**（就是它的交卡） */
+function lastAssistantTextIn(file: string | undefined): string {
+	if (!file) return "";
+	let lines: string[];
+	try {
+		lines = readFileSync(file, "utf8").split(/\r?\n/);
+	} catch {
+		return "";
+	}
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const l = lines[i]!.trim();
+		if (!l) continue;
+		let o: Record<string, unknown>;
+		try {
+			o = JSON.parse(l) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		if (o.type !== "message") continue;
+		const m = (o.message ?? {}) as Record<string, unknown>;
+		if (m.role !== "assistant") continue;
+		const txt = extractText(m.content);
+		if (txt && txt.trim()) return txt;
+	}
+	return "";
+}
+
+/** pane 最后一行是不是又回到 shell 提示符了（= 我们丢进去的 pi 已经退出） */
+function paneAtShell(tail: string): boolean {
+	const lines = String(tail ?? "")
+		.split(/\r?\n/)
+		.map((l) => l.trimEnd())
+		.filter((l) => l.trim());
+	const last = lines[lines.length - 1] ?? "";
+	if (/^PS\s+[A-Za-z]:.*>\s*$/.test(last)) return true; // Windows PowerShell
+	if (/^[^\s]+@[^\s]+:[^\s]*\$\s*$/.test(last)) return true; // bash 常见 PS1
+	if (/^[A-Za-z]:\\[^>]*>\s*$/.test(last)) return true; // cmd
+	return false;
+}
+
+/**
+ * `waitPaneDone` 的现实采集口径（单测可以注入假桩，不用真 herdr）。
+ *
+ * 为什么要个接口：pane 刚被关时 `paneReadEx` / `paneList` 在真机上会抛错，
+ * 以前它直接把 waitPaneDone 的 promise 拒掉 —— run 永不 settle → `.bg` 永远 running。
+ */
+export interface PaneWaitOps {
+	/** 读 pane 屏幕（失败也要返回 `{ok:false}`，不要抛） */
+	read(paneId: string): { ok: boolean; text: string };
+	/** pane 还在吗 */
+	alive(paneId: string): boolean;
+}
+
+const realPaneWaitOps: PaneWaitOps = {
+	read: (paneId) => paneReadEx(paneId),
+	alive: (paneId) => paneList().some((p) => p.paneId === paneId),
+};
+
+/**
+ * 等一个 pane 里的 pi 跑完（每 2s 看一次；pane 没了 / 回到 shell / 交了回执 / 到点 / **卡死**）。
+ *
+ * 卡死看门狗（`outcome: "stalled"`）就是在这个循环里顺带做的：
+ * 每轮已经读了一次屏幕，拿它和上一次比，记住「最后一次变化」的时刻；
+ * 连续 `PANE_IDLE_MS` 没变化 → 返回 stalled，由调用方收 pane + 降级 rpc 重跑。
+ * 判定条件全在 `isPaneStalled()`（纯函数）里，这里只负责采集事实：
+ *   pane 还活着吗 / 这次读成没读成 / 屏幕内容 / 任务送达过没有。
+ */
+export async function waitPaneDone(
+	slot: HerdrSlot,
+	sessionDir: string,
+	sessionId: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+	delivered = true,
+	ops: PaneWaitOps = realPaneWaitOps,
+): Promise<{ outcome: PaneOutcome; text: string; tail: string; stallLog: string[]; error?: string }> {
+	const started = Date.now();
+	let text = "";
+	// ---- 卡死看门狗的账 ----
+	let lastSeen = ""; // 上一次看到的「屏幕 + 会话正文」指纹
+	let lastChangeAt = started; // 最后一次变化时刻（初始 = 开跑那一刻）
+	const stallLog: string[] = [];
+	let lastReason = "";
+	// 采集异常计数：读 pane / paneList 对已关闭的 pane 真机上会抛错。
+	// 以前它直接把 waitPaneDone 的 promise 拒掉 → run 永不 settle → `.bg` 永远 running。
+	// 现在最多连续失败 3 次就带着「已有正文」果断返回。
+	let readFails = 0;
+	while (true) {
+		try {
+			const file = findSessionFileIn(sessionDir, sessionId);
+			const t = lastAssistantTextIn(file);
+			if (t) text = t;
+			const read = ops.read(slot.paneId);
+			const tail = clampTail(read.text, STDERR_LIMIT);
+			const finished = paneAtShell(tail) && Date.now() - started > 3000;
+			const reported = /<\/result>/.test(text);
+			const alive = ops.alive(slot.paneId);
+
+			// 屏幕或会话正文只要变了 → 刷新「最后一次变化」
+			const seen = `${read.ok ? "1" : "0"}\u0000${read.text}\u0000${t}`;
+			if (seen !== lastSeen) {
+				lastSeen = seen;
+				lastChangeAt = Date.now();
+				lastReason = "";
+			}
+
+			if (reported) return { outcome: "done", text, tail, stallLog };
+			if (!alive) {
+				// pane 被关了：有正文就当跑完（可能用户手动关的），没正文算失败
+				return { outcome: text ? "done" : "failed", text, tail, stallLog };
+			}
+			if (finished) return { outcome: text ? "done" : "empty", text, tail, stallLog };
+			if (signal?.aborted) return { outcome: "failed", text, tail, stallLog };
+			if (Date.now() - started > timeoutMs) return { outcome: "timeout", text, tail, stallLog };
+
+			// ---- 卡死看门狗 ----
+			// 注意：read.ok === false / 空屏 / 有执行迹象 → isPaneStalled 都不杀，这里只把原因记进日志，
+			// 留着排查「为什么看门狗没动手」。（同一个原因只记一条，不刷屏）
+			const ctx = { alive, readable: read.ok, output: read.text };
+			const stalled = isPaneStalled(lastChangeAt, Date.now(), delivered, ctx);
+			if (stalled) {
+				stallLog.push(`[看门狗] pane ${slot.paneId} 连续 ${Math.round((Date.now() - lastChangeAt) / 1000)}s 无输出 → 判卡死`);
+				return { outcome: "stalled", text, tail, stallLog };
+			}
+			const reason = paneStallReason(lastChangeAt, Date.now(), delivered, ctx);
+			if (reason !== "idle" && reason !== lastReason) {
+				lastReason = reason;
+				stallLog.push(`[看门狗] 暂不判卡死（${reason}）`);
+			}
+			readFails = 0; // 本轮采集全成功
+		} catch (e) {
+			readFails += 1;
+			const msg = e instanceof Error ? e.message : String(e);
+			stallLog.push(`[收尾] 采集 pane 状态抛错（第 ${readFails} 次）：${msg}`);
+			if (readFails >= 3) {
+				return { outcome: text ? "done" : "failed", text, tail: "", stallLog, error: `采集 pane 状态连续抛错：${msg}` };
+			}
+		}
+		if (signal?.aborted) return { outcome: "failed", text, tail: "", stallLog };
+		if (Date.now() - started > timeoutMs) return { outcome: "timeout", text, tail: "", stallLog };
+		await sleep(readFails ? 500 : 2000);
+	}
+}
+
+/**
+ * 试着用 Herdr 跑一把。
+ * 返回 RunResult = 已经跑完了（不管成败）；返回 undefined = 没走成，调用方退回 rpc 无头模式。
+ */
+async function tryRunInHerdr(
+	tpl: Template,
+	task: string,
+	opt: RunOptions,
+	argv: string[],
+	job: LiveJob,
+	sink: Sink,
+	makeResult: (outcome: Outcome, exitCode: number | null) => RunResult,
+): Promise<RunResult | undefined> {
+	let slot: HerdrSlot | undefined;
+	let script: string | undefined;
+	/** pane 里的活真的开跑了（这之后**必须有终态**，绝不带着 running 离开） */
+	let started = false;
+	/** 终态只写一次（重复写会把 delivered / 面板小票冲乱） */
+	let finalized = false;
+	/** 兜底计时器已经强制收尾过（后续收尾就不许再还锁 / 还槽位） */
+	let abandoned = false;
+	let guard: { clear: () => void } | undefined;
+	/** 卡在哪一步（写错误信息用） */
+	let stage = "init";
+	let result: RunResult | undefined;
+
+	const clearGuard = (): void => {
+		if (guard) {
+			guard.clear();
+			guard = undefined;
+		}
+	};
+
+	/**
+	 * 写终态（`.bg` + 投递登记 + 面板小票），**只写一次，且自己绝不抛**。
+	 *
+	 * 这就是本次回归的修法核心：以前这段只存在于 rpc 分支的 `finish()` 里，
+	 * pane 分支跑完直接 `return makeResult(...)` → `opt.onSettle` 从没被调用 →
+	 * `.bg` 永远 `running`、轮询永远不认领 → 回执永远不投。
+	 */
+	const settle = (outcome: Outcome, text: string, error?: string, forced = false): RunResult => {
+		const exitCode = forced ? null : outcome === "done" ? 0 : outcome === "timeout" ? null : 1;
+		const r = makeResult(outcome, exitCode);
+		r.degradeNote = job.note; // 批次汇总卡要靠它标 ⚠️
+		if (finalized) return r;
+		finalized = true;
+		clearGuard();
+		const fields = finalizeHerdrRun({ outcome, text, error, forced });
+		// ① 投递链：onSettle 负责「富卡片 + 交给 pollBgTasks 回投」（rpc 分支走的是同一条链）
+		try {
+			opt.onSettle?.(r);
+		} catch (e) {
+			try {
+				sink.stderr = clampTail(`${sink.stderr}\n[收尾] onSettle 抛错：${e instanceof Error ? e.message : String(e)}`, STDERR_LIMIT);
+			} catch {
+				/* ignore */
+			}
+		}
+		// ② 保险：onSettle 缺失 / 抛错时也把终态写进 `.bg`
+		//    （合并写：不覆盖已有卡片，绝不把 delivered:true 冲回 false）
+		try {
+			writeHerdrBgTerminal(opt.bgId, fields);
+		} catch {
+			/* 已经是最后一道兜底了 */
+		}
+		// ③ 面板小票
+		try {
+			markEnd(
+				job,
+				outcome === "done" ? "done" : outcome === "timeout" ? "timeout" : "failed",
+				withDegrade(
+					job,
+					error ??
+						(outcome === "done"
+							? "分屏里跑完了（pane 已收起）"
+							: outcome === "timeout"
+								? "超时（pane 留着，要看就切过去）"
+								: "失败（pane 留着，按回车关闭）"),
+				),
+			);
+		} catch {
+			/* ignore */
+		}
+		return r;
+	};
+
+	/** 还会话锁 + 并发槽位（只还一次；兜底计时器已经还过就不碰） */
+	const releaseAll = (): void => {
+		if (abandoned) return;
+		abandoned = true;
+		try {
+			releaseSessionLock(opt.names.id);
+		} catch {
+			/* ignore */
+		}
+		try {
+			releaseRunSlot();
+		} catch {
+			/* ignore */
+		}
+	};
+
+	try {
+		const cfg = readUiConfig();
+		const herdrOk = herdrAvailable();
+		const mode = resolveUiMode(cfg, activeRuns, herdrOk);
+		if (mode === "panel") return undefined;
+		if (!mainPaneId()) return undefined;
+
+		stage = "alloc";
+		slot = await allocHerdrSlot(tpl.cwd, cfg, mode);
+		if (!slot) {
+			// 等满 60s 还是没格 → 降级 rpc（备注要能让用户看出「不是派失败，是没位了」）
+			job.note = SLOT_WAIT_NOTE;
+			notifyLive();
+			return undefined;
+		}
+
+		const label = paneLabel("run", tpl.key, slot.index);
+		paneRename(slot.paneId, label);
+		job.paneId = slot.paneId;
+		job.tabId = slot.tabId;
+		job.uiMode = mode;
+		job.slotIndex = slot.index;
+		notifyLive();
+
+		// 交互式参数：去掉 --mode rpc / -p --mode json，其余白名单照旧；末尾加任务文本
+		const interactive = stripHeadlessArgs(argv).concat(task);
+		// resume 时会话文件已经存在：那时「第一条 user 消息」是上一次的任务，改看最后一条
+		const existedBefore = findSessionFileIn(opt.sessionDir, opt.names.id) !== undefined;
+		stage = "launch";
+		script = writePaneLauncher(tpl, interactive, opt, `${opt.names.id}-${slot.index}`);
+		if (!script || !paneRun(slot.paneId, paneLaunchCommand(script))) {
+			// pane 已经切出来了但活没跑起来 —— 收干净再降级
+			releaseHerdrSlot(slot, true);
+			dropLauncher(script);
+			job.paneId = undefined;
+			job.tabId = undefined;
+			job.uiMode = undefined;
+			job.slotIndex = undefined;
+			return undefined;
+		}
+
+		// ---- 兜底计时器：活进了 pane 就开始计时 ----
+		// 即使收尾逻辑再出错（读 pane 抛错 / finally 里又抛 / promise 永远不 resolve），
+		// 到点也必须写一次终态 —— 这是「.bg 永远 running」的最后一道堤。
+		const guardMs = opt.timeoutMs + HERDR_FINALIZE_GRACE_MS;
+		guard = armHerdrFinalizeGuard(guardMs, () => {
+			const msg = `兜底计时器到点（pane 收尾没在 ${Math.round(guardMs / 1000)}s 内跑完）`;
+			try {
+				sink.stderr = clampTail(`${sink.stderr}\n[收尾] ${msg}`, STDERR_LIMIT);
+			} catch {
+				/* ignore */
+			}
+			try {
+				settle("timeout", sink.final, msg, true);
+			} catch {
+				/* 连 settle 都炸就真没撤了 */
+			}
+			// 收干净：pane / 槽位 / 会话锁都不许留
+			abandoned = true;
+			try {
+				if (slot) releaseHerdrSlot(slot, true);
+			} catch {
+				/* ignore */
+			}
+			try {
+				releaseSessionLock(opt.names.id);
+			} catch {
+				/* ignore */
+			}
+			try {
+				releaseRunSlot();
+			} catch {
+				/* ignore */
+			}
+			started = false; // 已经收尾过，finally 别再写一遍
+		});
+
+		// ---- 关键断言：任务文本到底送到了没有 ----
+		// 编码事故过的链「不报错、只空跑」，所以必须拿会话文件反查第一条 user 消息。
+		// 不相等 / 超时 / 文件没出现 → **立刻关 pane + 降级 rpc 重跑**（宁可没见过过程，也不许 worker 收到空任务）。
+		stage = "deliver";
+		const delivered = await waitTaskDelivered(opt.sessionDir, opt.names.id, task, existedBefore);
+		if (!delivered) {
+			releaseHerdrSlot(slot, true);
+			dropLauncher(script);
+			job.paneId = undefined;
+			job.tabId = undefined;
+			job.uiMode = undefined;
+			job.slotIndex = undefined;
+			job.note = PANE_DEGRADED_NOTE;
+			notifyLive();
+			return undefined; // 调用方接着走 rpc 无头模式（会话锁 / 槽位都还在，不释放）
+		}
+		// 从这一刻起：活真的在 pane 里跑了，怎么结束都必须有终态
+		started = true;
+
+		stage = "wait";
+		let res: Awaited<ReturnType<typeof waitPaneDone>>;
+		try {
+			res = await waitPaneDone(slot, opt.sessionDir, opt.names.id, opt.timeoutMs, opt.signal, delivered);
+		} catch (e) {
+			// waitPaneDone 内部已经接住了大部分异常，这里是最后一道：
+			// 绝不让它的 reject 把 run 悬空（以前就是这么静默 reject → 永不 settle）。
+			res = {
+				outcome: "failed",
+				text: "",
+				tail: "",
+				stallLog: [`[收尾] waitPaneDone 抛错：${e instanceof Error ? e.message : String(e)}`],
+				error: `waitPaneDone 抛错：${e instanceof Error ? e.message : String(e)}`,
+			};
+		}
+
+		// ---- 卡死看门狗扣下的活：收 pane + 释放槽位 + 降级 rpc 重跑同一个任务 ----
+		// 为什么可以安全的重跑：pane 里的活一个字都没吐（90s 屏幕没变），会话文件里也没有可用的正文，
+		// 所以不存在「跑了两次、结果冲突」；而且这里是**回收后再降级**，不会两个进程同时写会话。
+		if (res.outcome === "stalled") {
+			paneRename(slot.paneId, paneLabel("stalled", tpl.key, slot.index));
+			releaseHerdrSlot(slot, true); // closePane=true：关 pane + 销槽位（溢出 tab 没人了就关 tab）
+			dropLauncher(script);
+			job.paneId = undefined;
+			job.tabId = undefined;
+			job.uiMode = undefined;
+			job.slotIndex = undefined;
+			job.note = PANE_STALLED_NOTE;
+			job.lastEventAt = Date.now();
+			notifyLive();
+			sink.stderr = clampTail(`${sink.stderr}\n${res.stallLog.join("\n")}`.trim(), STDERR_LIMIT);
+			// 返回 undefined → 调用方接着走 rpc 无头模式（终态由 rpc 分支写；这里写会把重跑的结果提前锁成失败）
+			started = false;
+			return undefined;
+		}
+
+		if (res.stallLog.length) {
+			sink.stderr = clampTail(`${sink.stderr}\n${res.stallLog.join("\n")}`.trim(), STDERR_LIMIT);
+		}
+		sink.final = res.text;
+		sink.stderr = clampTail(`${sink.stderr}\n${res.tail}`.trim(), STDERR_LIMIT);
+
+		// ---- 与 rpc 分支对等的收尾：终态先写，pane 修饰后做 ----
+		// 顺序很重要：以前是先改标签 / 关 pane / markEnd，任何一步抛错就丢了终态。
+		stage = "settle";
+		releaseAll();
+		result = settle(res.outcome, res.text, res.error);
+
+		// 收尾：成功 → 改 ✅ → 2s → 关；失败 → 改 ❌ 保留（paneKeepOnError），让用户自己处理
+		try {
+			const ok = res.outcome === "done";
+			if (ok) {
+				paneRename(slot.paneId, paneLabel("ok", tpl.key, slot.index));
+				setTimeout(() => releaseHerdrSlot(slot, true), 2000).unref?.();
+			} else if (cfg.paneKeepOnError && res.outcome !== "empty") {
+				paneRename(slot.paneId, paneLabel("err", tpl.key, slot.index));
+				releaseHerdrSlot(slot, false);
+			} else {
+				releaseHerdrSlot(slot, true);
+			}
+			dropLauncher(script);
+		} catch (e) {
+			// pane 修饰失败不影响结果（终态已经落了）
+			sink.stderr = clampTail(
+				`${sink.stderr}\n[收尾] pane 修饰失败：${e instanceof Error ? e.message : String(e)}`,
+				STDERR_LIMIT,
+			);
+		}
+		return result;
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		try {
+			sink.stderr = clampTail(`${sink.stderr}\n[收尾] pane 收尾异常（${stage}）：${msg}`, STDERR_LIMIT);
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (slot) releaseHerdrSlot(slot, true);
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (script) dropLauncher(script);
+		} catch {
+			/* ignore */
+		}
+		releaseAll();
+		// 活还没开跑（分配 / 起跑阶段就炸了）→ 交给 rpc 重试
+		if (!started) return undefined;
+		return settle("failed", sink.final, `pane 收尾异常（${stage}）：${msg}`);
+	} finally {
+		clearGuard();
+		// 最后一道闸：只要活真的开跑过，就绝不带着 `running` 离开这个函数
+		if (started && !finalized) {
+			try {
+				result = settle("failed", sink.final, "pane 收尾没走到终态（finally 兜底）");
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+}
+
+/** 把无头模式的参数改成交互式：去掉 `--mode rpc` / `-p --mode json` */
+function stripHeadlessArgs(argv: string[]): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i]!;
+		if (a === "--mode" && (argv[i + 1] === "rpc" || argv[i + 1] === "json")) {
+			i++; // 连值一起跳过
+			continue;
+		}
+		if (a === "-p" || a === "--print") continue;
+		out.push(a);
+	}
+	return out;
+}
+
 // ======================= 跑一个助理 =======================
 interface RunOptions {
 	timeoutMs: number;
@@ -878,6 +2099,8 @@ interface RunOptions {
 	sessionDir: string;
 	/** 后台任务完成时回调（写状态文件、触发回投）。同步模式不用。 */
 	onSettle?: (r: RunResult) => void;
+	/** 后台任务的记账 id（异步派活才有）：pane 分支的收尾靠它兜底写 `.bg` 终态 */
+	bgId?: string;
 }
 
 /** 给助理准备专属会话目录：不存在就建 */
@@ -1017,6 +2240,14 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		.join("\n\n");
 	if (body) args.push("--append-system-prompt", body);
 
+	// ---------- Herdr 分屏模式（split / tab）----------
+	// 走成了 → 直接返回结果（pane 里跑，用户能看见全貌）；
+	// 没走成（非 Herdr / 任何 herdr 调用失败）→ 返回 undefined，下面原封不动走 rpc 无头模式。
+	{
+		const viaPane = await tryRunInHerdr(tpl, task, opt, args, job, sink, base);
+		if (viaPane) return viaPane;
+	}
+
 	return new Promise<RunResult>((done) => {
 		let timedOut = false;
 		let settled = false;
@@ -1074,6 +2305,8 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		// ---------- 传输层：RPC（双向）或 旧 JSON（单向）----------
 		// RpcChannel 自己订阅 stdout；旧路径才需要 jsonRead 逐行喂。
 		let rpc: RpcChannel | undefined;
+		/** prompt 的唯一出口（正常 1 条；硬收尾追问再 1 条，见 makePromptGate） */
+		const prompts = makePromptGate();
 		let jsonRead: ((chunk: string) => void) | undefined;
 		if (useRpc) {
 			rpc = new RpcChannel(child);
@@ -1126,15 +2359,19 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			markEnd(
 				job,
 				liveStatus,
-				outcome === "timeout"
-					? "超时被停止（要接着做用 resume）"
-					: outcome === "empty"
-						? "跑了但没吐结论"
-						: exitCode && exitCode !== 0
-							? `子进程退出码 ${exitCode}`
-							: undefined,
+				withDegrade(
+					job,
+					outcome === "timeout"
+						? "超时被停止（要接着做用 resume）"
+						: outcome === "empty"
+							? "跑了但没吐结论"
+							: exitCode && exitCode !== 0
+								? `子进程退出码 ${exitCode}`
+								: undefined,
+				),
 			);
 			const r = base(outcome, exitCode);
+			r.degradeNote = job.note; // 批次汇总卡要靠它标 ⚠️
 			releaseSessionLock(opt.names.id);
 			releaseSlot(); // 兜底：正常路径在 close/exit 里已经释放过，这里保证「无论如何都释放」
 			opt.onSettle?.(r);
@@ -1179,9 +2416,11 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			const softLead = Math.max(SOFT_WINDDOWN_MIN_LEAD_MS, Math.floor(opt.timeoutMs * 0.25));
 			wrapUpHook = () => {
 				if (wrapUpSent || settled) return;
+				const text = wrapUpText();
+				if (!prompts.wrapUp(text)) return; // 闸门：任务 prompt 之外，只有硬收尾能补发这一条
 				wrapUpSent = true;
 				windDownLog.push("追问交卡");
-				rpc?.send({ type: "prompt", message: wrapUpText() });
+				rpc?.send({ type: "prompt", message: text });
 			};
 			softTimer = setTimeout(() => {
 				if (settled) return;
@@ -1193,6 +2432,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 				windDownLog.push("打断卡住的 run");
 				hardWindDownFired = true;
 				expectWrapUp = true;
+				prompts.allowWrapUp();
 				rpc?.send({ type: "abort" });
 				// 兜底：万一 abort 根本没产生 agent_settled（比如它当时本来就闲着、没有可打断的 run），
 				// 2 秒后直接追问。正常情况在上面的 settled 里按 aborted 就接住了，这个定时器不会开火。
@@ -1248,7 +2488,9 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			if (rpc) {
 				// ⚠️ 发完**不能** closeStdin()：关了 stdin 就再也发不出 steering，
 				//    而且等于立刻让 pi 收工。收工时机由 agent_settled / 超时定时器决定。
-				rpc.send({ id: "prompt-1", type: "prompt", message: cardPrompt(task) });
+				// 任务正文只发这一条（走闸门：同一次运行绝不许有第二条任务 prompt）。
+				const text = cardPrompt(task);
+				if (prompts.task(text)) rpc.send({ id: "prompt-1", type: "prompt", message: text });
 			} else {
 				child.stdin?.write(cardPrompt(task), "utf8");
 				child.stdin?.end();
@@ -1397,6 +2639,171 @@ function renderCard(r: RunResult): string {
 	].join("\n");
 }
 
+// ======================= 批次汇总卡（同一次 delegate(tasks) 只投一张）=======================
+//
+// 踩过的体验：一次派 8 个，全部 10s 内跑完，但卡片**一张一张吐了 8 轮对话**（异步回投每个 turn 只投一条）。
+// 现在：同一次调用的所有子任务共用一个 `batchId`，全部 settle 之后**只写一条 `.bg`、只投一次**，
+// 内容是一张汇总卡（每条一行）。单任务（非 tasks 数组）的投递行为一字不改。
+
+/** 汇总卡里一条结论最多多长（超过就截断，保证一条任务一行） */
+export const BATCH_CONCLUSION_MAX = 90;
+
+/** 汇总卡里的一条（纯数据，方便单测） */
+export interface BatchItem {
+	/** 助理名（不带 #n） */
+	name: string;
+	outcome: Outcome;
+	/** 耗时（ms） */
+	elapsedMs: number;
+	/** 该任务的回执正文（取「结论:」那一行） */
+	text?: string;
+	/** 失败原因（failed / busy） */
+	error?: string;
+	/** 降级备注（有它 = 这条算「降级」，标 ⚠️） */
+	note?: string;
+	/** 会话 ID（卡尾保留找回方式） */
+	sessionId?: string;
+}
+
+/** 从一段回执正文里取「结论:」那一行（没有就取第一行），压成一行并截断到 90 字 */
+function batchConclusion(text: string | undefined): string {
+	const lines = String(text ?? "")
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.filter(Boolean);
+	const hit = [...lines].reverse().find((l) => /^结论\s*[:：]/.test(l));
+	const src = (hit ?? lines[0] ?? "").replace(/^结论\s*[:：]\s*/, "");
+	const one = src.replace(/\s+/g, " ").trim() || "（没有结论）";
+	return one.length > BATCH_CONCLUSION_MAX ? `${one.slice(0, BATCH_CONCLUSION_MAX)}…` : one;
+}
+
+/**
+ * 批次汇总卡（纯函数，不读盘 / 不看时钟 / 不改入参）：
+ *
+ *   【批次 8 个】6 成功 · 1 降级 · 1 失败（合计 23s）
+ *   ✅ general#1  一句话结论（12s）
+ *   ⚠️ general#7  pane 槽位等待 60s 超时已降级 rpc
+ *   ❌ general#8  失败原因（3s）
+ *   ──── 找回方式 ────
+ *   general=a-1 · backend=b-2
+ *
+ * 「合计」= 这批的墙钟耗时（取最慢那条）；空列表也能渲染（不崩）。
+ */
+export function buildBatchCard(items: BatchItem[]): string {
+	const list = Array.isArray(items) ? items : [];
+	const doneOk = list.filter((i) => i.outcome === "done" && !i.note).length;
+	const degraded = list.filter((i) => Boolean(i.note)).length;
+	const failed = list.filter((i) => !i.note && (i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty")).length;
+	const timedOut = list.filter((i) => !i.note && i.outcome === "timeout").length;
+	const totalMs = list.reduce((m, i) => Math.max(m, Number(i.elapsedMs) || 0), 0);
+	const segs: string[] = [];
+	if (doneOk) segs.push(`${doneOk} 成功`);
+	if (degraded) segs.push(`${degraded} 降级`);
+	if (failed) segs.push(`${failed} 失败`);
+	if (timedOut) segs.push(`${timedOut} 超时`);
+	const head = `【批次 ${list.length} 个】${segs.length ? segs.join(" · ") : "没有任务"}（合计 ${Math.round(totalMs / 1000)}s）`;
+
+	const rows = list.map((it, i) => {
+		const who = `${it.name || "worker"}#${i + 1}`;
+		const secs = Math.round((Number(it.elapsedMs) || 0) / 1000);
+		if (it.note) return `⚠️ ${who}  ${oneLine(it.note, BATCH_CONCLUSION_MAX)}`;
+		if (it.outcome === "done") return `✅ ${who}  ${batchConclusion(it.text)}（${secs}s）`;
+		if (it.outcome === "timeout") return `⏱ ${who}  超时（${secs}s）`;
+		if (it.outcome === "empty") return `❌ ${who}  跑完没输出（${secs}s）`;
+		const why = it.error ? oneLine(it.error, BATCH_CONCLUSION_MAX) : it.outcome === "busy" ? "会话正忙，没启动" : "失败";
+		return `❌ ${who}  ${why}（${secs}s）`;
+	});
+
+	const ids = list.map((i) => (i.sessionId ? `${i.name || "worker"}=${i.sessionId}` : "")).filter(Boolean);
+	const tail = ids.length
+		? `\n\n──── 找回方式 ────\n${ids.join(" · ")}\n（要它接着做：delegate 带 resume: "<会话ID>"；要看过程：/resume-agent）`
+		: "";
+	return [head, ...rows].join("\n") + tail;
+}
+
+/** 一批的记账状态（只活在内存：整批 settle 后才落一条 `.bg`） */
+interface BatchState {
+	/** 写进 `BgTaskFile.id`（也是唯一那条 `.bg` 的文件名） */
+	id: string;
+	expected: number;
+	startedAt: number;
+	key: string;
+	task: string;
+	ownerSessionFile?: string;
+	ownerSessionId?: string;
+	deadlineAt: number;
+	/** 按任务序号存：pane 收尾 / 兜底 / catch 都可能来记同一条，序号去重 */
+	items: Map<number, BatchItem>;
+}
+
+/** 进程内的批（key = batchId）；还没 settle 完的都在这里 */
+const pendingBatches = new Map<string, BatchState>();
+
+/** 开一批：同一次 delegate(tasks) 的所有子任务共用这一个 batchId */
+function openBatch(
+	expected: number,
+	meta: { key: string; task: string; ownerSessionFile?: string; ownerSessionId?: string; deadlineAt: number },
+): BatchState {
+	const id = `batch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	const b: BatchState = {
+		id,
+		expected: Math.max(1, Math.round(Number(expected) || 0)),
+		startedAt: Date.now(),
+		key: meta.key,
+		task: meta.task,
+		ownerSessionFile: meta.ownerSessionFile,
+		ownerSessionId: meta.ownerSessionId,
+		deadlineAt: meta.deadlineAt,
+		items: new Map(),
+	};
+	pendingBatches.set(id, b);
+	return b;
+}
+
+/** `RunResult` → 汇总卡的一条 */
+function batchItemOf(r: RunResult): BatchItem {
+	return {
+		name: r.tpl.name,
+		outcome: r.outcome,
+		elapsedMs: r.elapsedMs,
+		text: r.text || r.partial,
+		error: r.stderrTail || (typeof r.exitCode === "number" ? `退出码 ${r.exitCode}` : ""),
+		note: r.degradeNote,
+		sessionId: r.names.id,
+	};
+}
+
+/**
+ * 记一条；整批 settle 后把汇总卡写成**唯一**一条 `.bg`（由 pollBgTasks 只投一次）。
+ * 同一序号重复来（pane 收尾 + 兜底计时器）→ 只认第一次。
+ */
+function noteBatchItem(batch: BatchState, seq: number, item: BatchItem): void {
+	if (batch.items.has(seq)) return;
+	batch.items.set(seq, item);
+	if (batch.items.size < batch.expected) return;
+	pendingBatches.delete(batch.id);
+
+	const items = [...batch.items.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+	const anyFail = items.some((i) => i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty");
+	const allTimeout = items.length > 0 && items.every((i) => i.outcome === "timeout");
+	writeBgTask({
+		id: batch.id,
+		key: batch.key,
+		name: `批次 ${items.length} 个`,
+		task: batch.task,
+		sessionId: items.map((i) => i.sessionId ?? "").filter(Boolean).join(", "),
+		startedAt: batch.startedAt,
+		status: allTimeout ? "timeout" : anyFail ? "failed" : "done",
+		resultText: buildBatchCard(items),
+		finishedAt: Date.now(),
+		delivered: false,
+		batch: true,
+		ownerSessionFile: batch.ownerSessionFile,
+		ownerSessionId: batch.ownerSessionId,
+		deadlineAt: batch.deadlineAt,
+	});
+}
+
 // ======================= 工具参数 =======================
 /**
  * 生成「可用助理」提示，拼进 assistant 参数的描述里。
@@ -1470,40 +2877,23 @@ function writeDelegateMode(mode: "sync" | "async"): void {
 }
 
 // ======================= 后台任务（异步派活）=======================
-interface BgTaskFile {
-	id: string;
-	key: string;
-	name: string;
-	task: string;
-	sessionId: string;
-	startedAt: number;
-	status: "running" | "done" | "timeout" | "failed" | "empty";
-	resultText?: string;
-	finishedAt?: number;
-	delivered?: boolean;
-	/** 派发它的「主会话」文件路径 —— 结果只投回这个会话，别的会话扫到也不投（防串台） */
-	ownerSessionFile?: string;
-	/** 派发它的主会话 ID（file 拿不到时的退路，也方便排查） */
-	ownerSessionId?: string;
-	/** 投递失败重试次数 */
-	attempts?: number;
-	/** 上次尝试投递的时间（算退避用） */
-	lastAttemptAt?: number;
-	/** 第一次投递失败的时间（算“多久还没发出去”用） */
-	firstFailAt?: number;
-	/** 最后一次投递失败的原因（排查用） */
-	lastError?: string;
-	/** 自动重试已放弃（超时），等 /agents bg redeliver 手动投 */
-	undelivered?: boolean;
-	/**
-	 * 这个任务最晚该什么时候有动静（= startedAt + timeoutMs + 余量）。
-	 * `reapStaleBgTasks()` 按它判“是不是真孤儿”，**不能写死 10 分钟** ——
-	 * timeoutMs 最大能到 30 分钟，写死就会把还在正常跑的活在第 10 分钟误判失败
-	 * （实测后果：先投一张假失败卡，真跑完后再投一张）。
-	 * 老文件没这个字段 → 回退到原来的 10 分钟兑底。
-	 */
-	deadlineAt?: number;
-}
+
+/**
+ * 本进程已投递过的任务 id。
+ *
+ * 为什么磁盘上已经有 `delivered:true` 还要内存去重：重试循环 / 投递途中 `/reload`
+ * 的竞态下，磁盘标记可能还没落盘就又开始新一轮扫描 —— 同一个 id 只认内存这一次。
+ */
+const deliveredThisRun = new Set<string>();
+
+/**
+ * 用户**手动** `/agents bg redeliver` 点名要投的 id。
+ *
+ * 自动投递有「只投最近 10 分钟」闸门（防 `/reload` 反复投老卡），
+ * 但手动重投就是用户自己拍板要补：「太老」对它们无效，否则点了没反应。
+ * 投一次就划掉（手动意图只免一次，失败后仍回到自动闸门口径）。
+ */
+const forcedDeliver = new Set<string>();
 
 function bgRoot(): string {
 	const d = join(assistantSessionRoot(), ".bg");
@@ -1517,11 +2907,21 @@ function bgRoot(): string {
 function bgFile(id: string): string {
 	return join(bgRoot(), `${id}.json`);
 }
-function writeBgTask(t: BgTaskFile): void {
+/**
+ * 写一条后台任务记账。
+ *
+ * ⚠️ 必须「读旧值 → 合并 → 写」，**不能整对象覆盖**：
+ *    同一条任务会被任务结束 / 投递成功 / 看门狗 / 退出钩子先后写，
+ *    后写的一方手里往往是**旧快照**，覆盖就会把 `delivered:true` 冲回 false
+ *    → `/reload` 再投一遍（用户收到重复卡片）。合并规则见 `mergeBgTask()`。
+ */
+function writeBgTask(t: BgTaskNext): BgTaskFile | undefined {
 	try {
-		writeFileSync(bgFile(t.id), JSON.stringify(t, null, 2), "utf8");
+		const merged = mergeBgTask(readBgTask(t.id), t);
+		writeFileSync(bgFile(t.id), JSON.stringify(merged, null, 2), "utf8");
+		return merged;
 	} catch {
-		/* ignore */
+		return undefined;
 	}
 }
 function readBgTask(id: string): BgTaskFile | undefined {
@@ -1531,13 +2931,13 @@ function readBgTask(id: string): BgTaskFile | undefined {
 		return undefined;
 	}
 }
-function listBgTasks(): BgTaskFile[] {
+function listBgTasks(dir: string = bgRoot()): BgTaskFile[] {
 	try {
-		return readdirSync(bgRoot())
+		return readdirSync(dir)
 			.filter((f) => f.endsWith(".json"))
 			.map((f) => {
 				try {
-					return JSON.parse(readFileSync(join(bgRoot(), f), "utf8")) as BgTaskFile;
+					return JSON.parse(readFileSync(join(dir, f), "utf8")) as BgTaskFile;
 				} catch {
 					return undefined;
 				}
@@ -2592,6 +3992,8 @@ function deliverBackoffMs(attempts: number): number {
 
 /** 要投给主会话的文本 */
 function bgDeliveryText(t: BgTaskFile): string {
+	// 批次汇总卡：卡里已经带了每个任务的一行结论 + 找回方式 → 原样投（不套壳、不再重复会话 ID）
+	if (t.batch) return t.resultText || "（批次没有结果文本）";
 	return (
 		`子Agent「${t.name}」回来了（后台任务）\n${t.resultText || "（没有结果文本）"}\n\n` +
 		`会话ID：${t.sessionId}（要翻看：/resume-agent）`
@@ -2637,7 +4039,13 @@ async function pollBgTasks(): Promise<void> {
 		if (t.status === "running" || t.delivered) continue;
 		// 归属校验：只投给派发它的那个主会话；别的会话/实例扫到也不投，避免串台
 		if (!isOwnBgTask(t)) continue;
+		if (deliveredThisRun.has(t.id)) continue; // 本进程已投过（防重试/reload 竞态重复投递）
 		if (t.undelivered) continue; // 自动重试已放弃，等手动
+		// ⚠️ 只有「刚结束 + 还没投够次数」的才自动投。
+		//    /reload 会重新 load 扩展 → armBgTimer 又挂一轮 1 秒轮询；没有这两条，
+		//    任何一条没落成 delivered:true 的老卡都会**每次 reload 再投一遍**（还顺带唤起主会话跑一轮）。
+		//    跳过的记录**不删**：面板 / `/agents bg` 仍能看到「未投递」，手动 redeliver 可补。
+		if (autoDeliverSkipReason(t, now) && !forcedDeliver.has(t.id)) continue;
 		const attempts = t.attempts ?? 0;
 		// 退避：别每秒硬撞
 		if (t.lastAttemptAt && now - t.lastAttemptAt < deliverBackoffMs(attempts)) continue;
@@ -2654,10 +4062,13 @@ async function pollBgTasks(): Promise<void> {
 		}
 		try {
 			await deliverBgTask(t);
-			// 只有真发出去才标 delivered
+			deliveredThisRun.add(t.id); // 先记账再落盘：落盘失败也不会在同一进程里再投一次
+			// 只有真发出去才标 delivered，而且**紧接着就落盘**：
+			// 中间不 await 任何东西，别让后面的 markEnd / 看门狗拿着旧快照把 delivered 冲回 false。
 			writeBgTask({ ...t, delivered: true, attempts: attempts + 1, lastAttemptAt: now, lastError: undefined });
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
+			// 首次失败就钉住 firstFailAt（之后取最早，不再改）—— 缺了它「多久没发出去」永远算不出来
 			const firstFailAt = t.firstFailAt ?? now;
 			const giveUp = now - firstFailAt > DELIVER_GIVEUP_MS;
 			writeBgTask({
@@ -2670,6 +4081,7 @@ async function pollBgTasks(): Promise<void> {
 				undelivered: giveUp, // 超时→不再自动重试，但也不静默丢（面板 + /agents bg 能看到）
 			});
 		} finally {
+			forcedDeliver.delete(t.id); // 手动重投只免一次闸门
 			try {
 				rmSync(claim, { force: true });
 			} catch {
@@ -2733,29 +4145,30 @@ function reapStaleBgTasks(): void {
 	}
 }
 
-/** 投递成功的记账小票保留多久（超过就回收）。没投成功的一律不碰 —— 你还能 /agents bg redeliver。 */
-const BG_KEEP_MS = 24 * 60 * 60 * 1000;
-
 /**
- * 回收「已投递成功 + 超过 24 小时」的记账小票。
+ * 回收过期的记账小票。
  *
- * 为什么需要：投递成功后没人删这些 .bg/*.json，派得多了会堆几百个小文件。
+ * 两条规则（判定在 `bgPruneReason()` 里，纯函数可单测）：
+ *   1. 已投递成功 + 完成超过 24h —— 卡片已经在主对话里了，小票没用；
+ *   2. 任何记录超过 7 天 —— 兜底，别让 `.bg/` 堆成几百个文件。
  *
- * ⚠️ 只删 `.bg/<id>.json`（投递记账，内容就是任务摘要 + 已经投进主对话的卡片文字），
- * **绝不碰 `assistant-sessions/<助理>/*.jsonl`（助理会话）** —— 那是完整历史，/resume-agent 和 resume 续跑都靠它。
- * 所以这里连路径都只用 `bgFile()` 拼，不去动 assistant-sessions 下的任何会话目录。
+ * ⚠️ `status === "running"` 的**绝不删**（任务还在跑，删了就没法回投）。
+ * ⚠️ 没投成功、也没满 7 天的一律不碰 —— 你还能 `/agents bg redeliver`。
+ * ⚠️ 只删 `.bg/<id>.json`（投递记账），**绝不碰 `assistant-sessions/<助理>/*.jsonl`（助理会话）**
+ *    —— 那是完整历史，/resume-agent 和 resume 续跑都靠它。所以这里只用 `bgFile()` 拼路径。
  *
+ * @param now 方便单测注入时钟
+ * @param dir 方便单测指向临时目录；默认 `.bg/`
  * @returns 删掉几个
  */
-export function reapDeliveredBgTasks(now: number = Date.now()): number {
+export function reapDeliveredBgTasks(now: number = Date.now(), dir: string = bgRoot()): number {
 	let n = 0;
-	for (const t of listBgTasks()) {
-		if (t.delivered !== true) continue; // 没投成功的留着（还能重投）
-		const done = t.finishedAt ?? t.startedAt;
-		if (now - done < BG_KEEP_MS) continue; // 还没到期
+	for (const t of listBgTasks(dir)) {
+		if (!bgPruneReason(t, now)) continue;
+		const file = join(dir, `${t.id}.json`);
 		try {
-			rmSync(bgFile(t.id), { force: true });
-			rmSync(`${bgFile(t.id)}.claim`, { force: true }); // 顺手清可能残留的「认领」锁
+			rmSync(file, { force: true });
+			rmSync(`${file}.claim`, { force: true }); // 顺手清可能残留的「认领」锁
 			n++;
 		} catch {
 			/* 删不掉就算了，下次启动再试 */
@@ -2955,6 +4368,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 	applyExtensionsConfig(); // 面板保鲜期等偏好
 	apiRef = api; // 供后台轮询回投用
 	armBgTimer(); // 先挂上（幂等）：/reload 后 session_start 不一定触发，见 armBgTimer 说明
+	// 启动就清一次过期小票（不依赖 session_start：/reload 时它不一定触发）
+	reapDeliveredBgTasks();
 
 	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
 	api.on("session_start", async (_event, ctx) => {
@@ -3175,6 +4590,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 					};
 				}
 
+				// 影子目录 bin 没接上 → 每个子助理启动都要联网下载 fd/rg（慢 + 报警）。
+				// 不拦派活（顶多慢几秒），但要让用户看见。
+				if (shadow.warnings.length) {
+					ctx.ui.notify(`「${tpl.name}」影子目录 bin 没接好：${shadow.warnings.join("；")}`, "warning");
+				}
 				ready.set(name, { tpl, shadow });
 			}
 			const plan = wants.map((w) => ({ ...w, ...ready.get(w.assistant)! }));
@@ -3225,57 +4645,114 @@ export function setupDelegate(api: ExtensionAPI): void {
 				// 异步：派完就走，登记后台任务；子进程后台跑，完成由轮询回投（见 pollBgTasks）
 				if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 				const ids: string[] = [];
-				for (const { tpl: one, shadow: shadowOf, task } of plan) {
+				const deadlineAt = Date.now() + total + 2 * 60 * 1000;
+				// 同一次 delegate(tasks) → 一个 batchId：整批 settle 后**只写一条** `.bg`、只投一张汇总卡。
+				// 单任务（tasks 里就一个）不走批次，投递行为与以前完全一致。
+				const batch =
+					plan.length > 1
+						? openBatch(plan.length, {
+								key: "batch",
+								task: plan.map((p) => p.task).join(" ｜ "),
+								ownerSessionFile: currentSessionFile,
+								ownerSessionId: currentSessionId,
+								deadlineAt,
+							})
+						: undefined;
+				for (const [seqIdx, { tpl: one, shadow: shadowOf, task }] of plan.entries()) {
 					const seq = resumeId ? 0 : nextSeq(one.key);
 					const names = buildNames(main, one, seq, resumeId);
 					// bg 文件名加随机后缀：中文 key 会被 sanitize 掉，两个助理同一秒派发会撞 id、互相覆盖 .bg 文件
 					const bgId = `${names.id}-${Math.random().toString(36).slice(2, 8)}`;
 					ids.push(names.id);
-					writeBgTask({
-						id: bgId, key: one.key, name: one.name, task, sessionId: names.id,
-						startedAt: Date.now(), status: "running",
-						ownerSessionFile: currentSessionFile,
-						ownerSessionId: currentSessionId,
-						// 2 分钟余量：收尾/追问/写盘都要时间，别卡在边界上误判
-						deadlineAt: Date.now() + total + 2 * 60 * 1000,
-					});
-					void runAssistant(one, task, {
-						timeoutMs: total,
-						// 不传 signal：不随本轮 turn 结束被 abort
-						names,
-						resumed: Boolean(resumeId),
-						mainModel,
-						shadowDir: shadowOf.dir,
-						sessionDir: ensureAssistantSessionDir(one.key),
-						onSettle: (r) => {
-							const prev = readBgTask(bgId) ?? {
-								id: bgId, key: one.key, name: one.name, task, sessionId: names.id,
-								startedAt: Date.now(), status: "running" as const,
-								ownerSessionFile: currentSessionFile,
-								ownerSessionId: currentSessionId,
-								deadlineAt: Date.now() + total + 2 * 60 * 1000,
-							};
-							writeBgTask({
-								...prev,
-								status: outcomeToStatus(r.outcome),
-								resultText: renderCard(r),
-								finishedAt: Date.now(),
-								delivered: false,
-							});
-						},
-					}).catch(() => { /* runAssistant 自身不 reject，兜底 */ });
+					// 批次里**不写** per-task 的 `.bg`（否则每张卡都会单独回投一次 → 8 轮对话）
+					if (!batch) {
+						writeBgTask({
+							id: bgId, key: one.key, name: one.name, task, sessionId: names.id,
+							startedAt: Date.now(), status: "running",
+							ownerSessionFile: currentSessionFile,
+							ownerSessionId: currentSessionId,
+							// 2 分钟余量：收尾/追问/写盘都要时间，别卡在边界上误判
+							deadlineAt,
+						});
+					}
+					void (batch
+						? runAssistant(one, task, {
+								// 批次：onSettle 不一定被调到（会话锁忙 / 排队中被中止 / 找不到 CLI 都是早退），
+								// 所以再挂一层 .then —— 保证这批一定能凑齐、汇总卡一定发得出去。
+								// （noteBatchItem 按序号去重，onSettle 已经记过的不会重复）
+								timeoutMs: total,
+								names,
+								resumed: Boolean(resumeId),
+								mainModel,
+								shadowDir: shadowOf.dir,
+								sessionDir: ensureAssistantSessionDir(one.key),
+								onSettle: (r) => noteBatchItem(batch, seqIdx, batchItemOf(r)),
+							})
+								.then((r) => {
+									if (r) noteBatchItem(batch, seqIdx, batchItemOf(r));
+								})
+								.catch((e) => {
+									// runAssistant 正常不 reject；真拒了也得记一条，否则这批永远等不齐
+									const msg = e instanceof Error ? e.message : String(e);
+									noteBatchItem(batch, seqIdx, {
+										name: one.name,
+										outcome: "failed",
+										elapsedMs: Date.now() - batch.startedAt,
+										error: `runAssistant 异常：${msg}`,
+										sessionId: names.id,
+									});
+								})
+						: runAssistant(one, task, {
+								timeoutMs: total,
+								// 不传 signal：不随本轮 turn 结束被 abort
+								names,
+								resumed: Boolean(resumeId),
+								mainModel,
+								shadowDir: shadowOf.dir,
+								sessionDir: ensureAssistantSessionDir(one.key),
+								// pane 分支的收尾靠它兜底写终态（onSettle 抛错 / 根本没调到也得有终态）
+								bgId,
+								onSettle: (r) => {
+									const prev = readBgTask(bgId) ?? {
+										id: bgId, key: one.key, name: one.name, task, sessionId: names.id,
+										startedAt: Date.now(), status: "running" as const,
+										ownerSessionFile: currentSessionFile,
+										ownerSessionId: currentSessionId,
+										deadlineAt,
+									};
+									writeBgTask({
+										...prev,
+										status: outcomeToStatus(r.outcome),
+										resultText: renderCard(r),
+										finishedAt: Date.now(),
+										delivered: false,
+									});
+								},
+							}).catch((e) => {
+								// runAssistant 正常不 reject；真拒了也绝不让这条留在 running（回执永远不投的根因）
+								try {
+									const prev = readBgTask(bgId);
+									if (prev && prev.status === "running") {
+										const msg = e instanceof Error ? e.message : String(e);
+										const fields = finalizeHerdrRun({ outcome: "failed", error: `runAssistant 异常：${msg}` });
+										writeHerdrBgTerminal(bgId, fields);
+									}
+								} catch {
+									/* ignore */
+								}
+							}));
 				}
 				return {
 					content: [
 						{
 							type: "text" as const,
 							text:
-								`已派发 ${plan.length} 个任务给「${label}」（后台跑，完成后自动回投主会话）：\n` +
+								`已派发 ${plan.length} 个任务给「${label}」（后台跑，完成后自动回投主会话${batch ? "，整批合成一张汇总卡" : ""}）：\n` +
 								ids.map((id) => `  · 会话ID ${id}`).join("\n") +
 								`\n\n中途想切同步/异步：/delegate-mode async | sync`,
 						},
 					],
-					details: { ok: true, async: true, sessions: ids },
+					details: { ok: true, async: true, sessions: ids, batchId: batch?.id },
 				};
 			}
 
@@ -3444,7 +4921,14 @@ export function setupDelegate(api: ExtensionAPI): void {
 						if (t.status === "running" || t.delivered) continue;
 						if (!isOwnBgTask(t)) continue;
 						// 清掉「已放弃」和退避计时，立即重试
-						writeBgTask({ ...t, undelivered: false, firstFailAt: undefined, attempts: 0, lastAttemptAt: undefined });
+						writeBgTask({
+							...t,
+							undelivered: false,
+							// 显式清零：只有用户主动要求重投才允许把重试计数/失败时间倒回去
+							reset: ["attempts", "firstFailAt", "lastAttemptAt", "lastError", "undelivered"],
+						});
+						deliveredThisRun.delete(t.id); // 手动重投：把内存去重也放开
+						forcedDeliver.add(t.id); // 也绕过「太老不自动投」的闸门（用户亲自要补）
 						n++;
 					}
 					await pollBgTasks();
