@@ -281,6 +281,25 @@ pi 扩展同步
 
 若 PowerShell 拦执行策略，用 `powershell -ExecutionPolicy Bypass -File .\install.ps1`。
 
+#### ⚠️ 同步前先清掉 `PI_CODING_AGENT_DIR`（真踩过）
+
+**现象**：跑完 `install.ps1`，`diff` 看「没有变化」，实际**一个文件都没装到真实目录**。
+
+**原因**：这个变量可能还指着派活时给子助理用的**影子目录**（`mcp` 隔离会临时改它）。`install.ps1` 只认环境变量，会老老实实把文件同步到那个影子目录里去。
+
+**PowerShell 里没有 `unset`**，所以两边写法不一样：
+
+| 你在哪 | 怎么写 |
+|---|---|
+| bash / Git Bash | `unset PI_CODING_AGENT_DIR && powershell -File install.ps1` |
+| PowerShell | 先 `Remove-Item Env:PI_CODING_AGENT_DIR`，再 `.\install.ps1`（只影响当前窗口） |
+
+**验证**（必须**无输出**，有输出就是没同步到真实目录）：
+
+```bash
+diff -r ai-configure ~/.pi/agent/extensions/ai-configure
+```
+
 ### 方式 A′：手动复制（macOS / Linux）
 
 ```bash
@@ -1187,6 +1206,17 @@ mcp: my-db
 - **槽位**：拿不到格子会**排队等 60s**，仍无位 → 降级 rpc（卡片备注「槽位等待 60s 超时已降级 rpc」，不是派失败）。
 - **卡死判定**：pane **90s 无输出** → 判卡死，自动降级 rpc 重跑（备注「pane 卡死 90s（无输出）已降级 rpc」）。
 
+### 排障：现象 → 原因 → 怎么办
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| 派了 N 个，只看到几块分屏 | 槽位有限：主窗口 **2** + 每个溢出 tab **4** | 其余**排队等 60s**，仍无位 → 降级 rpc（卡片会写「槽位等待 60s 超时已降级 rpc」）。不是派失败 |
+| 某任务没进分屏，而是直接出结果 | 该任务降级走了 rpc | 看卡片里的降级原因；非 Herdr 环境（没装 CLI / 不是交互式 TUI）属正常设计 |
+| Pane 标签是 `❌` 且保留 | 任务**失败**，pane 故意留着等你看 | 按回车关掉。**成功**的会自动收起，不用管 |
+| Pane 里卡住不动 | **90s 无输出**被判卡死 | 自动收 pane + 降级 rpc 重跑（备注「pane 卡死 90s（无输出）已降级 rpc」） |
+| 子助理启动慢 / 日志刷 `fd not found. Downloading...` | 影子目录缺 `bin/`，启动时现联网下载 fd/rg | **v2.5.0 已修**：影子目录的 `bin` 建成 junction，指向真实 `~/.pi/agent/bin` |
+| 每次 `/reload` 都收到旧卡片 | `.bg` 的 `delivered` 被覆盖，重投逻辑重复投递 | **v2.5.0 已修**：只自动投递 **10 分钟内**的结果、最多自动尝试 **3 次**；更老的用 `/agents bg redeliver` 手动补 |
+
 ---
 
 ## 上下文成本实测
@@ -1337,6 +1367,15 @@ adapter 专属设置挪到 `mcp-adapter.json`：
 ```
 
 一句话：**能进 pi 原生 `mcp.json` 的只有官方字段（含 `timeout`，单位秒）**；adapter 专属的别往那儿塞。
+
+## 更新日志
+
+### v2.5.0
+
+- 新增：Herdr 分屏 UI（`superagent.ui`: panel/split/tab/auto），主窗口左主右上下两格，溢出 tab `sa:extra#n` 可多个、每个 2×2
+- 修复：影子目录缺 bin（启动时联网下载 fd/rg 导致慢/挂起）、槽位分配竞态、pane 卡死无检测、`.bg` 的 delivered 被覆盖导致 reload 重投、pane 收尾丢回执
+- 体验：同批任务合并成 1 张汇总卡；槽位满排队等 60s；只自动投递 10 分钟内结果、最多自动尝试 3 次
+- 测试：unit / smoke / herdr-finalize-check / concurrency-regress
 
 ## 许可
 
