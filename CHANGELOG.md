@@ -1,0 +1,52 @@
+# 更新日志
+
+格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
+
+## 2.5.0
+
+- 新增：Herdr 分屏 UI 模式（`superagent.ui`: panel / split / tab / auto），主窗口左主右上下两格；溢出任务进 tab `sa:extra#n`，可开多个、每个 2×2
+- 新增：`herdr.ts` 薄封装 + 分屏布局与收尾回执，非 Herdr 环境自动降级回 panel
+- 修复：影子目录缺 bin 导致启动时联网下载 fd/rg（改 junction）、槽位分配竞态、pane 90s 无输出无检测、pane 收尾丢回执
+- 修复：后台任务 `delivered` 标记被覆盖，导致 reload 后重复投递
+- 体验：同批任务合并成 1 张汇总卡；槽位满时排队等 60s 再降级；只自动投递 10 分钟内的结果、最多自动尝试 3 次
+- 测试：unit 422+ 条断言 / smoke 10 条命令 / `herdr-finalize-check` / `concurrency-regress`
+
+## 2.4.1
+
+- 新增：排队任务在面板可见（`⏳ 排队中`），不再“点了没反应”
+- 修复：槽位改为进程退出即释放，避免僵尸槽位占满额度
+- 修复：`general` 助理权限收紧到 `${cwd}`
+- 新增：exec 硬拦开关（可关闭 exec 拦截回到纯观察模式）
+- 新增：`scripts/concurrency-regress.mjs` 并发回归脚本 + unit 补充断言
+
+## 2.4.0
+
+- 新增：Worker 侧权限守卫 `perm-guard.ts`（纯函数 `decideToolCall`：protected 硬拦、fs 路径白名单、exec/net 观察期只记录、fail-open）
+- 新增：`guard-entry.ts` —— 复制进影子目录的极薄入口，按官方 permission-gate 方式拒绝，文案含「策略性拒绝，不要重试」+ 替代方案
+- 保护清单：插件源码、`~/.pi/agent/{extensions,assistants,shadow}`、`ai-extensions.json`、`mcp-catalog.json`、`mcp.json`、`.git` 一律不可写
+- 新增：Router 协议支持异步派活（预计 >30s 用 `wait:false`，先回一句，结果回投）
+- 测试：unit 新增 perm-guard 套件 16 条断言
+
+## 2.3.1
+
+- 新增：`delegate.tasks` 元素支持 `{ assistant, task }` 对象形式，`assistant` 改为可选
+- 执行时按助理去重、各自建影子目录，跨领域并行任务可一次派给不同助理
+- Router 协议新增：派活前按 `desc` 挑专才；明确领域的活不许派给 `general`
+- `general` 的 `desc` 去掉「不确定就派我」的兜底暗示
+
+## 2.3.0
+
+- 新增：`permissions.ts` —— fs / paths / exec / cmds / net / budget 六项权限，解析 / 摘要 / 声明注入
+- 助理编辑页新增权限 6 行，落盘到 frontmatter；新建助理默认 dev / reader 预设
+- Worker 提示词注入「你的权限」段（越界不会成功、不要绕），任务卡片显示权限摘要
+- 新增：`git_read` 只读工具（status / diff / log / show，spawn 无 shell，拒绝时给替代方案）
+- 修复：`assistantFormParts.commit` 漏传 `ctx` 导致面板保存必失败（v2.2.1 遗留）
+- 新增：全局助理可「另存为本项目副本」，列表显示 全局 / 本项目 来源
+
+## 2.2.1
+
+- 修复：进入助理会开第二个面板（组页 `enter` 读到 `SettingDef.page` 就走 `d.page()` 同框 pushPage），命令执行次数 0
+- 新增：`delegate.assistantNewPage()`，「＋ 新建助理」也改成面板内翻页
+- 新增：长文本就地编辑 —— `FormField kind="long"` 值列显示摘要 `(N 字 · M 行)`，回车进编辑视图（软换行、21 行视口跟光标、`ctrl+s` 保存、`esc` 取消）
+- 渲染：`FormPane` 加 `lastH` + `fit()`，离开编辑视图时补空行到历史最高高度，避免宿主留残影
+- 修复：`FormPane` / `MultiSelect` 补 `invalidate()` 空实现，宿主遍历 overlay 组件时不再 `TypeError` 崩溃
