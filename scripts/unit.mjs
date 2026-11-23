@@ -164,8 +164,12 @@ function runSuite(name, bundleFile, bodyLines, env = {}) {
 	writeFileSync(bundleFile, src, "utf8");
 	console.log(`\n─── ${name} ───`);
 	try {
+		const inherited = { ...process.env };
+		// 隔离：外层 shell 里的 PI_SA_UI（压测要 export 它）不许污染断言。
+		// 套件要测环境变量就在断言里自己设 + try/finally 恢复。
+		delete inherited.PI_SA_UI;
 		const out = execFileSync(process.execPath, [bundleFile], {
-			env: { ...process.env, ...env },
+			env: { ...inherited, ...env },
 			encoding: "utf8",
 		});
 		process.stdout.write(out);
@@ -983,8 +987,12 @@ allOk =
 			'ok("paneLabel 三种状态都不同（不会看混）", new Set([paneLabel("run", "a", 1), paneLabel("ok", "a", 1), paneLabel("err", "a", 1), paneLabel("stalled", "a", 1)]).size === 4);',
 			'ok("paneLabel 名字空时兜底", paneLabel("run", "", 1) === "▶ sa:worker#1");',
 			'ok("tabLabel", tabLabel(2) === "sa:extra#2");',
-			'ok("ui 缺省（无配置）→ panel：绝不默默改派活链路", resolveUiMode(undefined, 1, true) === "panel");',
-			'ok("ui 缺省（老配置只剩 mainSlots）→ panel", resolveUiMode({ mainSlots: 2 }, 5, true) === "panel");',
+			'ok("默认 UI_DEFAULTS.ui === auto", UI_DEFAULTS.ui === "auto");',
+			'ok("ui 缺省（无配置）= auto + herdr → split", resolveUiMode(undefined, 1, true) === "split");',
+			'ok("ui 缺省（无配置）+ 3 个并发 → tab（超过 mainSlots=2）", resolveUiMode(undefined, 3, true) === "tab");',
+			'ok("ui 缺省 + 没 herdr → 降级 panel", resolveUiMode(undefined, 1, false) === "panel");',
+			'ok("ui 缺省（老配置只剩 mainSlots）也是 auto", resolveUiMode({ mainSlots: 2 }, 5, true) === "tab");',
+			'ok("显式 auto + 没 herdr → panel", resolveUiMode({ ui: "auto" }, 1, false) === "panel");',
 			'ok("显式 auto + 1 个并发 + herdrOk → split", resolveUiMode({ ui: "auto", mainSlots: 2 }, 1, true) === "split");',
 			'ok("auto + 2 个 → split", resolveUiMode({ ui: "auto", mainSlots: 2 }, 2, true) === "split");',
 			'ok("auto + 3 个 → tab", resolveUiMode({ ui: "auto", mainSlots: 2 }, 3, true) === "tab");',
@@ -1016,7 +1024,7 @@ allOk =
 			'ok("槽位表：overflowSlots=0 → 主窗口满了才排队", planSlot(3, { mainSlots: 2, overflowSlots: 0 }).where === "queue");',
 			'ok("容量 = 2 + 4 = 6（只是第一屏，不再当总上限）", slotCapacity(cfg) === 6 && slotCapacity({ mainSlots: 2, overflowSlots: 0 }) === 2);',
 			'const c0 = readUiConfig();',
-			'ok("配置：没写就是 panel + 2 + 4 + 0.6", c0.ui === "panel" && c0.mainSlots === 2 && c0.overflowSlots === 4 && c0.splitRatio === 0.6 && c0.paneKeepOnError === true);',
+			'ok("配置：没写就是 auto + 2 + 4 + 0.6", c0.ui === "auto" && c0.mainSlots === 2 && c0.overflowSlots === 4 && c0.splitRatio === 0.6 && c0.paneKeepOnError === true);',
 			'// 直接写配置文件（bundle 里没导入 patchExtCfg）',
 			'const cfgFile = join(getAgentDir(), "ai-extensions.json");',
 			'mkdirSync(getAgentDir(), { recursive: true });',
@@ -1025,11 +1033,53 @@ allOk =
 			'ok("配置：能读出来", c1.ui === "split" && c1.paneKeepOnError === false);',
 			'ok("配置：越界值被夹住", c1.mainSlots === 2 && c1.overflowSlots === 0 && c1.splitRatio === 0.95);',
 			'writeFileSync(cfgFile, JSON.stringify({ superagent: { ui: "胡说" } }), "utf8");',
-			'ok("配置：非法 ui 回落 panel", readUiConfig().ui === "panel");',
+			'ok("配置：非法 ui 回落默认值 auto", readUiConfig().ui === "auto");',
 			'writeFileSync(cfgFile, JSON.stringify({ superagent: { enabled: false, ui: "auto" } }), "utf8");',
 			'ok("superagent.enabled=false → 强制 panel（连显式 auto 也不开分屏）", readUiConfig().ui === "panel");',
 			'writeFileSync(cfgFile, JSON.stringify({ superagent: { enabled: false, ui: "split" } }), "utf8");',
 			'ok("superagent.enabled=false → 显式 split 也压回 panel", readUiConfig().ui === "panel");',
+			// 环境变量强制覆写（PI_SA_UI）：压测/脚本逃生口，优先级高于配置文件。
+			'writeFileSync(cfgFile, JSON.stringify({ superagent: { ui: "auto" } }), "utf8");',
+			'const savedEnv = process.env.PI_SA_UI;',
+			'try {',
+			'  process.env.PI_SA_UI = "panel";',
+			'  ok("PI_SA_UI=panel → 即使配置写 auto 也是 panel", readUiConfig().ui === "panel");',
+			'  process.env.PI_SA_UI = "split";',
+			'  ok("PI_SA_UI=split → split", readUiConfig().ui === "split");',
+			'  process.env.PI_SA_UI = "  TAB  ";',
+			'  ok("PI_SA_UI 宽松解析：首尾空格 + 大写也认", readUiConfig().ui === "tab");',
+			'  process.env.PI_SA_UI = "bogus";',
+			'  ok("PI_SA_UI=bogus → 按原配置算（不被污染）", readUiConfig().ui === "auto");',
+			'  process.env.PI_SA_UI = "auto";',
+			'  ok("PI_SA_UI=auto → auto（显式钉回自动判定）", readUiConfig().ui === "auto");',
+			'} finally {',
+			'  if (savedEnv === undefined) delete process.env.PI_SA_UI; else process.env.PI_SA_UI = savedEnv;',
+			'}',
+			// 全局关（enabled=false）时环境变量也不能绕过：仍然 panel。
+			'writeFileSync(cfgFile, JSON.stringify({ superagent: { enabled: false, ui: "auto" } }), "utf8");',
+			'const savedEnv2 = process.env.PI_SA_UI;',
+			'try {',
+			'  process.env.PI_SA_UI = "split";',
+			'  ok("enabled=false + PI_SA_UI=split → 仍然 panel（全局关不可绕过）", readUiConfig().ui === "panel");',
+			'} finally {',
+			'  if (savedEnv2 === undefined) delete process.env.PI_SA_UI; else process.env.PI_SA_UI = savedEnv2;',
+			'}',
+			'writeFileSync(cfgFile, JSON.stringify({ superagent: { enabled: true, ui: "auto" } }), "utf8");',
+			'const savedEnv3 = process.env.PI_SA_UI;',
+			'try {',
+			'  delete process.env.PI_SA_UI;',
+			'  ok("不设 PI_SA_UI + 配置 enabled:true/auto → auto", readUiConfig().ui === "auto");',
+			'} finally {',
+			'  if (savedEnv3 !== undefined) process.env.PI_SA_UI = savedEnv3;',
+			'}',
+			'writeFileSync(cfgFile, JSON.stringify({ superagent: { enabled: false } }), "utf8");',
+			'const savedEnv4 = process.env.PI_SA_UI;',
+			'try {',
+			'  delete process.env.PI_SA_UI;',
+			'  ok("不设 PI_SA_UI 且配置 enabled:false → panel", readUiConfig().ui === "panel");',
+			'} finally {',
+			'  if (savedEnv4 !== undefined) process.env.PI_SA_UI = savedEnv4;',
+			'}',
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-herdr") },
 	) && allOk;
@@ -1433,6 +1483,19 @@ allOk =
 			'ok("解析：数字不是数字 → undefined（不写坏配置）", parseFieldValue(dNum, "abc") === undefined);',
 			'const dEnum = getSetting("tEnum");',
 			'ok("解析：枚举按显示文本映射回真实值", parseFieldValue(dEnum, "触发词（必须说）") === "word");',
+			// 面板里 UI 模式改了存不进去的回归：长标签会被截断成 "auto"
+			'const dUi = { key: "tUi", kind: "enum", options: ["panel", "split", "tab", "auto（默认：有 Herdr 就分屏）"], values: ["panel", "split", "tab", "auto"] };',
+			'ok("解析：UI 长标签完整匹配 → auto", parseFieldValue(dUi, "auto（默认：有 Herdr 就分屏）") === "auto");',
+			'ok("解析：UI 标签被截断成 auto 也能存", parseFieldValue(dUi, "auto") === "auto");',
+			'ok("解析：UI 旧长标签（auto = ≤2 个用 split）也能存", parseFieldValue(dUi, "auto = ≤2 个用 split") === "auto");',
+			'ok("解析：UI 普通短值 split → split", parseFieldValue(dUi, "split") === "split");',
+			'ok("解析：UI 乱七八糟的值 → undefined（不写坏配置）", parseFieldValue(dUi, "bogus") === undefined);',
+			'const storeUi = { v: "panel" };',
+			'registerSettings([{ key: "tUiReal", group: "甲组", label: "UI 模式", desc: "这是一个枚举项，用来测面板里改 UI 模式能不能真的存进去", kind: "enum", options: ["panel", "split", "tab", "auto（默认：有 Herdr 就分屏）"], values: ["panel", "split", "tab", "auto"], def: "auto", get: () => storeUi.v, set: (v) => { storeUi.v = v; } }]);',
+			'const rUi = applySettingsValues({ tUiReal: "auto" });',
+			'ok("保存：截断成 auto 也真的存进去了（不再落 failed）", rUi.applied.length === 1 && rUi.failed.length === 0 && storeUi.v === "auto");',
+			'const rUi2 = applySettingsValues({ tUiReal: "auto = ≤2 个用 split" });',
+			'ok("保存：旧长标签也能存", rUi2.applied.length === 1 && rUi2.failed.length === 0 && storeUi.v === "auto");',
 			'const dList = getSetting("tList");',
 			'ok("解析：列表支持中英文逗号/空格", JSON.stringify(parseFieldValue(dList, "发送，投给pi 继续")) === JSON.stringify(["发送","投给pi","继续"]));',
 			'const dBool = getSetting("tBool");',
@@ -1518,6 +1581,72 @@ allOk =
 			'if (crashed.length) console.log("   炸了: " + crashed.join(" | "));',
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-entry") },
+	) && allOk;
+
+// ---------- 套件：config（拉取连接的重试 / 错误分类） ----------
+// 场景：后端冷启动第一次 ~10s 超时，用户点「从配置中心拉取连接」看到 timeout 报错。
+// 这里用假 sleep（不真等）验重试编排；不连真实网络。
+bundle("config.ts", "config.mjs");
+allOk =
+	runSuite(
+		"config：拉取重试 / 错误分类",
+		join(tmp, "config.mjs"),
+		[
+			'// ---- 错误分类：只有超时/网络类可重试 ----',
+			'ok("分类：timeout 文案 → 可重试", isRetriableFetchError(new Error("The operation was aborted due to timeout")) === true);',
+			'ok("分类：{name:TimeoutError} 对象 → 可重试（DOMException 不是 Error 子类）", isRetriableFetchError({ name: "TimeoutError" }) === true);',
+			'ok("分类：真 DOMException(TimeoutError) → 可重试", isRetriableFetchError(new DOMException("The operation was aborted due to timeout", "TimeoutError")) === true);',
+			'ok("分类：fetch failed（断网/连接重置）→ 可重试", isRetriableFetchError(new Error("fetch failed")) === true);',
+			'ok("分类：ECONNRESET → 可重试", isRetriableFetchError(new Error("read ECONNRESET")) === true);',
+			'ok("分类：密钥不对（401）→ 不重试", isRetriableFetchError(new Error("密钥不对（401）")) === false);',
+			'ok("分类：HTTP 500 → 不重试（状态码错重试也没用）", isRetriableFetchError(new Error("中心返回 HTTP 500")) === false);',
+			'ok("分类：没给明文 → 不重试", isRetriableFetchError(new Error("中心没给明文（Token 不对？）")) === false);',
+			'// ---- 重试编排 ----',
+			'const fakeSleep = async () => {};',
+			'let n1 = 0;',
+			'const r1 = await withRetry(async () => { n1++; return "ok"; }, 3, [800, 2000], fakeSleep);',
+			'ok("重试：第一次就成功 → 只调 1 次", r1 === "ok" && n1 === 1);',
+			'let n2 = 0;',
+			'const r2 = await withRetry(async (i) => { n2++; if (i < 2) throw new Error("The operation was aborted due to timeout"); return i; }, 3, [800, 2000], fakeSleep);',
+			'ok("重试：前 2 次超时、第 3 次成功 → 返回成功值且调了 3 次", r2 === 2 && n2 === 3);',
+			'let n3 = 0;',
+			'let e3;',
+			'try { await withRetry(async () => { n3++; throw new Error("The operation was aborted due to timeout"); }, 3, [800, 2000], fakeSleep); } catch (e) { e3 = e; }',
+			'ok("重试：3 次都超时 → 抛错，调用 3 次", !!e3 && n3 === 3);',
+			'ok("重试：最后一次的错误原样抛出（不是包装成别的）", !!e3 && String(e3.message).includes("timeout"));',
+			'let n4 = 0;',
+			'let e4;',
+			'try { await withRetry(async () => { n4++; throw new Error("密钥不对（401）"); }, 3, [800, 2000], fakeSleep); } catch (e) { e4 = e; }',
+			'ok("重试：第一次 401 → 立刻抛，只调 1 次", !!e4 && e4.message === "密钥不对（401）" && n4 === 1);',
+			'let n5 = 0;',
+			'try { await withRetry(async () => { n5++; throw new Error("中心返回 HTTP 500"); }, 3, [800, 2000], fakeSleep); } catch { /* expected */ }',
+			'ok("重试：HTTP 500 不重试 → 只调 1 次", n5 === 1);',
+			'const sleeps = [];',
+			'try { await withRetry(async () => { throw new Error("timeout"); }, 3, [800, 2000], async (ms) => { sleeps.push(ms); }); } catch { /* expected */ }',
+			'ok("重试：等 2 次（attempts-1）", sleeps.length === 2);',
+			'ok("重试：间隔按 delays 依次是 800 / 2000", JSON.stringify(sleeps) === JSON.stringify([800, 2000]));',
+			'const sleeps2 = [];',
+			'await withRetry(async (i) => { if (i < 3) throw new Error("timeout"); return "v"; }, 4, [100], async (ms) => { sleeps2.push(ms); });',
+			'ok("重试：delays 不够长时用最后一项兜底（100）", JSON.stringify(sleeps2) === JSON.stringify([100, 100, 100]));',
+			'// ---- 默认参数：3 次 + 不出网（fn 自己抛） ----',
+			'let n6 = 0;',
+			'try { await withRetry(async () => { n6++; throw new Error("socket hang up"); }, undefined, undefined, fakeSleep); } catch { /* expected */ }',
+			'ok("重试：默认 attempts=3", n6 === 3);',
+			'// ---- onRetry 回调：重试期间给用户可见反馈 ----',
+			'const seen = [];',
+			'try { await withRetry(async () => { throw new Error("timeout"); }, 3, [800, 2000], fakeSleep, (info) => seen.push(info)); } catch { /* expected */ }',
+			'ok("onRetry：3 次尝试 → 2 次回调（= 重试次数）", seen.length === 2);',
+			'ok("onRetry：attempt 依次是 1、2", JSON.stringify(seen.map((x) => x.attempt)) === JSON.stringify([1, 2]));',
+			'ok("onRetry：waitMs 依次是 800、2000", JSON.stringify(seen.map((x) => x.waitMs)) === JSON.stringify([800, 2000]));',
+			'ok("onRetry：attempts 与 error 也一并给出", seen.every((x) => x.attempts === 3 && x.error instanceof Error));',
+			'let threwYet = false;',
+			'const rThrow = await withRetry(async (i) => { threwYet = true; if (i < 1) throw new Error("timeout"); return "done"; }, 3, [800, 2000], fakeSleep, () => { throw new Error("回调炸了"); });',
+			'ok("onRetry：回调内部抱错不影响重试，最终仍能成功", rThrow === "done" && threwYet);',
+			'let cb0 = 0;',
+			'const rFast = await withRetry(async () => "fast", 3, [800, 2000], fakeSleep, () => { cb0++; });',
+			'ok("onRetry：第一次就成功 → 回调没被调", rFast === "fast" && cb0 === 0);',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-config") },
 	) && allOk;
 
 // ---------- 静态检查：删掉的功能不许留"幽灵引用" ----------
@@ -1630,6 +1759,7 @@ allOk =
 	const delegateSrc = readFileSync(join(ext, "delegate.ts"), "utf8");
 	const liveSrc = readFileSync(join(ext, "live.ts"), "utf8");
 	const herdrSrc = readFileSync(join(ext, "herdr.ts"), "utf8");
+	const saSrc = readFileSync(join(ext, "superagent.ts"), "utf8");
 	const mustExport = [
 		"herdrAvailable",
 		"paneSplit",
@@ -1653,6 +1783,9 @@ allOk =
 		"成功改 ✅ / 失败改 ❌（保留 pane 时改成「已停」）": delegateSrc.includes('paneLabel("ok"') && delegateSrc.includes('paneLabel("stopped"') && /kind === "stopped"/.test(herdrSrc),
 		"失败保留 pane 会先停掉里面的 pi（ctrl+c -> 已停）": /stopKeptPane\(slot\.paneId/.test(delegateSrc) && /export function stopKeptPane/.test(delegateSrc) && delegateSrc.includes('"ctrl+c"'),
 		"panel 里分屏 worker 压成一行": /function renderPaneJob/.test(liveSrc) && /job\.uiMode === "split"/.test(liveSrc),
+		"默认 UI 是 auto（不是 panel）": /ui: "auto",/.test(herdrSrc) && !/ui: "panel",/.test(herdrSrc),
+		"UI 模式 set 宽松解析（长标签/被截断也能存）": saSrc.includes("UI_VALUES.find((x) => x === raw)") && saSrc.includes("/[ =（(]/"),
+		"UI 候选标签不再是超长说明句（面板里看得全）": /const UI_OPTIONS = \[\s*"panel",/.test(saSrc) && !saSrc.includes("auto = ≤2 个用 split，更多溢出到 tab"),
 	};
 	const bad = Object.entries(checks)
 		.filter(([, v]) => v !== true)

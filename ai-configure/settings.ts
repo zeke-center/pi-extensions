@@ -218,8 +218,14 @@ export function parseFieldValue(d: SettingDef, text: string): string | number | 
 	if (d.kind === "enum") {
 		const labels = d.options ?? [];
 		const vals = d.values ?? labels;
-		const i = labels.indexOf(raw);
-		return i >= 0 ? vals[i] : undefined;
+		let i = labels.indexOf(raw);
+		if (i < 0) {
+			// 面板里长标签可能被截断/去掉说明（"auto = xxx" → "auto"），按值再兜一次
+			const head = raw.split(/[ =（(]/)[0].trim();
+			i = vals.findIndex((x) => String(x) === head);
+			if (i < 0) i = labels.findIndex((x) => x.split(/[ =（(]/)[0].trim() === head);
+		}
+		return i >= 0 && i < vals.length ? vals[i] : undefined;
 	}
 	if (d.kind === "list") {
 		const list = raw

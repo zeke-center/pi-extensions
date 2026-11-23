@@ -260,19 +260,70 @@ function padTo(s: string, w: number): string {
 }
 
 // ======================= 网络 =======================
-async function fetchConnectors(tok: string): Promise<Connector[]> {
+/** 超时/网络类错误才重试；鉴权/HTTP 4xx 之类立刻抛（重试没用） */
+export function isRetriableFetchError(e: unknown): boolean {
+	// 注意：AbortSignal.timeout() 抛的是 DOMException（不是 Error 子类），
+	// 但带 name="TimeoutError"；所以不能只看 instanceof Error，要退回去看 name/message。
+	let msg: string;
+	if (e instanceof Error) {
+		msg = `${e.name} ${e.message}`;
+	} else if (e && typeof e === "object") {
+		const o = e as { name?: unknown; message?: unknown };
+		const s = `${typeof o.name === "string" ? o.name : ""} ${typeof o.message === "string" ? o.message : ""}`.trim();
+		msg = s || String(e);
+	} else {
+		msg = String(e);
+	}
+	return /timeout|abort|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up/i.test(msg);
+}
+
+/** 重试编排：attempts 次，间隔按 delays 依次等。fn 抛不可重试的错立刻上抛。 */
+export async function withRetry<T>(
+	fn: (attempt: number) => Promise<T>,
+	attempts = 3,
+	delays: number[] = [800, 2000],
+	sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+	onRetry?: (info: { attempt: number; attempts: number; error: unknown; waitMs: number }) => void,
+): Promise<T> {
+	let lastErr: unknown;
+	for (let i = 0; i < attempts; i++) {
+		try {
+			return await fn(i);
+		} catch (e) {
+			lastErr = e;
+			if (!isRetriableFetchError(e) || i === attempts - 1) throw e;
+			const waitMs = delays[Math.min(i, delays.length - 1)] ?? 1000;
+			try {
+				onRetry?.({ attempt: i + 1, attempts, error: e, waitMs });
+			} catch {
+				/* 回调自身抛错不能影响重试 */
+			}
+			await sleep(waitMs);
+		}
+	}
+	throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+async function fetchConnectors(
+	tok: string,
+	onRetry?: (info: { attempt: number; attempts: number; error: unknown; waitMs: number }) => void,
+): Promise<Connector[]> {
 	if (!API) {
 		throw new Error("没设配置中心地址。请先设环境变量 CENTER_API（例：CENTER_API=https://api.example.com）");
 	}
-	const r = await fetch(`${API}/api/ai/connectors`, {
-		headers: { "X-Brain-Token": tok },
-		signal: AbortSignal.timeout(10000),
-	});
-	if (r.status === 401) throw new Error("密钥不对（401）");
-	if (!r.ok) throw new Error(`中心返回 HTTP ${r.status}`);
-	const j = (await r.json()) as { connectors?: Connector[]; reveal?: boolean };
-	if (!j.reveal) throw new Error("中心没给明文（Token 不对？）");
-	return j.connectors ?? [];
+	// 后端冷启动第一次常超时（实测 ~10s），所以单次给 20s，再整体重试 3 次。
+	// 只有超时/网络类才重试；401 / 非 ok / 没给明文 立刻抛。
+	return withRetry(async () => {
+		const r = await fetch(`${API}/api/ai/connectors`, {
+			headers: { "X-Brain-Token": tok },
+			signal: AbortSignal.timeout(20000),
+		});
+		if (r.status === 401) throw new Error("密钥不对（401）");
+		if (!r.ok) throw new Error(`中心返回 HTTP ${r.status}`);
+		const j = (await r.json()) as { connectors?: Connector[]; reveal?: boolean };
+		if (!j.reveal) throw new Error("中心没给明文（Token 不对？）");
+		return j.connectors ?? [];
+	}, 3, [800, 2000], undefined, onRetry);
 }
 
 /** 没密钥时弹框让用户输（只存在内存，不写任何文件）。返回 null 表示放弃。 */
@@ -420,12 +471,26 @@ export function setupConfig(api: ExtensionAPI): void {
 			}
 
 			let connectors: Connector[];
+			ctx.ui.notify("正在从配置中心拉取…（最多约 60 秒，超时会自动重试）", "info");
+			let retries = 0;
+			const onRetry = (info: { attempt: number; attempts: number; waitMs: number }) => {
+				retries = info.attempt;
+				ctx.ui.notify(
+					`拉取超时，正在重试 ${info.attempt}/${info.attempts - 1}（${Math.round(info.waitMs / 1000)} 秒后）…`,
+					"warning",
+				);
+			};
 			try {
-				connectors = (await fetchConnectors(tok)).filter((c) => c.enabled);
+				connectors = (await fetchConnectors(tok, onRetry)).filter((c) => c.enabled);
 			} catch (e) {
-				ctx.ui.notify(`拉取失败：${e instanceof Error ? e.message : e}`, "error");
+				const msg = e instanceof Error ? e.message : String(e);
+				const hint = /timeout|abort|fetch failed/i.test(msg)
+					? "（后端可能刚冷启动）已重试 3 次仍失败 —— 等 10 秒再点一次，别连续重试"
+					: "";
+				ctx.ui.notify(`拉取失败：${msg}${hint}`, "error");
 				return;
 			}
+			if (retries > 0) ctx.ui.notify(`拉取成功（重试 ${retries} 次后）`, "info");
 			if (connectors.length === 0) {
 				ctx.ui.notify("台账里没有启用的连接（去 AI 配置中心加一条）", "warning");
 				return;

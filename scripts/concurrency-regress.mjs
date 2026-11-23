@@ -22,6 +22,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// 压测不碰 Herdr：默认 auto 会让"跑一次派活"变成"真开 pane"，压死 + 留残留 pane。
+process.env.PI_SA_UI = "panel";
+
 const require = createRequire(import.meta.url);
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const ext = join(root, "ai-configure");

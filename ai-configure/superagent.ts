@@ -411,10 +411,10 @@ const EXTRA_DEFS: SettingDef[] = [];
 // 值存在 `ai-extensions.json` 的 `superagent` 块下：
 //   ui / mainSlots / overflowSlots / splitRatio / paneKeepOnError
 const UI_OPTIONS = [
-	"panel = 只在面板里显示卡片（默认，哪里都能用）",
-	"split = Herdr 左主右子分屏（需 Herdr）",
-	"tab = 每个子助理一个 Herdr 标签（需 Herdr）",
-	"auto = ≤2 个用 split，更多溢出到 tab；非 Herdr 自动降级 panel（**必须显式选**）",
+	"panel",
+	"split",
+	"tab",
+	"auto（默认：有 Herdr 就分屏）",
 ];
 const UI_VALUES: UiMode[] = ["panel", "split", "tab", "auto"];
 
@@ -531,11 +531,11 @@ function registerSuperAgentSettings(): void {
 			label: "UI 模式",
 			desc:
 				"子助理到底怎么显示出活的过程：\n\n" +
-				"- **panel**：只在面板里显示卡片（**默认**，哪里都能用）\n" +
+				"- **panel**：只在面板里显示卡片（哪里都能用）\n" +
 				"- **split**：Herdr 左主右子分屏 —— 主会话在左，右边竖切两格放子助理\n" +
 				"- **tab**：每个子助理一个 Herdr 标签\n" +
 				"- **auto**：≤2 个用 split，更多溢出到一个「sa:extra」标签里（2×2 四宫格），非 Herdr 自动降级 panel\n\n" +
-				"默认是 panel：分屏/auto 要你自己选（这条链依赖外部 CLI 与交互式进程，走错会把任务派成空的）。\n" +
+				"默认 auto：有 Herdr 就分屏，没有就退回面板卡片。\n" +
 				"Super Agent 全局关掉时也会强制回到 panel。\n\n" +
 				"全部 pane/tab 都用 `sa:<助理>#<序号>` 命名；跑成功自动收起，失败保留（按回车关闭）。",
 			kind: "enum",
@@ -543,7 +543,13 @@ function registerSuperAgentSettings(): void {
 			values: UI_VALUES,
 			def: UI_DEFAULTS.ui,
 			get: () => readUiConfig().ui,
-			set: (v) => patchSuperAgent({ ui: UI_VALUES.includes(v as UiMode) ? v : UI_DEFAULTS.ui }),
+			set: (v) => {
+				// 面板里长标签可能被截断/去掉说明（"auto（默认…）" / "auto = …"），先精确匹配再按前缀兑
+				const raw = String(v ?? "");
+				const head = raw.split(/[ =（(]/)[0].trim();
+				const hit = UI_VALUES.find((x) => x === raw) ?? UI_VALUES.find((x) => x === head);
+				patchSuperAgent({ ui: hit ?? UI_DEFAULTS.ui });
+			},
 		},
 		{
 			key: "superagent.mainSlots",

@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.2**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1277,6 +1277,9 @@ mcp: my-db
 
 1. **版本号三处**：`package.json`、`ai-configure/package.json`、`README.md` 顶部的「当前版本」。
 2. **四套测试全绿**：`node scripts/unit.mjs`、`node scripts/smoke.mjs`、`node scripts/herdr-finalize-check.mjs`、`node scripts/concurrency-regress.mjs`。
+
+> 🧪 跑压测 / 收尾检查前先钉死 UI 模式：`$env:PI_SA_UI="panel"`（bash: `export PI_SA_UI=panel`）。
+> 默认 `auto` 会让"跑一次派活"变成"真开 Herdr pane"，压测会挂住并留下残留 pane。
 3. **同步生效目录**：先清 `PI_CODING_AGENT_DIR`（bash `unset` / PowerShell `Remove-Item Env:`），再跑 `install.ps1`，然后 `diff -r ai-configure ~/.pi/agent/extensions/ai-configure` 必须无输出。
 4. **⭐ 追加 CHANGELOG**：在 `CHANGELOG.md` **最上面**加一段 `## <新版本号>`，写成中文、3~6 条、一条一句话，只写「新增 / 修复 / 体验 / 测试」这类重点，**别写成长篇**。
    - 版本标题必须是 `## 2.6.0` 这种三段式（pi 靠这个正则解析：`## \[?(\d+)\.(\d+)\.(\d+)\]?`）

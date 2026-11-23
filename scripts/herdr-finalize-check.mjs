@@ -17,6 +17,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// 收尾检查不碰 Herdr：默认 auto 会真开 pane（保险，即使这个脚本只调纯函数）。
+process.env.PI_SA_UI = "panel";
+
 const require = createRequire(import.meta.url);
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const ext = join(root, "ai-configure");

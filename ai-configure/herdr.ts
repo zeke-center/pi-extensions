@@ -349,11 +349,10 @@ export interface UiConfig {
 }
 
 export const UI_DEFAULTS: UiConfig = {
-	// ⚠️ 默认必须是 panel，**不能**是 auto。
-	// 分屏链路依赖外部 CLI（herdr）+ 交互式 pi 进程 + launcher 编码，这条链出过真事故：
-	// 任务文本在 launcher 里被吃掉，worker 只收到碎片输入、空跑一趟（还「看起来正常」）。
-	// 默认开启 = 把所有人的派活行为换掉，所以 auto / split / tab 只能由用户显式选择。
-	ui: "panel",
+	// 默认 auto：本机有 herdr 就自动分屏（≤mainSlots 用 split，更多进 tab），
+	// 没有 herdr / 分屏链路失败 → 自动降级回 panel。用户明确要求默认 auto。
+	// 注意 auto 也依赖 herdr 探测，所以 resolveUiMode 里 herdrOk=false 必须回 panel。
+	ui: "auto",
 	mainSlots: 2,
 	overflowSlots: 4,
 	splitRatio: 0.6,
@@ -379,22 +378,31 @@ export function readUiConfig(): UiConfig {
 			? b.ui
 			: UI_DEFAULTS.ui;
 	const ratio = Number(b.splitRatio);
-	return {
+	const base: UiConfig = {
 		ui,
 		mainSlots: intIn(b.mainSlots, UI_DEFAULTS.mainSlots, 0, 2),
 		overflowSlots: intIn(b.overflowSlots, UI_DEFAULTS.overflowSlots, 0, 4),
 		splitRatio: Number.isFinite(ratio) ? Math.min(0.95, Math.max(0.05, ratio)) : UI_DEFAULTS.splitRatio,
 		paneKeepOnError: typeof b.paneKeepOnError === "boolean" ? b.paneKeepOnError : UI_DEFAULTS.paneKeepOnError,
 	};
+	// 测试 / 脚本逃生口：环境变量强制指定 UI 模式，优先级最高。
+	// 为什么需要：默认 auto 后，任何"跑一次派活"的脚本都会真去开 Herdr pane，
+	// 压测会挂住 + 留一堆残留 pane。压测脚本必须能钉死 panel。
+	// 例外：enabled === false（全局关）时环境变量也不能绕过，仍然 panel。
+	const forced = String(process.env.PI_SA_UI ?? "").trim().toLowerCase();
+	if (!disabled && (forced === "panel" || forced === "split" || forced === "tab" || forced === "auto")) {
+		return { ...base, ui: forced };
+	}
+	return base;
 }
 
 /**
  * 这一刻该用哪种 UI。
- *   panel（默认）       → 永远只画卡片
+ *   auto（默认）        → 没有 Herdr → panel；≤ mainSlots 个 → split；更多 → tab（溢出到 tab）
+ *   panel               → 永远只画卡片
  *   split / tab         → 要 Herdr；没有就**降级 panel**（不报错、不崩）
- *   auto（必须显式选）  → 没有 Herdr → panel；≤ mainSlots 个 → split；更多 → tab（溢出到 tab）
  *
- * 认不出来的值（含缺省）一律当 panel —— "auto" 只在用户**真的写了 auto** 时才生效。
+ * 缺省 / 认不出来的值都按 UI_DEFAULTS.ui（= auto）算，auto 仍然被 herdrOk 兜住。
  */
 export function resolveUiMode(
 	cfg: Partial<UiConfig> | undefined,
