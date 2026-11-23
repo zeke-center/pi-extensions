@@ -1273,6 +1273,19 @@ mcp: my-db
 .\install.ps1 board
 ```
 
+### 发版清单（每次发版照做，别漏）
+
+1. **版本号三处**：`package.json`、`ai-configure/package.json`、`README.md` 顶部的「当前版本」。
+2. **四套测试全绿**：`node scripts/unit.mjs`、`node scripts/smoke.mjs`、`node scripts/herdr-finalize-check.mjs`、`node scripts/concurrency-regress.mjs`。
+3. **同步生效目录**：先清 `PI_CODING_AGENT_DIR`（bash `unset` / PowerShell `Remove-Item Env:`），再跑 `install.ps1`，然后 `diff -r ai-configure ~/.pi/agent/extensions/ai-configure` 必须无输出。
+4. **⭐ 追加 CHANGELOG**：在 `CHANGELOG.md` **最上面**加一段 `## <新版本号>`，写成中文、3~6 条、一条一句话，只写「新增 / 修复 / 体验 / 测试」这类重点，**别写成长篇**。
+   - 版本标题必须是 `## 2.6.0` 这种三段式（pi 靠这个正则解析：`## \[?(\d+)\.(\d+)\.(\d+)\]?`）
+   - 为什么必须写：pi 更新后会读它，在**新会话首屏**显示 `Extension Updates`，用户才知道这版改了什么
+   - 漏掉 = 用户升级后什么也看不到
+5. **提交 + 打 tag + 双推**：`git commit` → `git tag v<版本>` → `git push origin main --tags`（`origin` 配了两个 pushurl，GitHub 与 Gitee 一次推完）。
+
+> ⚠️ 第 4 步最容易忘。改完代码、测试过了、准备提交前，先翻一眼 `CHANGELOG.md` 最上面的版本号是不是这次要发的版本。
+
 入口是默认导出的工厂函数；各模块导出 `setupXxx`：
 
 ```ts
