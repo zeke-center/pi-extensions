@@ -9,10 +9,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { boardSnapshot, computeMcp } from "./board";
 import { loadTemplates, undeliveredBgCount } from "./delegate";
+import { formatHerdrDiagnostic, herdrStatus, readUiConfig, resolveUiMode, type HerdrDiagInput } from "./herdr";
 import { healthReport } from "./health";
 import { liveJobs } from "./live";
 import { assistantSessionRoot, localCatalogPath, shadowRoot } from "./mcp-pool";
 import { panelMode } from "./panel";
+import { resolveRouterPrompt } from "./superagent";
 
 export function showDoctor(ctx: ExtensionContext): void {
 	const cwd = ctx.cwd ?? process.cwd();
@@ -72,6 +74,8 @@ export function showDoctor(ctx: ExtensionContext): void {
 	L.push(`- 未回投：${undeliveredBgCount()}`);
 	L.push(`- 运行中子进程：${liveJobs().filter((j) => j.status === "running").length}`);
 	L.push(`- 子代理面板：${panelMode()}`);
+	// 分屏为什么没生效 / Router 提示词到底读的哪份 —— 都摊开（全部 try/catch，绝不抛）
+	L.push(...herdrDiagnosticLines(cwd));
 	L.push(`- 助理会话目录：${assistantSessionRoot()}`);
 	L.push(`- 影子目录根：${shadowRoot()} · 本地 MCP 目录：${localCatalogPath()}`);
 	L.push("");
@@ -90,6 +94,58 @@ export function showDoctor(ctx: ExtensionContext): void {
 	}
 
 	ctx.ui.notify(L.join("\n"), "info");
+}
+
+/**
+ * Herdr / Router 诊断行（给 `/aidoctor` 用）。
+ * 每一项都单独 try/catch：任何一项取不到就写「(取不到)」，**绝不把整个 doctor 搞崩**。
+ */
+export function herdrDiagnosticLines(cwd: string): string[] {
+	let st: ReturnType<typeof herdrStatus> | undefined;
+	try {
+		st = herdrStatus();
+	} catch {
+		st = undefined;
+	}
+	let ui: string | undefined;
+	let actual: string | undefined;
+	let running = 0;
+	try {
+		running = liveJobs().filter((j) => j.status === "running").length;
+	} catch {
+		running = 0;
+	}
+	try {
+		const cfg = readUiConfig();
+		ui = cfg.ui;
+		actual = resolveUiMode(cfg, running, st?.ok === true);
+	} catch {
+		actual = undefined; // 配置读不到 / 算不出来 → 格式化时写 (取不到)
+	}
+	const router: Partial<HerdrDiagInput> = {};
+	try {
+		const rp = resolveRouterPrompt(cwd);
+		router.routerSource = rp.source;
+		router.routerBytes = rp.bytes;
+		router.routerFile = rp.file;
+		router.routerExtraFile = rp.extraFile;
+	} catch {
+		/* 取不到就留空 → 格式化时写 (取不到) */
+	}
+	const input: HerdrDiagInput = {
+		term: st?.term,
+		panes: st?.panes,
+		ok: st?.ok,
+		reason: st?.reason,
+		ui,
+		actual,
+		...router,
+	};
+	try {
+		return formatHerdrDiagnostic(input);
+	} catch {
+		return formatHerdrDiagnostic(undefined);
+	}
 }
 
 export function setupDoctor(api: ExtensionAPI): void {

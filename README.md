@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.3**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.4**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -131,6 +131,9 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | **`/delegate-mode`** | （无参数） | 看 delegate 默认同步还是异步 |
 | | `async` | 默认**异步**：派完就走，后台跑，完成自动回投（不打断） |
 | | `sync` | **同步**：派完等结果才继续（老行为） |
+| **`/router`** | `[blind\|readonly\|off]` | 看 / 切 **Router 档位**（Super Agent 主会话的管束强度）。本会话有效、**重启复位**；默认 `blind`（只派活，不许主会话自己动手）。无参数 = 只看当前档 |
+| **`/panes`** | — | 列出本会话的子助理 pane（编号 / 助理 / 状态），标出「自己」和主 pane |
+| **`/pane-close`** | `[all\|编号]` | 关闭卡住的子助理 pane；无参只关「已停 / 失败保留」的；**永远跳过自己和主 pane** |
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
 
@@ -706,6 +709,7 @@ pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 
 - ❌ **混进一件可能卡很久的**（扫全盘、大范围搜索、装依赖、跑测试）→ 整批陪你等，白搭
 - 👉 那种给慢活改用具模板的 `timeout` 单独放宽（或干脆不给），**别把它和快活混在一批里**
 - 👉 真卡住的用 `resume: "<会话ID>"` 续，历史都在，不会重做
+- 👉 想知道**逐件进度**（而不是干等整批）：把 `superagent.batchLive` 打开（写在 `~/.pi/agent/ai-extensions.json` 的 `superagent` 块下，**默认关**）—— 每完成一件回投一条 **≤60 字短卡**，一批最多 **4** 条（并发上限），序号 1 基
 
 ### 超时：到点前先叫停，不会再白跑
 
@@ -1200,6 +1204,13 @@ mcp: my-db
 | `tab` | 每个子助理一个 Herdr tab |
 | `auto` | ≤2 个走 `split`，更多溢出到 tab |
 
+`superagent` 块下还有两个跟「保留的 pane」有关的配置：
+
+| 配置 | 默认 | 行为 |
+|---|---|---|
+| `paneKeepOnError` | `true` | 失败 / 超时 / ESC 中止后**保留 pane**（先停掉里面的 pi，标签写「已停」），方便回看现场；`false` 则直接关 |
+| `paneKeepMinutes` | `10` | 保留的 pane 多少分钟后自动回收；**`0` = 永不自动关**（只留给人手动 `/pane-close`） |
+
 - **降级**：`split` / `tab` / `auto` 都需要 Herdr；非 Herdr 环境（没装 CLI / 不是交互式 TUI）**自动降级回 `panel`**，不会派成空任务。Super Agent 全局关掉时也强制 `panel`。
 - **布局**：主窗口右侧竖切两格（`mainSlots = 2`，比例 `splitRatio`）；放不下的进溢出 tab **`sa:extra#n`**，每个 tab **2×2 四宫格**，可多个（`sa:extra#2`、`#3`…）。pane/tab 一律命名 `sa:<助理>#<序号>`，跑成功自动收起，失败保留（按回车关）。
 - **回投**：同一次 `delegate(tasks)` 整批 settle 后**只回投 1 张汇总卡**（每条结论一行），不会一个助理一张。
@@ -1216,6 +1227,40 @@ mcp: my-db
 | Pane 里卡住不动 | **90s 无输出**被判卡死 | 自动收 pane + 降级 rpc 重跑（备注「pane 卡死 90s（无输出）已降级 rpc」） |
 | 子助理启动慢 / 日志刷 `fd not found. Downloading...` | 影子目录缺 `bin/`，启动时现联网下载 fd/rg | **v2.5.0 已修**：影子目录的 `bin` 建成 junction，指向真实 `~/.pi/agent/bin` |
 | 每次 `/reload` 都收到旧卡片 | `.bg` 的 `delivered` 被覆盖，重投逻辑重复投递 | **v2.5.0 已修**：只自动投递 **10 分钟内**的结果、最多自动尝试 **3 次**；更老的用 `/agents bg redeliver` 手动补 |
+| 配了 `auto` 却一直是面板卡片 | `herdrStatus().ok=false`（没装 CLI / 不是 Herdr 终端 / pane 读不到） | `/aidoctor` 看「Herdr」诊断行的 `原因：` —— 那里直接写了失败理由 |
+| 更新后一直降级 | 不在 Herdr 终端 / `herdr` 不在 PATH | 卡片上会写原因（**v2.5.4 起不再静默降级**）；装好 herdr 并确保在 `PATH` 里，或干脆改用 `panel` |
+| 子助理失败后 pane 一直留着 | 失败默认保留（`paneKeepOnError`） | `/pane-close` 一键关；或等 10 分钟自动回收（`paneKeepMinutes`） |
+| 按 ESC 停不下来 | 以前只跳出等待 | 现在 ESC 也会停掉 pane 里的进程 |
+
+---
+
+## 模块 6 · 自定义 Router 提示词（v2.5.4）
+
+Super Agent 开着时，主会话（Router）会注入一段 `<superagent-router>` 提示词。
+除了内置版本，你可以用自己的文件**替换**或**追加**内容 —— 改完**下一轮对话就生效，不用 `/reload`**。
+
+| 语义 | 项目级（优先） | 用户级 |
+|---|---|---|
+| **替换**内置 | `<项目>/.pi/pi-extensions/router.md` | `~/.pi/agent/pi-extensions/router.md` |
+| **追加**在内置之后 | `<项目>/.pi/pi-extensions/router.extra.md` | `~/.pi/agent/pi-extensions/router.extra.md` |
+
+- 项目级存在就用项目级，否则用户级，都没有就用内置
+- **追加文件永远生效**，可以和替换文件叠加
+- 文件空的（或只有空白）视为不存在；**少于 200 字符会被忽略**并提示（防误建空文件）
+- 超过 **12KB** 会截断（末尾标「已截断」）
+- 最省事的开始方式：`/ai` → Super Agent → 「生成用户级提示词模板」，再按需改
+- 想看当前用的是哪一份：`/aidoctor`（会列出 Herdr 诊断 + Router 提示词来源和字节数）
+
+**它管什么**：派活时机、先派谁、怎么拆并行批次、回执口味、什么时候该停下来问人。
+**它不管什么**：Worker 的执行方式（那是各助理 md 里的事）。
+
+> 档位（`blind` / `readonly` / `off`）和提示词是两回事：档位管**工具放行**，提示词管**怎么想**。档位用 `/router` 临时切，本会话有效。
+
+#### 并行与串行
+
+Router 声明计划前会先做**依赖分析**：互不依赖的步骤标 `[并行]`，一批一次派完（每批最多 4 个，
+受并发上限限制）；只有「后一步要用前一步结果」才串行。
+如果你希望不同的拆分口味，写进自己的 `router.md` / `router.extra.md` 即可。
 
 ---
 

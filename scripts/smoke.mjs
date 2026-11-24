@@ -51,6 +51,8 @@ const EXPECT = [
 	"resume-agent",
 	"agent-resume-back",
 	"delegate-mode",
+	"panes",
+	"pane-close",
 ];
 
 const isWin = process.platform === "win32";

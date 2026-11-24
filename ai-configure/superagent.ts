@@ -164,6 +164,18 @@ export function superagentEnabled(): boolean {
 	return readSuperAgent().enabled;
 }
 
+/**
+ * 批量实时进度（默认**关**）：一次 delegate(tasks) 里，每完成一件就回投一条极短进度卡。
+ *
+ * 为什么不放进 `UiConfig`：这跟「怎么显示」无关，它决定的是**回投几条消息**
+ * （关 = 只等全部完成出 1 张汇总卡）。所以直接读 `superagent.batchLive`。
+ */
+export function batchLiveEnabled(): boolean {
+	const raw = readExtCfg().superagent;
+	const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	return obj.batchLive === true;
+}
+
 // ======================= Worker 回执契约 =======================
 
 export interface WorkerReport {
@@ -206,11 +218,176 @@ const ROUTER_PROTOCOL = `【你是 Router】
 - 派活前**先按各助理 desc 挑专才**：数据库 → db，服务器 → server，前端 → frontend，后端 → backend。\`general\` 只用于没有专才对口的杂活。
 - **不要把数据库/服务器/前端/后端这类明确领域的活派给 general。**
 - 预计超过 30 秒的活（查服务器 / 跑测试 / 大批改动 / 多任务）用 \`wait: false\` 异步派：先回一句话说明“已派出什么”，结果完成后会自动回投；**不要用同步等待把主会话卡住**。
-- 只有“下一步必须依赖这个结果才能接着做”（比如要先看 diff 才能决定改不改）时才用同步。`;
+- 只有“下一步必须依赖这个结果才能接着做”（比如要先看 diff 才能决定改不改）时才用同步。
+
+【先做依赖分析，再声明计划】
+- 声明 progress(plan) 之前，先逐个问：这一步的输入是不是依赖上一步的输出？
+- 分类：并行 = 互不依赖；串行 = 后一步要用前一步的结果。只有后者才允许串行。
+- 计划表里把可并行的步骤标上「[并行]」，同一批并行的步骤写成同一组。
+- 禁止伪串行：只因为步骤编号是 2、3 就串行，是错的。
+
+【并行批次一次派完】
+- 同一批互不依赖的活，用一次 delegate(tasks=[...]) 全部派出去，不要逐个等。
+- 每批最多 4 个（并发上限 4），超出的排下一批。
+- 只有依赖链上的步骤才逐个派：前一步结果出来再派下一步。
+
+【预计超过 30 秒用异步】
+- wait:false 派完立刻回一句「已派出什么」，结果完成自动回投，不要把主会话卡住。
+- 只有下一步必须用这个结果才能继续时，才 wait:true。`;
+
+// ======================= Router 提示词外部化（A1） =======================
+
+/**
+ * 提示词文件放**专用子目录** `<root>/pi-extensions/`：
+ *   - 项目级 `<cwd>/.pi/pi-extensions/router.md`
+ *   - 用户级 `<agentDir>/pi-extensions/router.md`
+ * 不放 `.pi/` 根，是因为那儿会被 pi 当上下文文件（AGENTS.md 之类）扫进去。
+ */
+const ROUTER_SUBDIR = "pi-extensions";
+/** 短于这个长度的替换文件当没写（避免半截文件把 Router 变成哑巴） */
+const ROUTER_MIN_CHARS = 200;
+/** 注入上限：太长的提示词只会烧 token */
+const ROUTER_MAX_BYTES = 12288;
+const ROUTER_TRUNC_TAG = "\n…（已截断，超过 12KB）";
+
+/** 生成模板时写在最前面的 3 行注释 */
+const ROUTER_TPL_HEADER = [
+	"<!-- Super Agent Router 提示词（项目级）。改完下一轮生效，不用 reload。 -->",
+	"<!-- 删掉本文件 = 回退到内置/用户级。追加内容请写 router.extra.md。 -->",
+	"<!-- 当前内容覆盖的是「内置提示词」，不是追加。 -->",
+].join("\n");
+
+export interface RouterPromptInfo {
+	text: string;
+	/** "项目文件" | "用户文件" | "内置" */
+	source: string;
+	/** 实际用的替换文件路径（用内置时为空） */
+	file?: string;
+	/** 追加文件路径（没有为空） */
+	extraFile?: string;
+	/** 字节数（用于面板/doctor 显示） */
+	bytes: number;
+	/** 非空 = 有需要注意的情况（例如文件太短被忽略），面板/doctor 显示用 */
+	warning?: string;
+}
+
+/** 提示词文件的四个位置（项目级优先于用户级） */
+function routerPromptPaths(root: string): { base: { file: string; source: string }[]; extra: string[] } {
+	const agentDir = getAgentDir();
+	return {
+		base: [
+			{ file: join(root, ".pi", ROUTER_SUBDIR, "router.md"), source: "项目文件" },
+			{ file: join(agentDir, ROUTER_SUBDIR, "router.md"), source: "用户文件" },
+		],
+		extra: [join(root, ".pi", ROUTER_SUBDIR, "router.extra.md"), join(agentDir, ROUTER_SUBDIR, "router.extra.md")],
+	};
+}
+
+/** 读一个提示词文件：不存在 / 读失败 / trim 后为空 → undefined（等于没这个文件） */
+function readPromptFile(file: string): string | undefined {
+	try {
+		if (!existsSync(file)) return undefined;
+		const raw = readFileSync(file, "utf8");
+		return raw.trim() ? raw : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 清洗：去 BOM、CRLF → LF、3+ 空行压成 2 个、首尾 trim */
+function cleanPromptText(text: string): string {
+	return text
+		.replace(/^\uFEFF+/, "")
+		.replace(/\r\n?/g, "\n")
+		.replace(/\n{4,}/g, "\n\n\n")
+		.trim();
+}
+
+/** 按 UTF-8 字节截断（不切断多字节字符） */
+function truncateUtf8(text: string, maxBytes: number): string {
+	const buf = Buffer.from(text, "utf8");
+	if (buf.length <= maxBytes) return text;
+	let end = maxBytes;
+	// 退到字符起始字节：落在续字节（10xxxxxx）上就往前退，最多 3 字节
+	while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--;
+	return buf.subarray(0, end).toString("utf8");
+}
+
+/**
+ * 解析当前生效的 Router 提示词。
+ *
+ * 优先级：项目级 router.md → 用户级 router.md → 内置 ROUTER_PROTOCOL；
+ * 再把 router.extra.md（项目级 → 用户级）追加在后面。
+ * `opts.forceEnabled` 只给单测用（不去读用户真实配置）。
+ */
+export function resolveRouterPrompt(cwd?: string, opts?: { forceEnabled?: boolean }): RouterPromptInfo {
+	const enabled = opts?.forceEnabled ?? superagentEnabled();
+	if (!enabled) return { text: "", source: "内置", bytes: 0 };
+
+	const root = cwd || cwdNow();
+	const paths = routerPromptPaths(root);
+
+	let base: string | undefined;
+	let source = "内置";
+	let file: string | undefined;
+	let warning: string | undefined;
+	for (const c of paths.base) {
+		const raw = readPromptFile(c.file);
+		if (!raw) continue;
+		const text = cleanPromptText(raw);
+		if (text.length < ROUTER_MIN_CHARS) {
+			warning = "文件太短（<200 字符），已忽略并用内置";
+			continue;
+		}
+		base = text;
+		source = c.source;
+		file = c.file;
+		warning = undefined; // 后面这级用上了，前面被忽略的文件就不再吭声
+		break;
+	}
+	if (base === undefined) base = cleanPromptText(ROUTER_PROTOCOL);
+
+	let extra: string | undefined;
+	let extraFile: string | undefined;
+	for (const f of paths.extra) {
+		const raw = readPromptFile(f);
+		if (!raw) continue;
+		extra = cleanPromptText(raw);
+		if (!extra) continue;
+		extraFile = f;
+		break;
+	}
+
+	let text = cleanPromptText(extra ? `${base}\n\n${extra}` : base);
+	if (Buffer.byteLength(text, "utf8") > ROUTER_MAX_BYTES) {
+		text = truncateUtf8(text, ROUTER_MAX_BYTES) + ROUTER_TRUNC_TAG;
+	}
+	return { text, source, file, extraFile, bytes: Buffer.byteLength(text, "utf8"), warning };
+}
 
 /** 给 Router 的协议段（模式关 → 空串，等于什么都不加） */
 export function routerProtocol(): string {
-	return superagentEnabled() ? ROUTER_PROTOCOL : "";
+	return resolveRouterPrompt().text;
+}
+
+/** 面板那一行显示的摘要：`项目文件 · 1234 字节 + 追加 ⚠ …` */
+export function getRouterPromptLabel(info: RouterPromptInfo = resolveRouterPrompt()): string {
+	let s = `${info.source} · ${info.bytes} 字节`;
+	if (info.extraFile) s += " + 追加";
+	if (info.warning) s += ` ⚠ ${info.warning}`;
+	return s;
+}
+
+/** 写提示词模板（已存在就**不覆盖**） */
+export function writeRouterTemplate(target: string, builtin: string): { ok: boolean; existed: boolean; path: string } {
+	try {
+		if (existsSync(target)) return { ok: false, existed: true, path: target };
+		mkdirSync(dirname(target), { recursive: true });
+		writeFileSync(target, `${ROUTER_TPL_HEADER}\n\n${builtin}\n`, "utf8");
+		return { ok: true, existed: false, path: target };
+	} catch {
+		return { ok: false, existed: existsSync(target), path: target };
+	}
 }
 
 /** 从 Worker 的最终回复里抓回执（容忍 ``` 包裹、前后废话、坏 JSON） */
@@ -661,7 +838,7 @@ function registerSuperAgentSettings(): void {
 				"- **auto**：≤2 个用 split，更多溢出到一个「sa:extra」标签里（2×2 四宫格），非 Herdr 自动降级 panel\n\n" +
 				"默认 auto：有 Herdr 就分屏，没有就退回面板卡片。\n" +
 				"Super Agent 全局关掉时也会强制回到 panel。\n\n" +
-				"全部 pane/tab 都用 `sa:<助理>#<序号>` 命名；跑成功自动收起，失败保留（按回车关闭）。",
+				"全部 pane/tab 都用 `sa:<助理>#<序号>` 命名；跑成功自动收起，失败保留（用 /pane-close 关闭，或等 10 分钟自动回收）。",
 			kind: "enum",
 			options: UI_OPTIONS,
 			values: UI_VALUES,
@@ -729,6 +906,18 @@ function registerSuperAgentSettings(): void {
 			set: (v) => patchSuperAgent({ paneKeepOnError: v === true || v === "true" }),
 		},
 		{
+			key: "superagent.batchLive",
+			group: SUPERAGENT_GROUP,
+			label: "批量实时进度",
+			desc:
+				"派多个任务时，每完成一件就回投一条极短进度（更实时，但消息更多）。\n" +
+				"默认关：只等全部完成出 1 张汇总卡。",
+			kind: "bool",
+			def: false,
+			get: () => batchLiveEnabled(),
+			set: (v) => patchSuperAgent({ batchLive: v === true || v === "true" }),
+		},
+		{
 			key: "superagent.release",
 			group: SUPERAGENT_GROUP,
 			label: "临时放开全部工具",
@@ -740,6 +929,84 @@ function registerSuperAgentSettings(): void {
 			def: "",
 			get: () => "→ 回车执行",
 			set: () => releaseRouterTools(),
+		},
+		{
+			key: "superagent.routerPrompt",
+			group: SUPERAGENT_GROUP,
+			label: "Router 提示词",
+			desc:
+				"主会话（Router）那段系统提示词从哪来。**可用文件替换/追加**（优先项目级）：\n\n" +
+				"```\n" +
+				"<cwd>/.pi/pi-extensions/router.md         ← 替换（项目级）\n" +
+				"<agentDir>/pi-extensions/router.md        ← 替换（用户级）\n" +
+				"<cwd>/.pi/pi-extensions/router.extra.md   ← 追加（项目级）\n" +
+				"<agentDir>/pi-extensions/router.extra.md  ← 追加（用户级）\n" +
+				"```\n\n" +
+				"都没文件 = 用内置。**改完下一轮生效，不用 reload**。\n" +
+				"文件 `<200` 字符会被忽略（避免半截文件把 Router 变哑巴）；\n" +
+				"拼起来超过 12KB 会截断。\n\n" +
+				"回车 = 打印当前实际在用的文件路径 + 字节数。",
+			kind: "action",
+			def: "",
+			// 值列/行尾是**动态**的：每次面板重建都重算（改了文件再开面板就能看到）
+			get hint() {
+				return getRouterPromptLabel();
+			},
+			get: () => getRouterPromptLabel(),
+			set: () => {
+				const info = resolveRouterPrompt();
+				const lines = [
+					`Router 提示词：${info.source} · ${info.bytes} 字节`,
+					`替换文件：${info.file ?? "（无，用内置）"}`,
+					`追加文件：${info.extraFile ?? "（无）"}`,
+				];
+				if (info.warning) lines.push(`⚠ ${info.warning}`);
+				settingsCtx()?.ui?.notify?.(lines.join("\n"), info.warning ? "warning" : "info");
+			},
+		},
+		{
+			key: "superagent.routerTplProject",
+			group: SUPERAGENT_GROUP,
+			label: "生成项目级提示词模板",
+			desc:
+				"把**当前内置提示词**原文写到：\n\n" +
+				"```\n<cwd>/.pi/pi-extensions/router.md\n```\n\n" +
+				"写出来就能直接改；删掉这个文件 = 回退到内置/用户级。\n" +
+				"想**追加**（不覆盖内置）就写同目录的 `router.extra.md`。\n\n" +
+				"文件已存在就**不覆盖**（只会提示路径）。",
+			kind: "action",
+			def: "",
+			get: () => "→ 写到项目 `.pi/pi-extensions/router.md`",
+			set: () => {
+				const target = join(cwdNow(), ".pi", ROUTER_SUBDIR, "router.md");
+				const r = writeRouterTemplate(target, ROUTER_PROTOCOL);
+				settingsCtx()?.ui?.notify?.(
+					r.ok ? `已生成模板：${r.path}\n改完下一轮生效` : `已存在，未覆盖：${r.path}`,
+					r.ok ? "info" : "warning",
+				);
+			},
+		},
+		{
+			key: "superagent.routerTplUser",
+			group: SUPERAGENT_GROUP,
+			label: "生成用户级提示词模板",
+			desc:
+				"把**当前内置提示词**原文写到：\n\n" +
+				"```\n<agentDir>/pi-extensions/router.md\n```\n\n" +
+				"用户级 = 所有项目都生效（项目级会盖它）。删掉 = 回退到内置。\n" +
+				"想**追加**就写同目录的 `router.extra.md`。\n\n" +
+				"文件已存在就**不覆盖**（只会提示路径）。",
+			kind: "action",
+			def: "",
+			get: () => "→ 写到用户级 `pi-extensions/router.md`",
+			set: () => {
+				const target = join(getAgentDir(), ROUTER_SUBDIR, "router.md");
+				const r = writeRouterTemplate(target, ROUTER_PROTOCOL);
+				settingsCtx()?.ui?.notify?.(
+					r.ok ? `已生成模板：${r.path}\n改完下一轮生效` : `已存在，未覆盖：${r.path}`,
+					r.ok ? "info" : "warning",
+				);
+			},
 		},
 		...EXTRA_DEFS,
 	];

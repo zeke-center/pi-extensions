@@ -619,7 +619,9 @@ function toolLine(t: ToolRun, width: number, now: number): LiveLine {
 /**
  * 分屏模式（split / tab）的 job：**只画一行**。
  * 为什么不再画工具列表：用户在真 pane 里能看全—— 面板再列一遍只是把对话区挤没。
- *   例：`▶ sa:general#1  改 delegate.ts  12s  → pane w2:pQ`
+ * 但**最近一个工具名**要带上（写在后半行的时间后面），否则面板上看不出它在干什么。
+ *   例：`▶ sa:general#1  改 delegate.ts  12s · bash  → pane w2:pQ`
+ * 宽度不够时**先砍任务摘要**，工具名最后砍（任务摘要在 panel 卡片里另有一份）。
  */
 function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const { width, now, detail } = opts;
@@ -631,12 +633,20 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const target = job.paneId ? `  → pane ${job.paneId}` : job.tabId ? `  → tab ${job.tabId}` : "";
 	const lead = `  sa:${job.name}#${idx}`;
 	const tail = `  ${elapsed}${target}`;
-	const room = Math.max(8, width - widthOf(`${mark} ${lead}`) - widthOf(tail));
+	// 最近一个工具名（分屏时用户在真 pane 里能看全，但面板这一行是「一眼看它在干什么」的唯一入口）
+	// 取 tools 的最后一条；MCP 工具剥掉 `mcp__<server>__` 前缀，否则一行放不下
+	const lastTool = job.tools.length ? shortToolName(job.tools[job.tools.length - 1].name) : "";
+	const toolSeg = lastTool ? ` · ${oneLine(lastTool, 20)}` : "";
+	// 宽度先扣掉「标记 + 名字 + 时间 + 去向 + 工具名」，剩下的才给任务摘要。
+	// 宽度不够时**先砍摘要、绝不砍工具名**（任务摘要在 panel 卡片里另有显示，工具名这里没有第二个地方）。
+	const room = width - widthOf(`${mark} ${lead}`) - widthOf(tail) - widthOf(toolSeg);
+	const brief = job.taskBrief && room >= 8 ? `  ${oneLine(job.taskBrief, room)}` : "";
 	const segs: Seg[] = [
 		{ text: `${mark} `, tone },
 		{ text: `sa:${job.name}#${idx}`, tone: "bold" },
-		{ text: job.taskBrief ? `  ${oneLine(job.taskBrief, room)}` : "", tone: "muted" },
+		{ text: brief, tone: "muted" },
 		{ text: `  ${elapsed}`, tone: "muted" },
+		{ text: toolSeg, tone: "default" },
 	];
 	if (target) segs.push({ text: target, tone: "muted" });
 	if (job.note && detail) segs.push({ text: `  ${oneLine(job.note, Math.max(8, Math.floor(width / 3)))}`, tone: "warn" });
@@ -663,6 +673,9 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 		head.push({ text: "  排队中", tone: icon.tone });
 	} else if (job.status === "running") {
 		head.push({ text: `  ${elapsed}`, tone: "muted" });
+		// 一眼分清「这张卡是在面板里看的」还是「已在真 pane 里看的」（分屏卡片走 renderPaneJob，行尾有 → pane xxx）
+		// 宽度不够就省掉，别为此把名字挤没
+		if (width >= 24) head.push({ text: "  🖥 panel", tone: "muted" });
 		if (quiet > STALE_MS) head.push({ text: `  ⚠ ${fmtDur(quiet)}无动静`, tone: "warn" });
 	} else {
 		head.push({ text: `  ${elapsed}`, tone: "muted" });
@@ -670,6 +683,8 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 			text: job.status === "done" ? "  完成" : job.status === "timeout" ? "  超时" : "  失败",
 			tone: icon.tone,
 		});
+		// 结束态也标一下：这轮是在面板里看的（分屏卡片走 renderPaneJob，行尾有 → pane xxx）
+		if (width >= 24) head.push({ text: "  🖥 panel", tone: "muted" });
 	}
 	out.push({ segs: head });
 

@@ -660,7 +660,7 @@ allOk =
 			'ok("回归：gone 路径必然产生终态（status !== running）", readBgTask(bg5).status === "done");',
 			'// ---- ⑥ 采集 pane 一直抛错 → promise 也不许 reject（以前就是静默 reject → 永不 settle）----',
 			'const boomKeepAlive = setInterval(() => {}, 50); // sleep() 内部 unref 了，测试里得自己撑着事件循环',
-			'const boomRes = await waitPaneDone({ index: 1, paneId: "w9:p2", where: "main" }, pd, "sid-boom", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 20 });',
+			'const boomRes = await waitPaneDone({ index: 1, paneId: "w9:p2", where: "main" }, pd, "sid-boom", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 20, slowSampleMs: 20 });',
 			'ok("回归：采集抛错不 reject，返回 failed + error", boomRes.outcome === "failed" && !!boomRes.error);',
 			'ok("回归：采集抛错也归因到日志（便于排查）", boomRes.stallLog.join(" ").includes("pane 已关闭"));',
 			'clearInterval(boomKeepAlive);',
@@ -703,8 +703,8 @@ allOk =
 			'ok("回执文本：状态: 完成中 → 不命中（模型还在写，早判会截正文）", paneHasReceiptText("状态: 完成中") === false);',
 			'ok("回执文本：空串 / 全空白 → 不命中", paneHasReceiptText("") === false && paneHasReceiptText("   " + String.fromCharCode(10)) === false);',
 			'ok("回执文本：普通正文（没回执形状）→ 不命中", paneHasReceiptText("thinking... 正在处理" + String.fromCharCode(10) + "> ") === false);',
-			'ok("回执文本：稳定窗口常量是 2s（别悄悄改小）", PANE_RECEIPT_STABLE_MS === 2000);',
-			'ok("回执文本：采集抛错阈值是 12 次（约 24s）", PANE_READ_FAIL_LIMIT === 12 && PANE_SAMPLE_MS === 2000);',
+			'ok("回执文本：稳定窗口常量是 800ms", PANE_RECEIPT_STABLE_MS === 800);',
+			'ok("回执文本：采集抛错阈值是 12 次 + 采样 800ms", PANE_READ_FAIL_LIMIT === 12 && PANE_SAMPLE_MS === 800);',
 			// ---- ② 回执正文 + 稳定窗口 → done（这就是本次修的那条路）----
 			'const rcpDir = join(tmpdir(), "receipt-sess-" + Math.random().toString(36).slice(2, 8));',
 			'mkdirSync(rcpDir, { recursive: true });',
@@ -725,26 +725,147 @@ allOk =
 			// ---- ⑤ 采集连续抛错 3 次 → 不判失败 ----------
 			'putSess("sid-three", receiptOnly);',
 			'let threeThrows = 0;',
-			'const rcpThree = await waitPaneDone({ index: 1, paneId: "w9:p3", where: "main" }, rcpDir, "sid-three", 20000, undefined, true, { read: () => { threeThrows += 1; if (threeThrows <= 3) throw new Error("pane 读不到"); return { ok: true, text: "π 输入框" }; }, alive: () => true, sampleMs: 20, receiptStableMs: 120 });',
+			'const rcpThree = await waitPaneDone({ index: 1, paneId: "w9:p3", where: "main" }, rcpDir, "sid-three", 20000, undefined, true, { read: () => { threeThrows += 1; if (threeThrows <= 3) throw new Error("pane 读不到"); return { ok: true, text: "π 输入框" }; }, alive: () => true, sampleMs: 20, slowSampleMs: 20, receiptStableMs: 120 });',
 			'ok("采集抛错：连续 3 次 → 不判失败（继续采样）", rcpThree.outcome !== "failed" && threeThrows >= 4);',
 			'ok("采集抛错：3 次之后读到回执 → 照样判 done", rcpThree.outcome === "done");',
 			// ---- ⑥ 采集连续抛错 12 次 → 才放弃（有正文 done / 没正文 failed）----
-			'const rcpTwelve = await waitPaneDone({ index: 1, paneId: "w9:p12", where: "main" }, rcpDir, "sid-three", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 5 });',
+			'const rcpTwelve = await waitPaneDone({ index: 1, paneId: "w9:p12", where: "main" }, rcpDir, "sid-three", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 5, slowSampleMs: 5 });',
 			'ok("采集抛错：12 次才放弃，且能读到正文 → outcome=done", rcpTwelve.outcome === "done" && !!rcpTwelve.error && rcpTwelve.stallLog.length >= 12);',
 			'ok("采集抛错：放弃时 error 说明是采集问题（不是任务失败）", /连续抛错 12 次/.test(String(rcpTwelve.error)));',
-			'const rcpEmpty = await waitPaneDone({ index: 1, paneId: "w9:p13", where: "main" }, join(tmpdir(), "no-such-sess-z"), "sid-none", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 5 });',
+			'const rcpEmpty = await waitPaneDone({ index: 1, paneId: "w9:p13", where: "main" }, join(tmpdir(), "no-such-sess-z"), "sid-none", 30000, undefined, true, { read: () => { throw new Error("pane 已关闭"); }, alive: () => true, sampleMs: 5, slowSampleMs: 5 });',
 			'ok("采集抛错：真读不到任何正文 → 才 failed", rcpEmpty.outcome === "failed" && !!rcpEmpty.error);',
-			// ---- ⑦ 失败保留 pane → 先停掉里面的 pi，标签写「已停」----------
+			// ---- ⑦ 失败保留 pane → 先停掉里面的 pi（两次 ctrl+c），标签写「已停」----------
 			'const skCalls = [];',
 			'let skLabel = "";',
-			'const sk = stopKeptPane("w9:pk", "general", 2, { sendKeys: (p, k) => { skCalls.push(p + "|" + k); return true; }, rename: (p, l) => { skLabel = l; return true; } });',
-			'ok("保留 pane：先给 pane 发 ctrl+c（桩断言被调用）", skCalls.length === 1 && skCalls[0] === "w9:pk|ctrl+c");',
-			'ok("保留 pane：标签含「已停」且是 ❌（用户一眼看出没活进程了）", sk.stopped === true && skLabel.includes("已停") && skLabel.startsWith("❌") && skLabel.includes("sa:general#2"));',
-			'ok("保留 pane：send-keys 抛错也不抛出去，标签照样改", (() => { let l2 = ""; const r2 = stopKeptPane("w9:pk", "x", 1, { sendKeys: () => { throw new Error("herdr 挂了"); }, rename: (p, l) => { l2 = l; return true; } }); return r2.stopped === false && l2.includes("已停"); })());',
+			'const sk = await stopKeptPane("w9:pk", "general", 2, { sendKeys: (p, k) => { skCalls.push(p + "|" + k); return true; }, rename: (p, l) => { skLabel = l; return true; }, read: () => "PS F:\\\\AI\\\\My_Center> ", sleep: async () => {} });',
+			'ok("保留 pane：发两次 ctrl+c（第一次只清输入框）", skCalls.length === 2 && skCalls[0] === "w9:pk|ctrl+c" && skCalls[1] === "w9:pk|ctrl+c");',
+			'ok("保留 pane：已回到 shell → 不再补 exit", !skCalls.includes("w9:pk|exit") && sk.escalated === false);',
+			'ok("保留 pane：标签含「已停」且是 ⏹（用户一眼看出没活进程了）", sk.stopped === true && skLabel.includes("已停") && skLabel.startsWith("⏹") && skLabel.includes("sa:general#2"));',
+			'ok("保留 pane：send-keys 抛错也不抛出去，标签照样改", await (async () => { let l2 = ""; const r2 = await stopKeptPane("w9:pk", "x", 1, { sendKeys: () => { throw new Error("herdr 挂了"); }, rename: (p, l) => { l2 = l; return true; }, read: () => "", sleep: async () => {} }); return r2.stopped === false && l2.includes("已停"); })());',
 			'clearInterval(rcpKeepAlive);',
 		],
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-receipt") },
 	) && allOk;
+
+// ---------- 套件 1.7：保留 pane 的处置（停 / 列出 / 关闭 / 回收 / TTL）----------
+// 踩过的真 bug：子助理停下来后**关不掉 pane** ——
+//   ① 「已停」是假的：只发一次 ctrl+c，而 pi 里第一次 ctrl+c 只清输入框，进程没退；
+//   ② ESC 中止只让 waitPaneDone 返回 failed，没停 pane 里的进程；
+//   ③ 用户侧零入口：paneClose 只有 run 自己收尾会调，人想关只能自己去关标签；
+//   ④ 保留的 pane 永久占槽 → 每个新任务干等 60s。
+// 这里钉死：两次 ctrl+c / 跳过自己与主 pane / 回收 / TTL。
+bundle("delegate.ts", "delegate-panes.mjs");
+allOk =
+	runSuite(
+		"delegate：保留 pane 的处置（停 / /panes / /pane-close / 回收 / TTL）",
+		join(tmp, "delegate-panes.mjs"),
+		[
+			// ---- ① stopKeptPane：两次 ctrl+c（第一次只清输入框）----
+			'const napMs = [];',
+			'const kc = [];',
+			'const r1 = await stopKeptPane("w2:pA", "general", 1, { sendKeys: (p, k) => { kc.push(k); return true; }, rename: () => true, read: () => "PS C:> ", sleep: async (ms) => { napMs.push(ms); } });',
+			'ok("停 pane：真正发的调用序列是 [ctrl+c, ctrl+c]（第一次只清输入框）", JSON.stringify(kc) === JSON.stringify(["ctrl+c", "ctrl+c"]));',
+			'ok("停 pane：两下之间等 300ms（可注入假 sleep，不真等）", PANE_STOP_GAP_MS === 300 && napMs.length === 1 && napMs[0] === 300);',
+			// ---- ② 第二次之后还在 pi 界面 → 补 exit + return ----
+			'const kc2 = [];',
+			'const r2 = await stopKeptPane("w2:pB", "db", 2, { sendKeys: (p, k) => { kc2.push(k); return true; }, rename: () => true, read: () => "⏵ 请输入你的指令...", sleep: async () => {} });',
+			'ok("停 pane：还在 pi 界面（没回 shell）→ 追加 exit + return 兜底", JSON.stringify(kc2) === JSON.stringify(["ctrl+c", "ctrl+c", "exit", "return"]));',
+			'ok("停 pane：补了 exit 才算升级（escalated）", r2.escalated === true);',
+			'ok("停 pane：已回 shell 时不乱发 exit", r1.escalated === false && !kc.includes("exit"));',
+			// ---- ③ 收尾计划：ESC 中止和超时一样，必须停进程 ----
+			'ok("计划：失败/超时 + paneKeepOnError → 停进程+保留", planPaneFinish({ outcome: "failed", keepOnError: true }) === "stop-keep" && planPaneFinish({ outcome: "timeout", keepOnError: true }) === "stop-keep");',
+			'ok("计划：ESC 中止（aborted）→ 也是停进程+保留（不是直接撒手）", planPaneFinish({ outcome: "failed", aborted: true, keepOnError: true }) === "stop-keep");',
+			'ok("计划：ESC 中止 + 不保留 → 直接关", planPaneFinish({ outcome: "failed", aborted: true, keepOnError: false }) === "close");',
+			'ok("计划：成功 / 空回执 → 关", planPaneFinish({ outcome: "done", keepOnError: true }) === "close" && planPaneFinish({ outcome: "empty", keepOnError: true }) === "close");',
+			// ---- ④ /pane-close 参数解析 ----
+			'ok("/pane-close 空参 → 只关已停/失败", parsePaneCloseArg("").mode === "kept" && parsePaneCloseArg("  ").mode === "kept");',
+			'ok("/pane-close all → 全关", parsePaneCloseArg("all").mode === "all" && parsePaneCloseArg("ALL").mode === "all");',
+			'ok("/pane-close 2 → 只关第 2 个（#2 也认）", parsePaneCloseArg("2").mode === "index" && parsePaneCloseArg("2").index === 2 && parsePaneCloseArg("#2").index === 2);',
+			'ok("/pane-close abc / 0 → 报错提示（不乱关）", parsePaneCloseArg("abc").mode === "bad" && parsePaneCloseArg("0").mode === "bad");',
+			// ---- ⑤ /panes 文案 ----
+			'ok("pane 状态记号：四种状态看得懂", paneStateText("▶ sa:a#1") === "🟢跑" && paneStateText("⏹ sa:a#1（已停·保留）") === "⏹已停" && paneStateText("❌ sa:a#1（失败·保留）") === "❌失败" && paneStateText("✅ sa:a#1") === "✅跑完");',
+			'ok("可回收判定：只有 ⏹ / ❌ 算", paneIsKept("⏹ sa:a#1") && paneIsKept("❌ sa:a#1") && !paneIsKept("▶ sa:a#1") && !paneIsKept("✅ sa:a#1"));',
+			'const repRows = buildPaneRows([{ paneId: "w2:p58", label: "▶ sa:general#1" }, { paneId: "w2:p59", label: "⏹ sa:db#1（已停·保留）" }, { paneId: "w2:pG", label: "主会话" }], [{ index: 1, paneId: "w2:p58" }, { index: 2, paneId: "w2:p59" }]);',
+			'const rep = formatPaneReport(repRows, "w2:p58", "w2:pG");',
+			'ok("/panes：账上的格子按编号列出（不用 sa: 前缀也一样）", rep[0].includes("子助理 pane") && rep[1].includes("#1") && rep[1].includes("🟢跑") && rep[2].includes("#2") && rep[2].includes("⏹已停"));',
+			'ok("/panes：写清楚「自己不会被关」+「主 pane 永不动」", rep.join(" ").includes("w2:p58") && rep.join(" ").includes("不会被关") && rep.join(" ").includes("w2:pG") && rep.join(" ").includes("永不动"));',
+			'ok("/panes：没有 pane 时说人话", formatPaneReport([], "w2:p58", "w2:pG").join(" ").includes("当前没有子助理 pane"));',
+			// ---- ⑥ 关闭：桩（paneClose 记账）+ 账上的槽位 ----
+			'let pcCalls = [];',
+			'const closeLabel = (id) => ({ "w2:p58": "▶ sa:general#1", "w2:p59": "⏹ sa:db#1（已停·保留）", "w2:p60": "❌ sa:x#1（失败·保留）" })[id] || "";',
+			'const closeStub = { mainPaneId: () => "w2:pG", workspaceId: () => "w2", paneList: () => [{ paneId: "w2:pG", label: "主会话" }, ...[...herdrSlots.values()].map((s) => ({ paneId: s.paneId, label: closeLabel(s.paneId) }))], paneSplit: () => undefined, tabCreate: () => undefined, tabClose: () => true, paneClose: (id) => { pcCalls.push(id); return true; } };',
+			'const resetSlots = () => { herdrSlots.clear(); herdrExtraTabs.clear(); keptPaneAt.clear(); pcCalls = []; process.env.HERDR_PANE_ID = "w2:pSELF"; setHerdrSlotOps(closeStub); herdrSlots.set(1, { index: 1, paneId: "w2:p58", where: "main" }); herdrSlots.set(2, { index: 2, paneId: "w2:p59", where: "main" }); herdrSlots.set(3, { index: 3, paneId: "w2:p60", where: "main" }); };',
+			'resetSlots();',
+			'const cKept = closePanesByTarget({ mode: "kept" });',
+			'ok("/pane-close 空参：只关 ⏹ 和 ❌ 两个", cKept.closed === 2 && pcCalls.includes("w2:p59") && pcCalls.includes("w2:p60") && !pcCalls.includes("w2:p58"));',
+			'ok("/pane-close：关掉后账上也销了", herdrSlots.size === 1 && herdrSlots.get(1) && herdrSlots.get(1).paneId === "w2:p58");',
+			// ---- ⑦ 跳过自己（踩过的真事故：助理把自己关了）----
+			'resetSlots();',
+			'process.env.HERDR_PANE_ID = "w2:p58";',
+						'herdrSlots.clear(); herdrSlots.set(1, { index: 1, paneId: "w2:p58", where: "main" }); herdrSlots.set(2, { index: 2, paneId: "w2:p59", where: "main" });',
+			'const cSelf = closePanesByTarget({ mode: "all" });',
+			'ok("/pane-close：永远跳过自己（HERDR_PANE_ID）", cSelf.closed === 1 && !pcCalls.includes("w2:p58") && cSelf.skippedSelf === 1);',
+			// ---- ⑧ 跳过主 pane（纯函数钉死）----
+			'const mainRows = [{ index: 1, paneId: "w2:pG", label: "⏹ sa:main#1（已停·保留）" }, { index: 2, paneId: "w2:p59", label: "⏹ sa:db#1（已停·保留）" }];',
+			'const selMain = selectPanesToClose(mainRows, { mode: "all" }, "w2:pSELF", "w2:pG");',
+			'ok("/pane-close：永远跳过主 pane", selMain.close.length === 1 && selMain.close[0].paneId === "w2:p59" && selMain.skippedMain === 1);',
+			// ---- ⑨ all 模式的关闭数量（3 个 sa: 里有 1 个是自己 → 关 2）----
+			'resetSlots();',
+			'process.env.HERDR_PANE_ID = "w2:p58";',
+			'herdrSlots.clear(); herdrSlots.set(1, { index: 1, paneId: "w2:p58", where: "main" }); herdrSlots.set(2, { index: 2, paneId: "w2:p59", where: "main" }); herdrSlots.set(3, { index: 3, paneId: "w2:p60", where: "main" });',
+			'const cAll = closePanesByTarget({ mode: "all" });',
+			'ok("/pane-close all：3 个 sa: 里有 1 个是自己 → 关 2 个", cAll.closed === 2 && cAll.skippedSelf === 1 && pcCalls.length === 2);',
+			// ---- ⑩ 按编号关（#2）----
+			'resetSlots();',
+			'const cIdx = closePanesByTarget({ mode: "index", index: 2 });',
+			'ok("/pane-close 2：只关第 2 格", cIdx.closed === 1 && pcCalls.length === 1 && pcCalls[0] === "w2:p59");',
+			// ---- ⑪ 槽位回收：满了 + 有一个 ⏹ → 先关它再分配，不进排队 ----
+			'herdrSlots.clear(); herdrExtraTabs.clear(); keptPaneAt.clear(); pcCalls = [];',
+			'process.env.HERDR_PANE_ID = "w1:p1";',
+			'let splitted = 0;',
+			'const reclaimPanes = () => [{ paneId: "w1:p1", label: "主会话" }, ...[...herdrSlots.values()].map((s) => ({ paneId: s.paneId, label: s.paneId === "w1:pK" ? "⏹ sa:db#1（已停·保留）" : "▶ sa:general#1" }))];',
+			'setHerdrSlotOps({ mainPaneId: () => "w1:p1", workspaceId: () => "w1", paneList: reclaimPanes, paneSplit: () => { splitted += 1; return "w1:pNEW"; }, tabCreate: () => undefined, tabClose: () => true, paneClose: (id) => { pcCalls.push(id); return true; } });',
+			'herdrSlots.set(1, { index: 1, paneId: "w1:pK", where: "main" });',
+			'markKept("w1:pK", 1000);',
+			'const sleptReclaim = [];',
+			'const reclaimed = await allocHerdrSlot("F:/tmp/x", { ui: "split", mainSlots: 1, overflowSlots: 0, splitRatio: 0.5, paneKeepOnError: true }, "split", { now: () => 0, sleep: async (ms) => { sleptReclaim.push(ms); }, waitMs: 60000 });',
+			'ok("槽位回收：满了先关最旧的 ⏹ pane，同一个调用里就拿到新槽", !!reclaimed && reclaimed.paneId === "w1:pNEW" && pcCalls.includes("w1:pK"));',
+			'ok("槽位回收：没进排队（一次也没睡/轮询）", sleptReclaim.length === 0 && splitted === 1);',
+			// ---- ⑫ 回收绝不关自己 / 主 pane ----
+			'herdrSlots.clear(); herdrExtraTabs.clear(); keptPaneAt.clear(); pcCalls = [];',
+			'process.env.HERDR_PANE_ID = "w1:pSELF";',
+			'setHerdrSlotOps({ mainPaneId: () => "w1:pSELF", workspaceId: () => "w1", paneList: () => [{ paneId: "w1:pSELF", label: "⏹ sa:self#1（已停·保留）" }], paneSplit: () => undefined, tabCreate: () => undefined, tabClose: () => true, paneClose: (id) => { pcCalls.push(id); return true; } });',
+			'herdrSlots.set(1, { index: 1, paneId: "w1:pSELF", where: "main" });',
+			'ok("槽位回收：自己和主 pane 永不关（没槽就老实排队）", reclaimOneKeptPane() === false && pcCalls.length === 0);',
+			// ---- ⑬ TTL ----
+			'keptPaneAt.clear(); pcCalls = [];',
+			'process.env.HERDR_PANE_ID = "w9:pSELF";',
+			'setHerdrSlotOps({ mainPaneId: () => "w9:pSELF", workspaceId: () => "w9", paneList: () => [], paneSplit: () => undefined, tabCreate: () => undefined, tabClose: () => true, paneClose: (id) => { pcCalls.push(id); return true; } });',
+			'ok("TTL：默认 10 分钟，常量也是 10", PANE_KEEP_MINUTES_DEFAULT === 10 && readPaneKeepMinutes() === 10);',
+			'ok("TTL 纯函数：不到 10 分钟 / 到了 / 0=永不关", paneKeepExpired(1000, 1000 + 9 * 60000, 10) === false && paneKeepExpired(1000, 1000 + 11 * 60000, 10) === true && paneKeepExpired(0, 99999999, 0) === false);',
+			'markKept("w9:pT", 1000000);',
+			'ok("TTL：未到点 → 不关", sweepKeptPaneTtl(1000000 + 9 * 60000, 10) === 0 && pcCalls.length === 0 && keptPaneAt.has("w9:pT"));',
+			'ok("TTL：超过 10 分钟 → 关掉并销账", sweepKeptPaneTtl(1000000 + 11 * 60000, 10) === 1 && pcCalls.includes("w9:pT") && !keptPaneAt.has("w9:pT"));',
+			'markKept("w9:pU", 0);',
+			'ok("TTL：paneKeepMinutes=0 → 永不自动关", sweepKeptPaneTtl(Date.now(), 0) === 0 && !pcCalls.includes("w9:pU") && keptPaneAt.has("w9:pU"));',
+			'keptPaneAt.clear(); herdrSlots.clear(); herdrExtraTabs.clear(); setHerdrSlotOps(undefined);',
+		],
+		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-panes") },
+	) && allOk;
+
+// ---------- 套件 1.8：文案不许再骗人（「按回车关闭」从没实现过）----------
+{
+	const dSrc = readFileSync(join(ext, "delegate.ts"), "utf8");
+	const sSrc = readFileSync(join(ext, "superagent.ts"), "utf8");
+	const noEnter = !dSrc.includes("回车关闭") && !sSrc.includes("回车关闭");
+	const pointsToCmd = noEnter && dSrc.includes("用 /pane-close 关闭") && /pane-close/.test(sSrc);
+	if (pointsToCmd) {
+		console.log("PASS  文案：delegate/superagent 不再说「按回车关闭」，改成指向 /pane-close");
+	} else {
+		allOk = false;
+		console.log("FAIL  文案：仍有「回车关闭」或没指向 /pane-close → " + JSON.stringify({ noEnter }));
+	}
+}
 
 // ---------- 套件 1.4：后台任务记账（合并写 = 不重复投递的地基）----------
 // 踩过的真 bug：writeBgTask 整对象覆盖写，后写的旧快照把 delivered:true 冲回 false
@@ -969,6 +1090,45 @@ allOk =
 			"ok('beginRun 也保留排队中的', (beginRun(), liveJobs().some((j) => j.status === 'queued')));",
 			"clearJobs();",
 			`ok("clearJobs 全清", liveJobs().length === 0);`,
+			"// ---- pane 卡片（分屏一行）补「最近一个工具名」----",
+			`const mkPane = (withTool) => {
+				const j = newJob({ key: "general", name: "general", task: "改 README 版式", sessionId: "s1", startedAt: 1_000_000 });
+				j.uiMode = "split";
+				j.paneId = "w2:pQ";
+				j.slotIndex = 1;
+				if (withTool) j.tools.push({ id: "t1", name: "bash", brief: "npm test", phase: "running", startedAt: 1_000_000 });
+				return j;
+			};`,
+			`const paneTxt = (j, width) => plainLines(renderJob(j, { width, now: 1_012_000 })).join("\\n");`,
+			`const pj = mkPane(true);`,
+			`ok("pane 卡片：时间后面追加最近一个工具名", /12s · bash/.test(paneTxt(pj, 100)));`,
+			`ok("pane 卡片：工具名在时间后面、去向前面（顺序对）", (() => { const s = paneTxt(pj, 100); return s.indexOf("12s") < s.indexOf("bash") && s.indexOf("bash") < s.indexOf("pane w2:pQ"); })());`,
+			`ok("pane 卡片：宽度 30 仍保留工具名（先砍摘要，不砍工具名）", paneTxt(pj, 30).includes("bash"));`,
+			`ok("pane 卡片：宽度 30 时先砍掉任务摘要", !paneTxt(pj, 30).includes("改 README"));`,
+			`ok("pane 卡片：宽裕时任务摘要照旧", paneTxt(pj, 100).includes("改 README 版式"));`,
+			`const noToolTxt = paneTxt(mkPane(false), 100);`,
+			`ok("pane 卡片：没有工具就不加分隔符（不出现 · bash）", !noToolTxt.includes("· bash") && !noToolTxt.includes("·"));`,
+			`ok("pane 卡片：没有工具时这一行还是完整的（时间 + 去向）", noToolTxt.includes("12s") && noToolTxt.includes("pane w2:pQ"));`,
+			`// ---- panel 卡片：标一个 🖥 panel（分屏卡片行尾已有 → pane xxx，不重复标）----`,
+			`const panelJob = newJob({ key: "general", name: "general", task: "改 README 版式", sessionId: "p1" });`,
+			`const panelFirst = plainLines(renderJob(panelJob, { width: 80, now: Date.now() }))[0];`,
+			`ok("panel 卡片：头部带 🖥 panel（一眼分清在面板里看）", panelFirst.includes("🖥 panel"));`,
+			`const panelDoneJob = newJob({ key: "general", name: "general", task: "改 README 版式", sessionId: "p3" }); markEnd(panelDoneJob, "done");`,
+			`ok("panel 卡片：结束态（✅ 完成）也标 🖥 panel", plainLines(renderJob(panelDoneJob, { width: 80, now: Date.now() }))[0].includes("🖥 panel"));`,
+			`let __narrowOk = true; let __narrowTxt = "";`,
+			`try { __narrowTxt = plainLines(renderJob(panelJob, { width: 30, now: Date.now() })).join("\\n"); } catch { __narrowOk = false; }`,
+			`ok("panel 卡片：宽 30 不抛错且内容非空", __narrowOk && __narrowTxt.trim().length > 0);`,
+			`ok("panel 卡片：宽 30 时任务摘要仍在（省标记可以，摘要不许丢）", __narrowOk && __narrowTxt.includes("改 README 版式"));`,
+			`// ---- 降级原因（note）照旧显示，别被新标记挤掉 ----`,
+			`const panelNoteJob = newJob({ key: "general", name: "general", task: "改 README 版式", sessionId: "p2" });`,
+			`panelNoteJob.note = "Herdr 不可用（pane list 为空）→ 面板模式";`,
+			`const panelNoteTxt = plainLines(renderJob(panelNoteJob, { width: 80, now: Date.now() })).join("\\n");`,
+			`ok("panel 卡片：有 note（降级原因）时照旧显示", panelNoteTxt.includes("Herdr 不可用") && panelNoteTxt.includes("🖥 panel"));`,
+			`let __noteNarrowOk = true;`,
+			`try { __noteNarrowOk = plainLines(renderJob(panelNoteJob, { width: 30, now: Date.now() })).join("\\n").includes("Herdr"); } catch { __noteNarrowOk = false; }`,
+			`ok("panel 卡片：宽 30 + note 不抛错，note 仍显示", __noteNarrowOk);`,
+			`ok("pane 卡片：不额外标 🖥（行尾 → pane 已足够）", !paneTxt(pj, 80).includes("🖥"));`,
+			`clearJobs();`,
 		],
 		{},
 	) && allOk;
@@ -982,7 +1142,10 @@ allOk =
 		[
 			'ok("paneLabel run", paneLabel("run", "general", 1) === "▶ sa:general#1");',
 			'ok("paneLabel ok", paneLabel("ok", "db", 2) === "✅ sa:db#2");',
-			'ok("paneLabel err 带上「按回车关闭」", paneLabel("err", "db", 3) === "❌ sa:db#3（按回车关闭）");',
+			'ok("paneLabel err 写「失败·保留」（不再骗人「按回车关闭」）", paneLabel("err", "db", 3) === "❌ sa:db#3（失败·保留）");',
+			'ok("paneLabel stopped 写「已停·保留」", paneLabel("stopped", "db", 3) === "⏹ sa:db#3（已停·保留）");',
+			'ok("paneLabel err/stopped 都不提「回车关闭」", !paneLabel("err", "db", 3).includes("回车关闭") && !paneLabel("stopped", "db", 3).includes("回车关闭"));',
+			'ok("paneLabel err/stopped 都写「保留」（不模拟回车也能看懂）", paneLabel("err", "db", 3).includes("保留") && paneLabel("stopped", "db", 3).includes("保留"));',
 			'ok("paneLabel stalled 标出「卡死已降级」", paneLabel("stalled", "x", 1) === "❌ sa:x#1（卡死已降级）");',
 			'ok("paneLabel 三种状态都不同（不会看混）", new Set([paneLabel("run", "a", 1), paneLabel("ok", "a", 1), paneLabel("err", "a", 1), paneLabel("stalled", "a", 1)]).size === 4);',
 			'ok("paneLabel 名字空时兜底", paneLabel("run", "", 1) === "▶ sa:worker#1");',
@@ -1082,6 +1245,194 @@ allOk =
 			'}',
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-herdr") },
+	) && allOk;
+
+// ---------- 套件：Herdr 降级可见（探测放宽 / 带原因 / 坏一次就不反复试）----------
+// 踩过的痛点：`herdrAvailable()` 精确判 `TERM_PROGRAM === "herdr"`，别人（Windows Terminal /
+// VS Code / tmux / SSH）一律 false，而 delegate 静默降级回 panel —— 卡片照出、不分屏、一句解释都没有。
+// 这里钉死两件事：探测结果必须带原因；放宽后能用就不能再误判。
+bundle("herdr.ts", "herdr-status.mjs");
+allOk =
+	runSuite(
+		"herdr：降级可见（herdrStatus 判定 / 坏锁 / 降级文案 / doctor 诊断行）",
+		join(tmp, "herdr-status.mjs"),
+		[
+			'// 桩：把跑 CLI 的那一层换掉（纯逻辑测，不真调 herdr）',
+			'const __realRunJson = runJson;',
+			'const __env = { TERM_PROGRAM: process.env.TERM_PROGRAM, HERDR_PANE_ID: process.env.HERDR_PANE_ID };',
+			'let __clicks = 0;',
+			'try {',
+			'  // ---- ① CLI 调不通 ----',
+			'  resetHerdrCache();',
+			'  runJson = () => undefined;',
+			'  let s = herdrStatus();',
+			'  ok("1 CLI 调不通 → ok=false 且 reason 含「调不通」", s.ok === false && s.reason.includes("调不通") && s.panes === 0);',
+			'  ok("1b 调不通时把 TERM_PROGRAM 带出来（给人看）", s.term === (process.env.TERM_PROGRAM ?? ""));',
+			'  // ---- ② 拿到 JSON 但 0 个 pane ----',
+			'  resetHerdrCache();',
+			'  runJson = () => ({ result: { panes: [] } });',
+			'  s = herdrStatus();',
+			'  ok("2 pane list 成功但 0 个 pane → 含「没有可用 pane」", s.ok === false && s.reason.includes("没有可用 pane") && s.panes === 0);',
+			'  // ---- ③ 正宗 herdr 终端 ----',
+			'  resetHerdrCache();',
+			'  runJson = () => ({ result: { panes: [{ pane_id: "w1:p1" }, { pane_id: "w1:p2" }] } });',
+			'  process.env.TERM_PROGRAM = "herdr";',
+			'  process.env.HERDR_PANE_ID = "w1:p1";',
+			'  s = herdrStatus();',
+			'  ok("3 TERM_PROGRAM=herdr + pane list 正常 → ok 且 reason 为空", s.ok === true && s.reason === "" && s.panes === 2);',
+			'  ok("12 herdrAvailable() 与 herdrStatus().ok 一致", herdrAvailable() === herdrStatus().ok && herdrAvailable() === true);',
+			'  // ---- ④ 放宽：非 herdr 终端也能用（附加保护：要拿得到本会话 pane）----',
+			'  resetHerdrCache();',
+			'  process.env.TERM_PROGRAM = "Windows_Terminal";',
+			'  delete process.env.HERDR_PANE_ID;',
+			'  s = herdrStatus();',
+			'  ok("4a 非 herdr 终端 + 拿不到主 pane → ok=false（附加保护）", s.ok === false && s.reason.includes("本会话的 pane"));',
+			'  resetHerdrCache();',
+			'  process.env.HERDR_PANE_ID = "w1:p1";',
+			'  s = herdrStatus();',
+			'  ok("4b 非 herdr 终端（Windows Terminal）但 herdr 在跑 → ok（放宽生效）", s.ok === true && s.reason === "" && s.term === "Windows_Terminal" && s.panes === 2);',
+			'  delete process.env.TERM_PROGRAM;',
+			'  resetHerdrCache();',
+			'  ok("4c TERM_PROGRAM 没设也能用（tmux / SSH 场景）", herdrStatus().ok === true);',
+			'  // ---- ⑤ 坏锁：放宽后切 pane 真失败 → 本次会话别再试 ----',
+			'  resetHerdrCache();',
+			'  __clicks = 0;',
+			'  runJson = () => { __clicks += 1; return { result: { panes: [{ pane_id: "w1:p1" }] } }; };',
+			'  herdrStatus();',
+			'  const __first = __clicks;',
+			'  herdrStatus();',
+			'  ok("5 判定结果被缓存（不反复跑 CLI）", __first === 1 && __clicks === 1);',
+			'  markHerdrBroken("切 pane 失败");',
+			'  ok("5b herdrBrokenReason 记下了原因", herdrBrokenReason().includes("切 pane 失败"));',
+			'  s = herdrStatus();',
+			'  ok("5c markHerdrBroken 后 ok=false 且 reason 含原因", s.ok === false && s.reason.includes("切 pane 失败"));',
+			'  ok("5d 坏锁生效后不再调 CLI", __clicks === 1);',
+			'  // ---- ⑥ reset 清掉坏锁 ----',
+			'  resetHerdrCache();',
+			'  s = herdrStatus();',
+			'  ok("6 resetHerdrCache 清掉标记（ok 恢复 / 原因清空）", herdrBrokenReason() === "" && s.ok === true);',
+			'  // ---- ⑦ / ⑧ resolveUiMode（降级的两个方向）----',
+			'  ok("7 resolveUiMode(auto,1,false) → panel", resolveUiMode({ ui: "auto" }, 1, false) === "panel");',
+			'  ok("8 resolveUiMode(auto,1,true) → split", resolveUiMode({ ui: "auto" }, 1, true) === "split");',
+			'  // ---- ⑨ 降级文案（纯函数）----',
+			'  const dn = herdrDownNote("herdr CLI 调不通（不在 PATH 或超时）", "auto");',
+			'  ok("9 降级 note 含「Herdr 不可用」+ 原因 + 想要的 ui", dn.includes("Herdr 不可用") && dn.includes("调不通") && dn.includes("auto"));',
+			'  ok("9b 没传 ui 也要有话说", herdrDownNote("x").includes("本次走面板卡片"));',
+			'  ok("9c 原因为空不写出空字符串", herdrDownNote("", "split").includes("未知原因"));',
+			'  // ---- ⑩ / ⑪ doctor 诊断行（纯函数，坏输入不抛）----',
+			'  const dl = formatHerdrDiagnostic({ term: "Windows_Terminal", panes: 3, ok: true, reason: "", ui: "auto", actual: "split", routerSource: "内置", routerBytes: 1234 }).join("\\n");',
+			'  ok("10 诊断行含 TERM_PROGRAM / 可用= / 结论：ui=", dl.includes("TERM_PROGRAM") && dl.includes("可用=") && dl.includes("结论：ui="));',
+			'  ok("10b 正常时原因写 (正常)、pane 数带 ✓", dl.includes("(正常)") && dl.includes("✓ 3 个"));',
+			'  ok("10c Router 行带来源 + 字节", dl.includes("Router 提示词：内置") && dl.includes("1234 字节"));',
+			'  let __missOk = true;',
+			'  let miss = "";',
+			'  try { miss = formatHerdrDiagnostic(undefined).join("\\n"); } catch { __missOk = false; }',
+			'  ok("11 取不到值时写 (取不到)，不抛错", __missOk && miss.includes("(取不到)") && !miss.includes("undefined") && !miss.includes("NaN"));',
+			'  let __badOk = true;',
+			'  try { formatHerdrDiagnostic({ term: null, panes: NaN, ok: null, reason: undefined }); } catch { __badOk = false; }',
+			'  ok("11b 脏值（null/NaN）也不抛", __badOk === true);',
+			'} finally {',
+			'  runJson = __realRunJson;',
+			'  if (__env.TERM_PROGRAM === undefined) delete process.env.TERM_PROGRAM; else process.env.TERM_PROGRAM = __env.TERM_PROGRAM;',
+			'  if (__env.HERDR_PANE_ID === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = __env.HERDR_PANE_ID;',
+			'  resetHerdrCache();',
+			'}',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-herdr-status") },
+	) && allOk;
+
+// ---------- 套件：Herdr 坏锁改冷却 + 负面缓存 TTL + 坏锁日志 ----------
+// 踩过的痛点：`markHerdrBroken()` 一旦设了就是**永久** ok:false，且 `herdrStatus()` 把负面结论也无限期缓存 ——
+// 一次 `pane list` 超时（10s）就能把整个会话钉死在 panel，直到重启。
+// 这里钉死：坏锁只冷却 30s（过期自动重探）、负面结论只缓存 5s、TERM_PROGRAM 不再绕过 pane 检查。
+bundle("herdr.ts", "herdr-cooldown.mjs");
+allOk =
+	runSuite(
+		"herdr：坏锁冷却 / 负面缓存 TTL / 坏锁日志",
+		join(tmp, "herdr-cooldown.mjs"),
+		[
+			'const __realRunJson3 = runJson;',
+			'const __env3 = { TERM_PROGRAM: process.env.TERM_PROGRAM, HERDR_PANE_ID: process.env.HERDR_PANE_ID };',
+			'const fsx = await import("node:fs");',
+			'let clicks = 0;',
+			'const okJson = () => { clicks += 1; return { result: { panes: [{ pane_id: "w1:p1" }] } }; };',
+			'try {',
+			'  process.env.TERM_PROGRAM = "Windows_Terminal";',
+			'  process.env.HERDR_PANE_ID = "w1:p1";',
+			'  // ---- ① 两个阈值常量导出（单测不真等 30s）----',
+			'  ok("C1 常量：坏锁冷却 30s / 负面缓存 5s", BROKEN_COOLDOWN_MS === 30_000 && STATUS_NEG_TTL_MS === 5_000);',
+			'  // ---- ② 坏锁生效 → ok=false 且带原因 ----',
+			'  resetHerdrCache();',
+			'  runJson = okJson;',
+			'  markHerdrBroken("x");',
+			'  let s = herdrStatus();',
+			'  ok("C2 markHerdrBroken 后 ok=false 且 reason 含「x」", s.ok === false && s.reason.includes("x"));',
+			'  ok("C2b reason 说清是冷却（30 秒内不再试），不是「永久不可用」", s.reason.includes("30 秒内不再试") && !s.reason.includes("本次会话已判定不可用"));',
+			'  ok("C2c 冷却中不白跑 CLI", clicks === 0);',
+			'  // ---- ③ 冷却过期（注入过去的时刻，不真等 30s）----',
+			'  markHerdrBroken("x", Date.now() - (BROKEN_COOLDOWN_MS + 1000));',
+			'  ok("C3 冷却过期后 herdrBrokenActive() === false", herdrBrokenActive() === false);',
+			'  ok("C4 冷却过期后 herdrBrokenReason() 返回空", herdrBrokenReason() === "");',
+			'  clicks = 0;',
+			'  s = herdrStatus();',
+			'  ok("C5 冷却过期后自动重探（真的跑了 CLI）且恢复 ok", clicks === 1 && s.ok === true);',
+			'  // ---- ④ reset 清坏锁 ----',
+			'  markHerdrBroken("y");',
+			'  resetHerdrCache();',
+			'  ok("C6 resetHerdrCache 清掉坏锁（herdrBrokenActive=false）", herdrBrokenActive() === false && herdrBrokenReason() === "");',
+			'  // ---- ⑤ 负面结论：TTL 内复用 / TTL 过后重探 ----',
+			'  resetHerdrCache();',
+			'  clicks = 0;',
+			'  runJson = () => { clicks += 1; return undefined; };',
+			'  s = herdrStatus();',
+			'  const s2 = herdrStatus();',
+			'  ok("C7 负面结论在 TTL 内复用（连调两次只探测一次）", clicks === 1 && s.ok === false && s2.ok === false);',
+			'  const s3 = herdrStatus(Date.now() + STATUS_NEG_TTL_MS + 1000);',
+			'  ok("C8 负面结论过期后重新探测（第二次真跑了 CLI）", clicks === 2 && s3.ok === false);',
+			'  // ---- ⑥ 正面结论：长期复用（不按 TTL 重探）----',
+			'  resetHerdrCache();',
+			'  clicks = 0;',
+			'  runJson = okJson;',
+			'  const p1 = herdrStatus();',
+			'  const p2 = herdrStatus(Date.now() + 10 * 60 * 1000);',
+			'  ok("C9 正面结论长期复用（TTL 过后仍不重探）", clicks === 1 && p1.ok === true && p2.ok === true);',
+			'  // ---- ⑦ 统一要求 mainPaneId（TERM_PROGRAM 不再绕过）----',
+			'  resetHerdrCache();',
+			'  process.env.TERM_PROGRAM = "herdr";',
+			'  delete process.env.HERDR_PANE_ID;',
+			'  s = herdrStatus();',
+			'  ok("C10 TERM_PROGRAM=herdr 但 HERDR_PANE_ID 未设 → ok=false（早判早降级）", s.ok === false);',
+			'  ok("C10b 此时 reason 点明 HERDR_PANE_ID 未设 + TERM_PROGRAM", s.reason.includes("HERDR_PANE_ID 未设") && s.reason.includes("TERM_PROGRAM=herdr"));',
+			'  resetHerdrCache();',
+			'  process.env.HERDR_PANE_ID = "w1:p1";',
+			'  process.env.TERM_PROGRAM = "Windows_Terminal";',
+			'  ok("C11 HERDR_PANE_ID 有值 + 非 herdr 终端 → ok=true", herdrStatus().ok === true);',
+			'  // ---- ⑧ 坏锁写日志（<agentDir>/herdr.log，写不进也不抛）----',
+			'  const logFile = join(getAgentDir(), "herdr.log");',
+			'  try { fsx.rmSync(logFile, { force: true }); } catch { /* ignore */ }',
+			'  markHerdrBroken("日志测试");',
+			'  const logTxt = fsx.existsSync(logFile) ? fsx.readFileSync(logFile, "utf8") : "";',
+			'  ok("C12 坏锁写日志：ISO 时间 + HERDR_BROKEN + 原因", /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}/m.test(logTxt) && logTxt.includes("HERDR_BROKEN") && logTxt.includes("日志测试"));',
+			'  herdrStatus(Date.now() + BROKEN_COOLDOWN_MS + 1000);',
+			'  const logTxt2 = fsx.existsSync(logFile) ? fsx.readFileSync(logFile, "utf8") : "";',
+			'  ok("C13 冷却过期重探成功也记一行 HERDR_RECOVERED", logTxt2.includes("HERDR_RECOVERED"));',
+			'  let __logOk = true;',
+			'  const __savedDir = process.env.PI_CODING_AGENT_DIR;',
+			'  // 把 herdr.log 占成一个目录（appendFileSync 必抛）→ 验证日志失败不会反过来报错',
+			'  const __block = join(getAgentDir(), "blocked");',
+			'  fsx.rmSync(__block, { recursive: true, force: true });',
+			'  fsx.mkdirSync(join(__block, "herdr.log"), { recursive: true });',
+			'  try { process.env.PI_CODING_AGENT_DIR = __block; herdrLog("x"); } catch { __logOk = false; }',
+			'  if (__savedDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = __savedDir;',
+			'  ok("C14 日志写不进也不抛（日志不许反过来影响派活）", __logOk === true);',
+			'} finally {',
+			'  runJson = __realRunJson3;',
+			'  if (__env3.TERM_PROGRAM === undefined) delete process.env.TERM_PROGRAM; else process.env.TERM_PROGRAM = __env3.TERM_PROGRAM;',
+			'  if (__env3.HERDR_PANE_ID === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = __env3.HERDR_PANE_ID;',
+			'  resetHerdrCache();',
+			'}',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-herdr-cooldown") },
 	) && allOk;
 
 // ---------- 套件：批次汇总卡 / 槽位等待 / 多溢出 tab ----------
@@ -1201,6 +1552,69 @@ allOk =
 			'ok("批次（真机）：重复 settle 同一条不会再写 .bg", listBgTasks().filter((t) => !bgBefore.includes(t.id)).length === 1);',
 		],
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-delegate-batch") },
+	) && allOk;
+
+// ---------- 套件 1.7：采样提速 + 批量实时短卡 ----------
+// C1：PANE_SAMPLE_MS / 回执稳定窗 2000 → 800，读失败连续 3 次降频到 2000（纯函数可测）
+// C3：superagent.batchLive（默认关）开着时每件回投一条 ≤ 60 字的极短卡，最多 4 条
+bundle("delegate.ts", "delegate-batchlive.mjs");
+allOk =
+	runSuite(
+		"delegate：采样提速 / 批量实时短卡",
+		join(tmp, "delegate-batchlive.mjs"),
+		[
+			'// ---- C1 采样提速 ----',
+			'ok("PANE_SAMPLE_MS === 800", PANE_SAMPLE_MS === 800);',
+			'ok("PANE_RECEIPT_STABLE_MS === 800", PANE_RECEIPT_STABLE_MS === 800);',
+			'ok("读失败 0/1/2 次 → 仍用 800ms", effectiveSampleMs(0) === 800 && effectiveSampleMs(1) === 800 && effectiveSampleMs(2) === 800);',
+			'ok("读失败 3 次 → 降频到 2000ms", effectiveSampleMs(3) === 2000 && effectiveSampleMs(9) === 2000);',
+			'ok("降频常量：阈值 3 / 慢档 2000", PANE_READ_FAIL_SLOW_AFTER === 3 && PANE_SAMPLE_SLOW_MS === 2000);',
+			'const blKeep = setInterval(() => {}, 50); // sleep() unref 了，测试里自己撑事件循环',
+			'const slDir = join(tmpdir(), "slow-sess-" + Math.random().toString(36).slice(2, 8));',
+			'mkdirSync(slDir, { recursive: true });',
+			'const slBody = ["状态: 完成", "结论: 跑完了"].join(String.fromCharCode(10));',
+			'writeFileSync(join(slDir, "20260101-000000-1_sid-slow.jsonl"), JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: slBody }] } }) + String.fromCharCode(10), "utf8");',
+			'let slThrows = 0;',
+			'const slRes = await waitPaneDone({ index: 1, paneId: "w9:ps", where: "main" }, slDir, "sid-slow", 20000, undefined, true, { read: () => { slThrows += 1; if (slThrows <= 3) throw new Error("pane 读不到"); return { ok: true, text: "π 输入框" }; }, alive: () => true, sampleMs: 5, slowSampleMs: 5, receiptStableMs: 120 });',
+			'ok("降频：连续读失败 3 次 → stallLog 里留一条「[采样] 降频到」", slRes.stallLog.some((l) => l.includes("[采样]") && l.includes("3 次")));',
+			'ok("降频：只记一条（不每次抛错都刷屏）", slRes.stallLog.filter((l) => l.includes("[采样]")).length === 1);',
+			'ok("降频：只是慢下来，读到成功后照样判 done", slRes.outcome === "done" && slThrows >= 4);',
+			'// ---- C3 批量实时开关 ----',
+			'ok("batchLiveEnabled() 默认 false（不写配置时）", batchLiveEnabled() === false);',
+			'mkdirSync(getAgentDir(), { recursive: true });',
+			'writeFileSync(join(getAgentDir(), "ai-extensions.json"), JSON.stringify({ superagent: { batchLive: true } }), "utf8");',
+			'ok("写 superagent.batchLive=true → batchLiveEnabled() 返回 true", batchLiveEnabled() === true);',
+			'ok("短卡上限常量 === 4", BATCH_LIVE_MAX === 4);',
+			'const blOk = batchLiveLiveText(2, { name: "通用助理", outcome: "done", elapsedMs: 7000, text: "结论: 改完了 README 版式" });',
+			'ok("短卡文案：成功 ≤ 60 字符（✅ #3 助理 7s · 结论，序号 1 基）", blOk.length <= 60 && blOk === "✅ #3 通用助理 7s · 改完了 README 版式");',
+			'const blLong = batchLiveLiveText(11, { name: "通用助理", outcome: "done", elapsedMs: 7000, text: "结论: " + "啊".repeat(300) });',
+			'ok("短卡文案：超长 headline 截断后仍 ≤ 60（前缀不丢）", blLong.length <= 60 && blLong.startsWith("✅ #12 通用助理 7s · ") && blLong.endsWith("…"));',
+			'const blFail = batchLiveLiveText(4, { name: "db", outcome: "failed", elapsedMs: 3000, error: "退出码 1" });',
+			'ok("短卡文案：失败用 ❌ 且 ≤ 60", blFail.startsWith("❌ #5 db 3s · ") && blFail.length <= 60 && blFail.includes("退出码 1"));',
+			'// ---- 真机（临时 .bg）：8 个 item → 4 条短卡 + 1 条汇总卡 ----',
+			'const blBefore = listBgTasks().map((t) => t.id);',
+			'const blBatch = openBatch(8, { key: "batch", task: "8 件事", ownerSessionFile: "F", ownerSessionId: "S", deadlineAt: Date.now() + 600000 });',
+			'for (let i = 0; i < 8; i++) noteBatchItem(blBatch, i, { name: "general", outcome: i === 2 ? "failed" : "done", elapsedMs: 1000 + i * 1000, text: "结论: 第 " + (i + 1) + " 件", error: i === 2 ? "退出码 1" : undefined, sessionId: "sess-" + i });',
+			'const blNew = listBgTasks().filter((t) => !blBefore.includes(t.id));',
+			'ok("短卡：8 个 item 只写 4 条（并发上限 4，防刷屏）", blNew.filter((t) => t.id.includes(":item:")).length === 4);',
+			'ok("短卡：id 形如 <batchId>:item:<seq>", blNew.some((t) => t.id === blBatch.id + ":item:3"));',
+			'ok("短卡：batch=true / delivered=false（等 pollBgTasks 投一次）", blNew.filter((t) => t.id.includes(":item:")).every((t) => t.batch === true && t.delivered === false));',
+			'ok("短卡：每条正文 ≤ 60 字符", blNew.filter((t) => t.id.includes(":item:")).every((t) => String(t.resultText || "").length <= 60));',
+			'ok("短卡：失败那条 status=failed 且正文是 ❌", (() => { const f = blNew.find((t) => t.id === blBatch.id + ":item:2"); return !!f && f.status === "failed" && String(f.resultText).startsWith("❌"); })());',
+			'ok("汇总卡：凑齐后仍然写 batch.id 那条（不被短卡挤掉）", (() => { const s = blNew.find((t) => t.id === blBatch.id); return !!s && s.batch === true && String(s.resultText || "").startsWith("【批次 8 个】"); })());',
+			'ok("短卡与汇总卡不冲突：1 条汇总 + 4 条短卡", blNew.length === 5);',
+			'// ---- 开关关掉 → 默认行为（只出 1 张汇总卡） ----',
+			'writeFileSync(join(getAgentDir(), "ai-extensions.json"), JSON.stringify({ superagent: { batchLive: false } }), "utf8");',
+			'ok("batchLive=false → batchLiveEnabled() 回到 false", batchLiveEnabled() === false);',
+			'const offBefore = listBgTasks().map((t) => t.id);',
+			'const offBatch = openBatch(2, { key: "batch", task: "2 件事", deadlineAt: Date.now() + 600000 });',
+			'noteBatchItem(offBatch, 0, { name: "general", outcome: "done", elapsedMs: 1000, text: "结论: a" });',
+			'noteBatchItem(offBatch, 1, { name: "general", outcome: "done", elapsedMs: 1000, text: "结论: b" });',
+			'const offNew = listBgTasks().filter((t) => !offBefore.includes(t.id));',
+			'ok("开关关掉：只写 1 条汇总卡，没有任何短卡", offNew.length === 1 && offNew[0].id === offBatch.id);',
+			'clearInterval(blKeep);',
+		],
+		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-batchlive") },
 	) && allOk;
 
 // ---------- 套件 2：mcp-pool（影子目录） ----------
@@ -1404,6 +1818,103 @@ allOk =
 		],
 		{ PI_CODING_AGENT_DIR: routerAgent },
 	) && allOk;
+
+// ---------- 套件：superagent Router 提示词外部化（resolveRouterPrompt / writeRouterTemplate） ----------
+// 造一批临时项目目录 + 用户级目录（agentDir 靠 PI_CODING_AGENT_DIR 指），路径用环境变量递进去。
+const rpRoot = mkdtempSync(join(tmpdir(), "pi-ext-router-prompt-"));
+const R = {};
+try {
+	/** 造一个「项目 + 用户级」组合目录；files 里的键写到对应位置 */
+	const mkProj = (name, files = {}) => {
+		const dir = join(rpRoot, name);
+		mkdirSync(join(dir, ".pi", "pi-extensions"), { recursive: true });
+		for (const [f, body] of Object.entries(files)) writeFileSync(join(dir, ".pi", "pi-extensions", f), body, "utf8");
+		return dir;
+	};
+	const mkAgent = (name, files = {}) => {
+		const dir = join(rpRoot, name);
+		mkdirSync(join(dir, "pi-extensions"), { recursive: true });
+		for (const [f, body] of Object.entries(files)) writeFileSync(join(dir, "pi-extensions", f), body, "utf8");
+		return dir;
+	};
+	//  ≥200 字符的正文（内置下限），marker 放在开头好断言
+	const long = (marker) => `${marker}\n` + "这是一段用来凑长度的规则文字，单纯验证文件级覆盖与追加的优先级顺序。\n".repeat(10);
+
+	R.none = mkProj("p_none");
+	R.onlyUser = mkProj("p_onlyuser");
+	R.agentOnlyUser = mkAgent("a_onlyuser", { "router.md": long("【用户级】USER-BASE") });
+	R.both = mkProj("p_both", { "router.md": long("【项目级】PROJECT-BASE") });
+	R.agentBoth = mkAgent("a_both", { "router.md": long("【用户级】USER-BASE") });
+	R.extraOnly = mkProj("p_extra", { "router.extra.md": "【追加】EXTRA-BLOCK" });
+	R.extraBoth = mkProj("p_extra_both", { "router.md": long("【项目级】PROJECT-BASE"), "router.extra.md": "【追加】EXTRA-BLOCK" });
+	R.empty = mkProj("p_empty", { "router.md": "   \n\n \t \n" });
+	R.agentEmpty = mkAgent("a_empty", { "router.md": long("【用户级】USER-BASE") });
+	R.short = mkProj("p_short", { "router.md": "太短了。" }); // 4 字符 < 200
+	R.crlf = mkProj("p_crlf", { "router.md": "\uFEFF# 标题\r\n" + long("CRLF-BASE").replace(/\n/g, "\r\n") });
+	R.blank = mkProj("p_blank", { "router.md": "A 段\n\n\n\n\nB 段\n" + long("BLANK-BASE") });
+	R.big = mkProj("p_big", { "router.md": "啊".repeat(7000) }); // ≈21KB（多字节）
+	R.agentClean = mkAgent("a_clean");
+	R.tpl = join(rpRoot, "tpl", "nested", "router.md");
+	R.tplAgain = R.tpl;
+
+	bundle("superagent.ts", "superagent-prompt.mjs");
+	allOk =
+		runSuite(
+			"superagent：Router 提示词外部化（替换/追加/清洗/截断/模式关）",
+			join(tmp, "superagent-prompt.mjs"),
+			[
+				`const R = JSON.parse(process.env.PI_UT_ROUTER);`,
+				`const B = ROUTER_PROTOCOL;`,
+				`const setAgent = (d) => { process.env.PI_CODING_AGENT_DIR = d; };`,
+				`const resolve = (cwd, on = true) => resolveRouterPrompt(cwd, { forceEnabled: on });`,
+				`setAgent(R.agentClean);`,
+				`const i1 = resolve(R.none);`,
+				'ok("1. 都没文件 → source=内置，text 含「Router」", i1.source === "内置" && i1.text.includes("Router") && i1.bytes > 0 && !i1.file);',
+				`setAgent(R.agentOnlyUser);`,
+				`const i2 = resolve(R.onlyUser);`,
+				'ok("2. 只有用户级 router.md → source=用户文件", i2.source === "用户文件" && i2.text.includes("USER-BASE") && !!i2.file);',
+				`setAgent(R.agentBoth);`,
+				`const i3 = resolve(R.both);`,
+				'ok("3. 项目 + 用户都有 → 用项目级", i3.source === "项目文件" && i3.text.includes("PROJECT-BASE") && !i3.text.includes("USER-BASE"));',
+				`setAgent(R.agentClean);`,
+				`const i4 = resolve(R.extraOnly);`,
+				'ok("4. 只有 router.extra.md → 内置 + 追加都在", i4.source === "内置" && i4.text.includes("Router") && i4.text.includes("EXTRA-BLOCK") && !!i4.extraFile && !i4.file);',
+				`setAgent(R.agentBoth);`,
+				`const i5 = resolve(R.extraBoth);`,
+				'ok("5. 替换 + 追加同时存在 → 替换内容在前", i5.text.indexOf("PROJECT-BASE") >= 0 && i5.text.indexOf("EXTRA-BLOCK") > i5.text.indexOf("PROJECT-BASE"));',
+				`setAgent(R.agentEmpty);`,
+				`const i6 = resolve(R.empty);`,
+				'ok("6. 空文件视为不存在 → 回落用户级", i6.source === "用户文件" && i6.text.includes("USER-BASE"));',
+				`setAgent(R.agentClean);`,
+				`const i7 = resolve(R.short);`,
+				'ok("7. 文件太短（<200 字符）→ warning 非空且用内置", !!i7.warning && i7.warning.includes("太短") && i7.text === B.trim() && i7.source === "内置");',
+				`const i8 = resolve(R.crlf);`,
+				'ok("8. BOM 去掉 + CRLF 归一成 LF", i8.text[0] !== "\\uFEFF" && !i8.text.includes("\\r") && i8.text.includes("CRLF-BASE"));',
+				`const i9 = resolve(R.blank);`,
+				'ok("9. 连续空行压成最多 2 个（无 4+ 连换行）", !/\\n{4,}/.test(i9.text) && i9.text.includes("\\n\\n\\n"));',
+				`const i10 = resolve(R.big);`,
+				'ok("10. 超大内容 → 截到 ≤12288+尾注 且含「已截断」", i10.bytes <= 12288 + Buffer.byteLength("\\n…（已截断，超过 12KB）", "utf8") && i10.bytes > 12288 && i10.text.includes("已截断") && !i10.text.includes("\\uFFFD"));',
+				`const i11 = resolve(R.none, false);`,
+				'ok("11. 模式关 → text 空、bytes 0", i11.text === "" && i11.bytes === 0);',
+				'ok("12a. 内置含「依赖分析」", B.includes("依赖分析"));',
+				'ok("12b. 内置含「并行」", B.includes("并行"));',
+				'ok("12c. 内置含「禁止伪串行」", B.includes("禁止伪串行"));',
+				'ok("12d. 内置含「tasks=[...]」", B.includes("tasks=[...]"));',
+				'ok("12e. 内置含「30 秒」", B.includes("30 秒"));',
+				'ok("12f. 内置原有规则没被删（【你是 Router】/ 挑专才 / wait: false）", B.includes("【你是 Router】") && B.includes("挑专才") && B.includes("wait: false"));',
+				`const w1 = writeRouterTemplate(R.tpl, B);`,
+				'ok("13a. 写模板到空目录 → ok && !existed（自动建目录）", w1.ok === true && w1.existed === false && w1.path === R.tpl);',
+				'const w1txt = readFileSync(R.tpl, "utf8");',
+				'ok("13b. 模板 = 3 行注释 + 内置原文", w1txt.split("\\n").slice(0, 3).every((l) => l.startsWith("<!--")) && w1txt.includes(B.trim()));',
+				`const w2 = writeRouterTemplate(R.tplAgain, B);`,
+				'ok("13c. 再调一次 → !ok && existed（不覆盖）", w2.ok === false && w2.existed === true);',
+				'ok("14. 面板标签动态算（source · bytes 字节 + 追加 / ⚠）", getRouterPromptLabel({ text: "x", source: "项目文件", bytes: 42, extraFile: "e", warning: "w" }) === "项目文件 · 42 字节 + 追加 ⚠ w");',
+			],
+			{ PI_CODING_AGENT_DIR: R.agentClean, PI_UT_ROUTER: JSON.stringify(R) },
+		) && allOk;
+} finally {
+	rmSync(rpRoot, { recursive: true, force: true });
+}
 
 // ---------- 套件：permissions（Worker 权限：解析 / 摘要 / 声明） ----------
 bundle("permissions.ts", "permissions.mjs");
@@ -1754,6 +2265,7 @@ allOk =
 			'ok("面板：有「助理 / 委派」分组（delegate 注册上了）", snap.some((s) => s.group.includes("助理")));',
 			'ok("面板：有「会话级」分组（board/gate 注册上了）", snap.some((s) => s.group.includes("会话级")));',
 			'ok("面板：不是空板（每一项都有说明，打开就能看）", snap.every((s) => s.desc.length >= 12));',
+			'ok("面板：批量实时开关那一行在（superagent.batchLive / bool / 默认关 = 文案里写了）", (() => { const r = snap.find((s) => s.key === "superagent.batchLive"); return !!r && r.kind === "bool" && r.label === "批量实时进度" && r.desc.includes("默认关"); })());',
 			// 命令 handler 空参跑一遍：抓 ReferenceError / 拼写错（/aihelp 就踩过 isExtDisabled 没 import）
 			"const fakeCtx = { ui: { notify() {}, setStatus() {}, select: async () => undefined, input: async () => undefined, editor: async () => undefined, custom: async () => undefined, theme: { fg: (_c, x) => x, bold: (x) => x } }, hasUI: false, isIdle: () => true, abort() {}, cwd: process.cwd(), sessionManager: { getEntries: () => [] } };",
 			"const crashed = [];",
@@ -1958,11 +2470,11 @@ allOk =
 	const checks = {
 		"herdr.ts 该导出的都导出了": mustExport.filter((n) => !new RegExp(`export function ${n}\\b`).test(herdrSrc)).length === 0,
 		"runAssistant 接上 tryRunInHerdr": /const viaPane = await tryRunInHerdr\(/.test(delegateSrc),
-		"失败自动降级（mode===panel 直接返回 undefined）": /if \(mode === "panel"\) return undefined;/.test(delegateSrc),
+		"降级可见（配了 auto/split/tab 却掉到 panel 会说清楚原因）": /const status = herdrStatus\(\);/.test(delegateSrc) && /resolveUiMode\(cfg, activeRuns, status\.ok\)/.test(delegateSrc) && /herdrDownNote\(status\.reason/.test(delegateSrc) && /notifyHerdrDownOnce\(/.test(delegateSrc),
 		"溢出 tab 第一格新开 tab、满了开下一个": /tabCreate\(ws, tabLabel\(n\)/.test(delegateSrc) && /herdrExtraTabs/.test(delegateSrc),
 		"槽位分配走串行队列（并发不抢同一格）": /function serializeSlotAlloc/.test(delegateSrc) && /await serializeSlotAlloc\(/.test(delegateSrc),
 		"成功改 ✅ / 失败改 ❌（保留 pane 时改成「已停」）": delegateSrc.includes('paneLabel("ok"') && delegateSrc.includes('paneLabel("stopped"') && /kind === "stopped"/.test(herdrSrc),
-		"失败保留 pane 会先停掉里面的 pi（ctrl+c -> 已停）": /stopKeptPane\(slot\.paneId/.test(delegateSrc) && /export function stopKeptPane/.test(delegateSrc) && delegateSrc.includes('"ctrl+c"'),
+		"失败保留 pane 会先停掉里面的 pi（ctrl+c -> 已停）": /stopKeptPane\(slot\.paneId/.test(delegateSrc) && /export async function stopKeptPane/.test(delegateSrc) && delegateSrc.includes('"ctrl+c"'),
 		"panel 里分屏 worker 压成一行": /function renderPaneJob/.test(liveSrc) && /job\.uiMode === "split"/.test(liveSrc),
 		"默认 UI 是 auto（不是 panel）": /ui: "auto",/.test(herdrSrc) && !/ui: "panel",/.test(herdrSrc),
 		"UI 模式 set 宽松解析（长标签/被截断也能存）": saSrc.includes("UI_VALUES.find((x) => x === raw)") && saSrc.includes("/[ =（(]/"),

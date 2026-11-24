@@ -20,6 +20,9 @@
  *   planSlot            —— 第 N 个子助理放哪一格
  */
 import { execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readExtCfg } from "./shared";
 
 /** 一条 herdr 命令最多等这么久（卡住的 herdr 不该把派活拖死） */
@@ -121,23 +124,236 @@ function findString(v: unknown, key: string): string | undefined {
 
 // ======================= 环境判定 =======================
 
-let availableCache: boolean | undefined;
-
-/** 终端是不是 Herdr（`TERM_PROGRAM=herdr`）+ herdr 真的能回 JSON */
-export function herdrAvailable(): boolean {
-	if (availableCache !== undefined) return availableCache;
-	if (process.env.TERM_PROGRAM !== "herdr") {
-		availableCache = false; // 环境变量不会中途变，可以放心缓存
-		return false;
-	}
-	// 能拿到可解析的 JSON 才算「真的能用」——只看环境变量会被「herdr 没装/服务没起」骗过去
-	availableCache = runJson(["pane", "list"]) !== undefined;
-	return availableCache;
+/**
+ * 探测结论（**带原因**）。
+ * 为什么不能只返回 boolean：`resolveUiMode` 掉回 panel 时用户看不到任何解释 ——
+ * 「卡片照出、不分屏、一句为什么都没有」。reason 就是给卡片 / `/aidoctor` 直接显示的。
+ */
+export interface HerdrStatus {
+	ok: boolean;
+	/** 空字符串 = 正常；否则是给人看的原因（卡片/doctor 直接显示） */
+	reason: string;
+	/** `process.env.TERM_PROGRAM`（"" = 没设） */
+	term: string;
+	/** pane list 拿到的 pane 数，失败为 0 */
+	panes: number;
 }
 
-/** 单测 / 换环境时清缓存 */
+/** 切 pane / pane run 失败的冷却：30 秒内不再尝试，过期自动重试（别永久锁死一个会话） */
+export const BROKEN_COOLDOWN_MS = 30_000;
+/** 负面结论（ok:false）的缓存寿命：过了就重探（一次 CLI 超时/失败不该钉死整个会话） */
+export const STATUS_NEG_TTL_MS = 5_000;
+
+/** 判定结果 + 原因一起缓存（同一次会话里反复派活不必每次跑 CLI） */
+let statusCache: HerdrStatus | undefined;
+/** 上面那份缓存的写入时刻（负面结论要按它算 TTL；正面结论长期复用） */
+let statusCachedAt = 0;
+/** 「切 pane 真失败」的原因 —— 配合 brokenAt 做冷却，**不再是永久锁** */
+let brokenReason = "";
+/** 上次判定坏掉的时刻（毫秒） */
+let brokenAt = 0;
+
+/** 坏锁在 now 这一刻是否还在冷却中（纯函数，便于单测注入时间） */
+export function brokenActiveAt(now: number): boolean {
+	if (!brokenReason) return false;
+	return now - brokenAt < BROKEN_COOLDOWN_MS;
+}
+
+/** 负面缓存是否已过期（纯函数，便于单测注入时间） */
+export function negativeExpiredAt(now: number): boolean {
+	if (!statusCache || statusCache.ok !== false) return false;
+	return now - statusCachedAt > STATUS_NEG_TTL_MS;
+}
+
+/**
+ * 坏锁 / 恢复写一行日志（`<agentDir>/herdr.log`）。
+ * 为什么不用 cwd 下的 guard.log：那是**项目目录**，用户的项目里不该长出调试文件；
+ * 而 agentDir 本来就是 pi 自己的状态目录。写不进就算了 —— 日志不许反过来影响派活。
+ */
+export function herdrLog(line: string): void {
+	try {
+		const dir = getAgentDir();
+		if (!dir) return;
+		mkdirSync(dir, { recursive: true });
+		appendFileSync(join(dir, "herdr.log"), `${new Date().toISOString()} ${String(line ?? "")}\n`, "utf8");
+	} catch {
+		/* ignore：写不进日志不影响判定 */
+	}
+}
+
+function cacheStatus(s: HerdrStatus): HerdrStatus {
+	statusCache = s;
+	statusCachedAt = Date.now();
+	return s;
+}
+
+/**
+ * herdr 现在到底能不能用 + 不能用的原因。
+ *
+ * 判定顺序（**先看 CLI 通不通，再看终端是不是 herdr**）：
+ *   ① 本会话已判定坏了 → 直接失败（不再试）
+ *   ② `pane list` 拿不到 JSON → CLI 调不通（没装 / 不在 PATH / 超时）
+ *   ③ 拿到 JSON 但 0 个 pane → 没有可用 pane
+ *   ④ `pane list` 正常，但拿不到本会话的 pane → false（**不看 TERM_PROGRAM**）
+ *   ⑤ 其余 → ok（放宽：Windows Terminal / VS Code / tmux / SSH 里，只要装了 herdr
+ *      且在跑、又知道往哪个 pane 切，就能用）
+ *
+ * 为什么 TERM_PROGRAM=herdr 不再「直接 ok」：此时如果缺 HERDR_PANE_ID，后面切 pane 必失败，
+ * 结果就是 delegate 里「先判 ok → 再 markHerdrBroken 永久锁」。早判早降级，好过「先 ok 再锁」。
+ *
+ * at 可注入（单测用），默认当前时间。
+ */
+export function herdrStatus(at: number = Date.now()): HerdrStatus {
+	const term = String(process.env.TERM_PROGRAM ?? "");
+	// ① 冷却期内不再试（**有超时**：过期就自动重探，别把会话永久钉死）
+	if (brokenActiveAt(at)) {
+		return cacheStatus({ ok: false, reason: `最近失败过，30 秒内不再试：${brokenReason}`, term, panes: 0 });
+	}
+	// 冷却过期 → 清掉坏锁、丢掉旧结论，正常重探
+	if (brokenReason) {
+		brokenReason = "";
+		brokenAt = 0;
+		statusCache = undefined;
+		herdrLog("HERDR_RECOVERED 冷却过期，重新探测");
+	}
+	// ② 缓存：正面结论长期复用；负面结论只在 TTL 内复用（过期就重探）
+	if (statusCache && !negativeExpiredAt(at)) return statusCache;
+	statusCache = undefined;
+	// 能拿到可解析的 JSON 才算「真的能用」——只看环境变量会被「herdr 没装/服务没起」骗过去
+	const raw = runJson(["pane", "list"]);
+	if (raw === undefined) {
+		return cacheStatus({ ok: false, reason: "herdr CLI 调不通（不在 PATH 或超时）", term, panes: 0 });
+	}
+	const panes = parsePaneList(raw).length;
+	if (panes === 0) {
+		return cacheStatus({ ok: false, reason: "herdr 里没有可用 pane", term, panes: 0 });
+	}
+	// 不管 TERM_PROGRAM 是什么都查：没有本会话的 pane 就切不了，早判早降级
+	if (!mainPaneId()) {
+		return cacheStatus({
+			ok: false,
+			reason: `拿不到本会话的 pane（HERDR_PANE_ID 未设，TERM_PROGRAM=${term}）`,
+			term,
+			panes,
+		});
+	}
+	return cacheStatus({ ok: true, reason: "", term, panes });
+}
+
+/**
+ * 切 pane / pane run 真失败 → 冷却 30 秒（到期自动重试）。
+ * 曾经这里是「永久 ok:false」，一次 10s 超时就能把整个会话钉死在 panel 上，所以改成冷却。
+ */
+export function markHerdrBroken(reason: string, at: number = Date.now()): void {
+	brokenReason = String(reason ?? "").trim() || "未知原因";
+	brokenAt = at;
+	statusCache = undefined; // 让下一次 herdrStatus() 立刻反映
+	statusCachedAt = 0;
+	herdrLog(`HERDR_BROKEN ${brokenReason}`);
+}
+
+/** 当前的「坏了」原因；空字符串 = 没坏 / 冷却已过期（过期顺手清掉，别留残渣） */
+export function herdrBrokenReason(): string {
+	if (brokenActiveAt(Date.now())) return brokenReason;
+	brokenReason = "";
+	brokenAt = 0;
+	// 冷却期间缓存的「最近失败过」也一起丢掉，否则过期后还会多骗最多一个 TTL
+	if (statusCache && statusCache.ok === false) {
+		statusCache = undefined;
+		statusCachedAt = 0;
+	}
+	return "";
+}
+
+/** 坏锁是否还在冷却中（对外只暴露布尔，不泄漏时间戳） */
+export function herdrBrokenActive(): boolean {
+	return brokenActiveAt(Date.now());
+}
+
+/** 终端能不能用 herdr 分屏（旧签名保留；判定逻辑见 herdrStatus） */
+export function herdrAvailable(): boolean {
+	return herdrStatus().ok;
+}
+
+/** 单测 / 换环境 / 新会话时清缓存（连坏锁一起清） */
 export function resetHerdrCache(): void {
-	availableCache = undefined;
+	statusCache = undefined;
+	statusCachedAt = 0;
+	brokenReason = "";
+	brokenAt = 0;
+}
+
+/** 降级卡片备注的前缀：delegate 靠它认出「这是降级说明」，不让终态备注把它抹掉 */
+export const HERDR_DOWN_PREFIX = "Herdr 不可用";
+
+/**
+ * 用户配了 auto/split/tab 却掉回 panel 时的说明（纯函数，卡片 / doctor 共用）。
+ * 带上 ui=，让人一眼看出「你想要的模式没生效」以及为什么。
+ */
+export function herdrDownNote(reason: string, ui?: string): string {
+	const why = String(reason ?? "").trim() || "未知原因";
+	const want = String(ui ?? "").trim();
+	return want
+		? `${HERDR_DOWN_PREFIX}：${why}（本次走面板卡片，ui=${want} 没生效）`
+		: `${HERDR_DOWN_PREFIX}：${why}（本次走面板卡片）`;
+}
+
+/** `/aidoctor` 的取值（拿不到的都留 undefined，格式化时写「(取不到)」） */
+export interface HerdrDiagInput {
+	term?: string;
+	panes?: number;
+	ok?: boolean;
+	reason?: string;
+	/** 配置里写的 ui */
+	ui?: string;
+	/** resolveUiMode 实际算出来的 */
+	actual?: string;
+	routerSource?: string;
+	routerBytes?: number;
+	routerFile?: string;
+	routerExtraFile?: string;
+}
+
+const MISSING = "(取不到)";
+
+/**
+ * `/aidoctor` 的 Herdr + Router 诊断行（**纯函数**，不读环境不跑命令，坏输入也不抛）。
+ * 一次摊开：终端类型 / pane 数 / 可用性 / 原因 / 配置的 ui 和实际生效的 ui / Router 提示词来源。
+ */
+export function formatHerdrDiagnostic(input: HerdrDiagInput | undefined): string[] {
+	const d = input ?? {};
+	const has = (v: unknown): boolean => v !== undefined && v !== null && !(typeof v === "string" && v === "");
+	const str = (v: unknown, dflt = MISSING): string => {
+		try {
+			return has(v) ? String(v) : dflt;
+		} catch {
+			return MISSING;
+		}
+	};
+	const num = (v: unknown): number | undefined => {
+		try {
+			const n = Number(v);
+			return v !== undefined && v !== null && Number.isFinite(n) ? Math.max(0, Math.round(n)) : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+
+	const panes = num(d.panes);
+	const ok = typeof d.ok === "boolean" ? d.ok : undefined;
+	const mark = ok === undefined ? "" : ok ? "✓" : "✗";
+	const paneTxt = panes === undefined ? MISSING : `${mark ? `${mark} ` : ""}${panes} 个`;
+	const reason = str(d.reason, ok === true ? "(正常)" : MISSING);
+	const bytes = num(d.routerBytes);
+	const file = has(d.routerFile) ? ` ${str(d.routerFile)}` : "";
+	const extra = has(d.routerExtraFile) ? `（+ 追加 ${str(d.routerExtraFile)}）` : "";
+
+	return [
+		`- Herdr：TERM_PROGRAM=${str(d.term)} · pane list ${paneTxt} · 可用=${ok === undefined ? MISSING : String(ok)}`,
+		`       原因：${reason}`,
+		`       结论：ui=${str(d.ui)} → 实际 ${str(d.actual)}`,
+		`- Router 提示词：${str(d.routerSource)} · ${bytes === undefined ? MISSING : String(bytes)} 字节${file}${extra}`,
+	];
 }
 
 /** 本会话自己的 pane（HERDR_PANE_ID）；没有就 undefined */
@@ -166,6 +382,11 @@ export interface PaneInfo {
 export function paneList(): PaneInfo[] {
 	const raw = runJson(["pane", "list"]);
 	if (raw === undefined) return [];
+	return parsePaneList(raw);
+}
+
+/** 把 `pane list` 的原始 JSON 解成 PaneInfo[]（不碰命令行，纯函数） */
+function parsePaneList(raw: unknown): PaneInfo[] {
 	const res = unwrapResult(raw);
 	const arr = Array.isArray(res.panes) ? res.panes : Array.isArray(findKey(raw, "panes")) ? (findKey(raw, "panes") as unknown[]) : [];
 	const out: PaneInfo[] = [];
@@ -313,15 +534,17 @@ export type PaneKind = "run" | "ok" | "err" | "stalled" | "stopped";
  * pane 标题。三个状态各打一个记号 —— 用户在 tab 栏扫一眼就知道哪个跑完了、哪个挂了。
  *   run → `▶ sa:<name>#<idx>`
  *   ok  → `✅ sa:<name>#<idx>`
- *   err → `❌ sa:<name>#<idx>（按回车关闭）`
- *   stopped → `❌ sa:<name>#<idx>（已停，回车关闭）` —— 失败的 pane 被保留了，但里面的 pi 已经 Ctrl+C 停掉
- *   stalled → `❌ sa:<name>#<idx>（卡死已降级）` —— 看门狗收掉的 pane（马上要关，所以不写「按回车关闭」）
+ *   err → `❌ sa:<name>#<idx>（失败·保留）` —— 失败也把 pane 留着，方便回头看输出
+ *   stopped → `⏹ sa:<name>#<idx>（已停·保留）` —— 失败的 pane 被保留了，但里面的 pi 已经 Ctrl+C 停掉
+ *   stalled → `❌ sa:<name>#<idx>（卡死已降级）` —— 看门狗收掉的 pane（马上要关，所以不写「保留」）
+ *
+ * 为什么不再写「按回车关闭」：回车关闭从没实现过，写出来就是骗人 —— 文案只说事实。
  */
 export function paneLabel(kind: PaneKind, name: string, idx: number): string {
 	const who = `sa:${name || "worker"}#${idx}`;
 	if (kind === "ok") return `✅ ${who}`;
-	if (kind === "err") return `❌ ${who}（按回车关闭）`;
-	if (kind === "stopped") return `❌ ${who}（已停，回车关闭）`;
+	if (kind === "err") return `❌ ${who}（失败·保留）`;
+	if (kind === "stopped") return `⏹ ${who}（已停·保留）`;
 	if (kind === "stalled") return `❌ ${who}（卡死已降级）`;
 	return `▶ ${who}`;
 }
