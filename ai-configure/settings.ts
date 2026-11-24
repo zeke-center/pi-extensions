@@ -246,6 +246,24 @@ export function parseFieldValue(d: SettingDef, text: string): string | number | 
 }
 
 /**
+ * 用配置定义重算表单行的显示值（enum 回填标签、bool 回填 是/否…）。
+ *
+ * 为什么需要：页面的 `value` 是**建页那一刻**的快照。项页 ctrl+s 会真的写盘，
+ * 回到组页时那行还是旧快照 → 退出时 `applySettingsValues` 就把旧值当成
+ * 「用户改了这一行」又写回去（表现：改了没保存）。所以页外改过之后得刷一遍。
+ */
+export function refreshFormFields(
+	fields: { key: string; value: string }[],
+	getDef: (key: string) => SettingDef | undefined,
+): void {
+	for (const f of fields) {
+		const d = getDef(f.key);
+		if (!d || d.kind === "action") continue;
+		f.value = fieldValue(d);
+	}
+}
+
+/**
  * 把表单结果写回去（只写真的变了的项）。
  * 返回 { applied, failed } —— 纯逻辑，好测。
  */
@@ -263,6 +281,14 @@ export function applySettingsValues(values: Record<string, string>, defs: Settin
 		const text = values[d.key] ?? "";
 		// 没动过的行跳过（表单里 value 就是当前值）
 		if (text === fieldValue(d)) continue;
+		// 显示格式差异的保险：enum 行有时显示标签、有时只剩值本身（长标签被截断成 "auto"、
+		// 项页存完留下的是值…）。只要解析出来就是**当前实际值**，就不算用户改动 ——
+		// 不跳过的话两种写法会来回写盘（“改了没保存”的另一半成因）。
+		if (d.kind === "enum") {
+			const cur = parseFieldValue(d, fieldValue(d));
+			const next = parseFieldValue(d, text);
+			if (cur !== undefined && next !== undefined && String(cur) === String(next)) continue;
+		}
 		const v = parseFieldValue(d, text);
 		if (v === undefined) {
 			failed.push(d.label);
@@ -374,6 +400,7 @@ export function settingsHomePage(): FormPage {
 		footer: "↑↓ 移动 · 回车 进入这一组 · ctrl+s 保存 · esc 退出",
 		detail: (f) => GROUP_BLURB[f.label] ?? `「${f.label}」共 ${defs.filter((d) => d.group === f.label).length} 项。`,
 		enter: (f) => settingsGroupPage(f.label.replace(/^nav\.group\./, "")),
+		refresh: () => refreshFormFields(fields, (k) => getSetting(k)),
 	};
 }
 
@@ -399,6 +426,7 @@ export function settingsGroupPage(group: string): FormPage {
 		title: group,
 		fields,
 		footer: "↑↓ 移动 · 回车 编辑/执行 · esc 返回总览 · ctrl+s 保存",
+		refresh: () => refreshFormFields(fields, (k) => getSetting(k)),
 		detail: (f) => {
 			if (f.key === "nav.back") return "回到总览（也可以直接按 esc）。";
 			const d = getSetting(f.key);
@@ -423,21 +451,23 @@ export function settingsGroupPage(group: string): FormPage {
 
 /** 项页：单个配置项的「大视图」（回车改值，ctrl+s 保存并留在本页） */
 export function settingsItemPage(d: SettingDef): FormPage {
+	const fields: FormField[] = [
+		{ key: "nav.back", label: "← 返回", value: "", kind: "text", readonly: true, drill: true },
+		{
+			key: d.key,
+			label: d.label,
+			value: fieldValue(d),
+			kind: d.kind === "enum" ? "enum" : d.kind === "bool" ? "bool" : "text",
+			options: d.kind === "enum" ? d.options : undefined,
+			hint: fieldHint(d),
+		},
+	];
 	return {
 		title: d.label,
 		footer: "回车 改 · ctrl+s 保存（留在本页）· esc 返回上一层",
-		fields: [
-			{ key: "nav.back", label: "← 返回", value: "", kind: "text", readonly: true, drill: true },
-			{
-				key: d.key,
-				label: d.label,
-				value: fieldValue(d),
-				kind: d.kind === "enum" ? "enum" : d.kind === "bool" ? "bool" : "text",
-				options: d.kind === "enum" ? d.options : undefined,
-				hint: fieldHint(d),
-			},
-		],
+		fields,
 		detail: (f) => (f.key === "nav.back" ? "回到上一层（也可以直接按 esc）。" : fieldDetail(d)),
+		refresh: () => refreshFormFields(fields, (k) => getSetting(k)),
 		enter: (f) => (f.key === "nav.back" ? null : undefined),
 		save: (values) => {
 			const v = parseFieldValue(d, values[d.key] ?? "");

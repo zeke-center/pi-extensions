@@ -2,6 +2,15 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.5.3
+
+- 变更：**Router 档位默认改为「只派活」** —— 开启 Super Agent 后主会话只剩 `delegate` / `progress` / `git_read`，只能决策与验收，不能再自己读文件、跑命令、改代码
+- 新增：`tool_call` 硬拦截 —— 白名单外的工具（含 `bash`、`codemode`、`write`、`edit`、`mcp__*` 执行类、晚注册的 MCP 工具）一律拒绝并提示「用 delegate 派活，不要重试」；守卫自身出错时放行（fail-open）并记日志
+- 新增：`/router` 命令 —— 不带参数看当前档位；`/router blind|readonly|off` 临时切换（本会话有效，重启复位）
+- 修复：设置面板里改完一项保存后，回到上一层被**旧快照写回**（表现成「改了没保存」）
+- 修复：`readonly` 档的 MCP 危险工具漏判（`ssh_exec` 这类现在会拦）
+- 测试：unit 新增 48 条断言（Router guard 26 + 设置刷新 22）
+
 ## 2.5.2
 
 - 变更：**UI 模式默认改为 `auto`** —— 本机有 Herdr 就自动分屏，没有则退回面板卡片

@@ -110,6 +110,8 @@ export interface FormPage {
 	footer?: string;
 	/** ctrl+s：返回 false = 退回上一层（默认留在本页）；不传 = 老行为（提交并关闭） */
 	save?: (values: Record<string, string>) => boolean | void;
+	/** 重新读一遍当前值（页外改过之后同步显示，避免旧快照被当改动提交） */
+	refresh?: () => void;
 }
 
 /** 面板里的一行 */
@@ -235,6 +237,13 @@ export class FormPane implements Focusable {
 	private stack: FormPage[];
 	/** 每层各自的光标位置（返回上一层时能回到原来那行） */
 	private sels: number[] = [0];
+	/** 用户在本页改过、但还没提交到磁盘的行（refresh 时得保住，否则刚改的值会被磁盘值盖回去） */
+	private dirty = new WeakSet<FormField>();
+
+	/** 标记「这行的值是本页刚改的，还没落盘」 */
+	private touch(f: FormField | undefined): void {
+		if (f) this.dirty.add(f);
+	}
 
 	private page(): FormPage {
 		return this.stack[this.stack.length - 1]!;
@@ -261,7 +270,34 @@ export class FormPane implements Focusable {
 		this.stack.pop();
 		this.sel = this.sels[this.stack.length - 1] ?? 0;
 		this.mode = "nav";
+		// 回上一层：里层可能已经把值写盘了（项页 ctrl+s），上层的旧快照必须跟着更新
+		this.refreshStack();
 		return true;
+	}
+
+	/** 从 enum/edit 切回列表视图：本页刚改了值，顺手按定义重算一遍显示 */
+	private backToNav(): void {
+		this.mode = "nav";
+		this.refreshStack();
+	}
+
+	/**
+	 * 让整页栈按自己的定义重算显示值（项页改完 → 组页那行也得跟着变）。
+	 *
+	 * 为什么要 sync 本页「改过还没写盘」的行回来：refresh 是按**磁盘当前值**重算的，
+	 * 在组页把 enum 改完再回车进项页、再 esc 回来时，会把刚改的值抹成旧值
+	 * （表现出来和这次修的 bug 一模一样：改了没保存）。
+	 */
+	private refreshStack(): void {
+		for (const p of this.stack) {
+			const keep = p.fields.map((f) => ({ f, v: f.value, dirty: this.dirty.has(f) }));
+			try {
+				p.refresh?.();
+			} catch {
+				/* 刷新失败不影响主流程 */
+			}
+			for (const k of keep) if (k.dirty) k.f.value = k.v;
+		}
 	}
 
 	constructor(
@@ -368,6 +404,7 @@ export class FormPane implements Focusable {
 		if (matchesKey(data, "ctrl+s") || matchesKey(data, "ctrl+enter")) {
 			const f = this.flds().find((x) => x.key === e.key);
 			if (f) f.value = e.lines.join("\n");
+			this.touch(f);
 			this.edit = null;
 			return;
 		}
@@ -556,13 +593,19 @@ export class FormPane implements Focusable {
 
 		// ctrl+s 在任何模式下都能直接存（正在编辑的那格先落地）
 		if (matchesKey(data, "ctrl+s")) {
-			if (this.mode === "edit" && f) f.value = this.buf;
+			if (this.mode === "edit" && f) {
+				f.value = this.buf;
+				this.touch(f);
+			}
 			this.mode = "nav";
 			const page = this.page();
 			if (this.stack.length > 1 && page.save) {
 				const values: Record<string, string> = {};
 				for (const x of page.fields) values[x.key] = x.kind === "mcp" ? this.mcpValue() : x.value;
 				const keep = page.save(values);
+				// 本页的值已经落盘了 → 不再算「未提交」，让 refresh 按磁盘值把它格式化回来
+				for (const x of page.fields) this.dirty.delete(x);
+				this.refreshStack(); // 项页存完 → 下面组页那行的旧快照必须跟着更新
 				if (keep === false) this.popPage(); // 存完退回上一层
 				return;
 			}
@@ -594,7 +637,7 @@ export class FormPane implements Focusable {
 		if (this.mode === "enum") {
 			const opts = f?.options ?? [];
 			if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-				this.mode = "nav";
+				this.backToNav(); // 值没动，顺手按定义刷一遍显示
 				return;
 			}
 			if (matchesKey(data, "up") && opts.length) {
@@ -606,20 +649,26 @@ export class FormPane implements Focusable {
 				return;
 			}
 			if (matchesKey(data, "return")) {
-				if (f && opts[this.enumSel] !== undefined) f.value = opts[this.enumSel] as string;
-				this.mode = "nav";
+				if (f && opts[this.enumSel] !== undefined) {
+					f.value = opts[this.enumSel] as string;
+					this.touch(f); // 本页刚改，refresh 时别抹掉
+				}
+				this.backToNav();
 			}
 			return;
 		}
 
 		if (this.mode === "edit") {
 			if (matchesKey(data, "escape")) {
-				this.mode = "nav"; // 放弃本行修改（不写回 f.value）
+				this.backToNav(); // 放弃本行修改（不写回 f.value）
 				return;
 			}
 			if (matchesKey(data, "return")) {
-				if (f) f.value = this.buf;
-				this.mode = "nav";
+				if (f) {
+					f.value = this.buf;
+					this.touch(f); // 本页刚改，refresh 时别抹掉
+				}
+				this.backToNav();
 				return;
 			}
 			if (matchesKey(data, "backspace")) {
@@ -715,6 +764,7 @@ export class FormPane implements Focusable {
 			if (f.readonly) return;
 			if (f.kind === "bool") {
 				f.value = f.value === "是" ? "否" : "是";
+				this.touch(f); // 本页刚改，refresh 时别抹掉
 				return;
 			}
 			if (f.kind === "mcp") {

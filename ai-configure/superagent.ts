@@ -4,13 +4,16 @@
  * 这一层现在负责什么
  * ----------------
  * ① 三层开关（全局 / 本项目 / 本会话）
- * ② **Router 工具档位**：模式开着时摘掉主会话的执行类工具（只读档保留 read/grep）
+ * ② **Router 工具档位**：模式开着时摘掉主会话的执行类工具。**默认「只派活」**（只剩
+ *    delegate / progress / git_read），另有只读档 / 不限制档。摘工具只是表面功夫，
+ *    真正的边界是 `installRouterGuard()` 那个 `tool_call` 钩子（晚注册的 MCP 工具、
+ *    codemode 借道、别的扩展重新激活工具，都得过它）。
  * ③ **Worker 回执契约**：给 Worker 的提示词尾部拼一段 `<result>` 格式要求 + 解析它交回来的块
  * ④ 状态栏提示（开着时 footer 显示 `⚡ Super Agent · 项目 · 只读`）
  *
  * 不做什么：不替 Router 决策、不改 Worker 的执行逻辑（那些在 delegate.ts 里）。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -48,8 +51,8 @@ const DEFAULTS = {
 	report: "strict" as ReportMode,
 	/** 失败自动重派次数（0 = 不自动） */
 	retry: 0,
-	/** Router 能力档位 */
-	router: "readonly" as RouterMode,
+	/** Router 能力档位（默认盲派：主会话只做决策，不自己执行） */
+	router: "blind" as RouterMode,
 };
 
 export type ReportMode = "strict" | "loose" | "off";
@@ -57,8 +60,12 @@ export type RouterMode = "readonly" | "blind" | "off";
 
 const REPORT_OPTIONS = ["严格", "宽松", "关"];
 const REPORT_VALUES: ReportMode[] = ["strict", "loose", "off"];
-const ROUTER_OPTIONS = ["只读（推荐）", "全禁（只剩 delegate/progress）", "不限制"];
-const ROUTER_VALUES: RouterMode[] = ["readonly", "blind", "off"];
+const ROUTER_OPTIONS = [
+	"只派活（推荐：主会话只做决策，不能自己执行）",
+	"只读（可以自己 read/grep，不能写/跑命令）",
+	"不限制（就是普通 pi）",
+];
+const ROUTER_VALUES: RouterMode[] = ["blind", "readonly", "off"]; // 顺序必须对应
 
 function readGlobalLayer(): boolean {
 	const raw = readExtCfg().superagent;
@@ -265,16 +272,80 @@ const BLOCKED_READONLY = ["bash", "write", "edit", "apply_patch", "multiedit", "
  * 留着它等于没摘 bash。这里用名字猜，宁可多摘（真需要就在面板里选「不限制」）。
  */
 const MCP_DANGER = /(ssh|exec|shell|bash|run_?cmd|write|delete|drop|update|insert|create|patch|apply)/i;
-/** 全禁档：除这两个，其它全摘 */
-const KEEP_BLIND = ["delegate", "progress"];
+/**
+ * 盲派档（默认）：Router 只许这三件事 —— 派活、报进度、验收 diff。
+ *
+ * `git_read` 留着的理由：验收 Worker 的改动要能看 diff，而它只读、改不了任何东西。
+ */
+const ROUTER_ALLOW: string[] = ["delegate", "progress", "git_read"];
+/** 保留旧名（导出：别处还在用 / 单测要断言它没跑偏） */
+export const KEEP_BLIND = ROUTER_ALLOW;
 /** 只读档明确要保留的（其余按黑名单摘）—— git_read 让我们能验收 Worker 的改动 */
 const KEEP_READONLY = ["delegate", "progress", "read", "grep", "git_read"];
+
+/** 盲派档的拒绝文案：一次到位，顺便明令别重试（模型很爱换个工具绕） */
+export const ROUTER_DENY_TEXT = [
+	"⛔ 主会话是 Router，不亲自执行。",
+	"现在是「只派活」档：只能用 delegate / progress / git_read。",
+	"要做事请用 delegate 派 Worker（把「要什么 + 验收标准」写清）。",
+	"⛔ 不要重试这个工具，也不要找替代工具绕过 —— 都会被拦。",
+].join("\n");
+
+/** 只读档的拒绝文案（同样是「别绕过」口径） */
+const ROUTER_DENY_TEXT_READONLY = [
+	"⛔ 主会话是 Router，现在是「只读」档：不能写文件、不能跑命令。",
+	"只读档能用：delegate / progress / read / grep / git_read。",
+	"要做事请用 delegate 派 Worker（把「要什么 + 验收标准」写清）。",
+	"⛔ 不要重试这个工具，也不要找替代工具绕过 —— 都会被拦。",
+].join("\n");
+
+/**
+ * 硬 guard 的判定（**纯函数**，不碰 api / 文件 / 环境变量 —— 这样能单测）。
+ *
+ * - `off`     ：全放行（等于普通 pi）
+ * - `blind`   ：只放行 ROUTER_ALLOW；其它一律 deny —— 内建工具、codemode、
+ *               任何 `mcp__*`、以及叫不上名字的新工具，全都算「不是派活」。
+ * - `readonly`：deny BLOCKED_READONLY + 名字命中 MCP_DANGER 的 `mcp__*`；其它放行。
+ */
+export function decideRouterToolCall(tool: string, mode: RouterMode): { allow: boolean; reason?: string } {
+	if (mode === "off") return { allow: true };
+	const name = String(tool ?? "");
+	if (mode === "blind") {
+		// 白名单是**正向**的：不在表里的（包括还没见过的新工具、mcp__*）全部拒
+		return ROUTER_ALLOW.includes(name) ? { allow: true } : { allow: false, reason: ROUTER_DENY_TEXT };
+	}
+	if (BLOCKED_READONLY.includes(name)) return { allow: false, reason: ROUTER_DENY_TEXT_READONLY };
+	if (name.startsWith("mcp__") && MCP_DANGER.test(name)) return { allow: false, reason: ROUTER_DENY_TEXT_READONLY };
+	return { allow: true };
+}
 
 /** 本会话对档位的覆盖（「临时放开」用；重启复位） */
 let routerSession: RouterMode | undefined;
 /** 摘工具前的那一刻快照，用于原样还原 */
 let toolsSnapshot: string[] | undefined;
-let apiRef: ExtensionAPI | undefined;
+/** 摘工具用的 api 引用。
+ *
+ * ⚠️ 名字带 router 前缀是故意的：delegate.ts 里也有个模块级 `apiRef`，
+ *    两个同名变量被 esbuild 打包进同一个文件时会被重命名成 `apiRef` / `apiRef2`，
+ *    单测往 `apiRef` 里塞假 api 就可能塞到另一个模块上（踩过：后台回投测试莫名就不投了）。
+ *    名字错开，两边都叫自己的。 */
+let routerApiRef: ExtensionAPI | undefined;
+/** guard 钩子只注册一次（theme/session 变化时 setup 可能再跑） */
+let guardInstalled = false;
+
+/** 往 `guard.log` 记一行（格式与 guard-entry.ts 一致：ISO 时间 + 空格 + 内容） */
+function guardLog(line: string): void {
+	try {
+		appendFileSync(join(getAgentDir(), "guard.log"), `${new Date().toISOString()} ${line}\n`, "utf8");
+	} catch {
+		/* 记不上就记不上，不因为这个拦活 */
+	}
+}
+
+/** 我是不是 Worker 进程（Worker 里 guard 必须放行，否则它自己干不了活） */
+function isWorkerProc(): boolean {
+	return Boolean((process.env.PI_DELEGATE_PPID ?? "").trim());
+}
 
 export function setRouterSession(v: RouterMode | undefined): void {
 	routerSession = v;
@@ -284,7 +355,7 @@ export function setRouterSession(v: RouterMode | undefined): void {
 
 /** 按当前配置摘 / 还原 Router 的工具（幂等，可反复调） */
 export function applyRouterTools(): void {
-	const api = apiRef;
+	const api = routerApiRef;
 	if (!api?.setActiveTools) return;
 	const st = readSuperAgent();
 	try {
@@ -309,20 +380,25 @@ export function applyRouterTools(): void {
 		const base = toolsSnapshot;
 		const keep =
 			st.router === "blind"
-				? base.filter((n) => KEEP_BLIND.includes(n))
+				? base.filter((n) => ROUTER_ALLOW.includes(n))
 				: base.filter((n) => !BLOCKED_READONLY.includes(n) && !(n.startsWith("mcp__") && MCP_DANGER.test(n)));
 		api.setActiveTools(keep);
 
 		// ---------- fail-safe 自检 ----------
 		// 收窄绝不能把 Router 弄成残废（v2.3 真踩过：快照拿早了，bash/read 全没了）。
-		// 只校验「本该保留的」：delegate/progress 必须还在；只读档额外要求 read。
-		const required = st.router === "blind" ? KEEP_BLIND : KEEP_READONLY;
+		// 只校验「本该保留的」：delegate/progress/git_read 必须还在；只读档额外要求 read。
+		//
+		// ⚠️ 少了东西**绝不原样还原全部工具**：还原 = 把「不自己干活」这个承诺废掉，
+		//    而且只剩一条 notify，静悄悄就变全能了。宁可工具少（少到只剩 delegate 也能派活），
+		//    也不能变回全能 —— 真漏网的由 installRouterGuard() 兜底拦。
+		const required = st.router === "blind" ? ROUTER_ALLOW : KEEP_READONLY;
 		const after = (api.getActiveTools?.() ?? []) as string[];
 		const missing = required.filter((n) => base.includes(n) && !after.includes(n));
 		if (missing.length) {
-			api.setActiveTools(toolsSnapshot);
-			toolsSnapshot = undefined;
-			notifyOnce(`⚠️ Super Agent 收窄失败（少了 ${missing.join(", ")}），已还原全部工具`);
+			guardLog(`ROUTER_NARROW_PARTIAL router=${st.router} missing=${missing.join(",")}`);
+			notifyOnce(
+				`⚠️ Super Agent 收窄不完整（少了 ${missing.join(", ")}）—— 已保留收窄结果，被漏掉的工具仍会被 guard 拦截`,
+			);
 		}
 	} catch {
 		/* 工具列表改不动就别硬改，主会话照常可用 */
@@ -345,7 +421,7 @@ function notifyOnce(msg: string): void {
 export function releaseRouterTools(): void {
 	setRouterSession("off");
 	try {
-		apiRef?.ui?.notify?.("本会话已恢复全部工具（重启 pi 后按配置重新生效）", "info");
+		routerApiRef?.ui?.notify?.("本会话已恢复全部工具（重启 pi 后按配置重新生效）", "info");
 	} catch {
 		/* 通知失败无所谓 */
 	}
@@ -353,7 +429,52 @@ export function releaseRouterTools(): void {
 
 /** 当前档位的中文短名（状态栏用） */
 function routerLabel(m: RouterMode): string {
-	return m === "readonly" ? "只读" : m === "blind" ? "全禁" : "不限制";
+	return m === "blind" ? "只派活" : m === "readonly" ? "只读" : "不限制";
+}
+
+// ======================= 硬 guard（主会话只能派活） =======================
+
+/**
+ * 要不要拦这次 tool_call —— **只有主会话（Router）才拦**。
+ *
+ * Worker 进程（环境变量里有 `PI_DELEGATE_PPID`）必须放行：它是干活的，拦了就没法干。
+ * 这个判断单独抽出来，就是为了能单测（不依赖真跑一个 Worker）。
+ */
+export function shouldGuardRouter(): boolean {
+	if (isWorkerProc()) return false;
+	return superagentEnabled();
+}
+
+/**
+ * 装硬 guard：`tool_call` 钩子，按当前档位拦工具。
+ *
+ * 为什么光靠 `applyRouterTools()` 摘工具不够（三个漏口）：
+ *   1. MCP server 是**异步**连上的：摘完之后 `mcp__…__ssh_exec` 才注册进来，可能自动激活
+ *   2. `codemode` 能调任意工具（嵌套调用也会走 tool_call，所以这里能拦住）
+ *   3. 别的扩展也可能重新激活工具 —— 摘表是「当时那一刻」的快照，钩子是**每次调用**都判
+ *
+ * **fail-open**：钩子自己出错就放行（只记 guard.log）。保险丝不该在自身故障时把主会话锁死。
+ */
+export function installRouterGuard(api: ExtensionAPI): void {
+	if (guardInstalled) return; // 幂等：session_start / reload 反复调也只注册一次
+	guardInstalled = true;
+	try {
+		api.on("tool_call", async (event) => {
+			try {
+				if (!shouldGuardRouter()) return undefined; // 模式关 / Worker 进程 → 不管
+				const d = decideRouterToolCall(String(event?.toolName ?? ""), readSuperAgent().router);
+				if (d.allow) return undefined;
+				guardLog(`ROUTER_DENY ${event?.toolName ?? "?"}`);
+				return { block: true, reason: d.reason ?? ROUTER_DENY_TEXT };
+			} catch (e) {
+				// fail-open：判定自己炸了就放行，别把主会话锁死
+				guardLog(`ROUTER_GUARD_ERROR ${e instanceof Error ? e.message : String(e)}`);
+				return undefined;
+			}
+		});
+	} catch {
+		guardInstalled = false; // 注册没成功：下次 setup 再试
+	}
 }
 
 // ======================= 状态栏 =======================
@@ -508,13 +629,16 @@ function registerSuperAgentSettings(): void {
 			label: "Router 能力",
 			desc:
 				"**主会话（Router）能用哪些工具** —— 模式开着时生效：\n\n" +
-				"- **只读（推荐）**：保留 `delegate` `progress` `read` `grep` `git_read`（只读 git，能验收 diff）；摘掉 `bash` `write` `edit` `apply_patch` `codemode`；" +
+				"- **只派活（推荐，默认）**：只留 `delegate` `progress` `git_read`（派活、报进度、验收 diff）。" +
+				"`read` `grep` `bash` `write` `edit` `apply_patch` `codemode` 以及所有 `mcp__*` 全摘；" +
+				"就算有晚注册 / 被重新激活的漏网工具，`tool_call` 钩子也会当场拦下。\n" +
+				"  → 主会话只做决策，真正干活必须派 Worker\n" +
+				"- **只读**：保留 `delegate` `progress` `read` `grep` `git_read`；摘掉 `bash` `write` `edit` `apply_patch` `codemode`；" +
 				"另外名字里带 ssh / exec / write / delete 这类词的 MCP 工具也一起摘（否则 `mcp__…__ssh_exec` 变相等于 bash）。\n" +
 				"  → 能自己看文件核对 Worker 的证据，但改不了任何东西\n" +
-				"- **全禁**：只留 `delegate` `progress`（纯调度，验收只能信 Worker 自述）\n" +
-				"- **不限制**：不摘工具（等于关闭这套收窄）\n\n" +
-				"⚠️ 这**不是安全边界**：它只是让 Router 专心调度。真正拦住越权的是 Worker 侧的权限校验（后续接）。\n" +
-				"⚠️ 工具改动只在本会话内存里，pi 重启自动回默认；想立刻恢复用下面那行「临时放开全部工具」。",
+				"- **不限制**：不摘工具也不拦（等于关闭这套收窄）\n\n" +
+				"默认只派活；`/router` 可临时切换（本会话有效）。\n" +
+				"⚠️ 摘工具只是表面功夫，真正的边界是 `tool_call` 硬 guard（fail-open：守卫自己出错就放行）。",
 			kind: "enum",
 			options: ROUTER_OPTIONS,
 			values: ROUTER_VALUES,
@@ -522,7 +646,7 @@ function registerSuperAgentSettings(): void {
 			get: () => routerSession ?? readCfgKey("router"),
 			set: (v) => {
 				routerSession = undefined; // 面板里改档位 = 回到配置值
-				setSuperAgentOption({ router: (ROUTER_VALUES.includes(v as RouterMode) ? v : "readonly") as RouterMode });
+				setSuperAgentOption({ router: (ROUTER_VALUES.includes(v as RouterMode) ? v : DEFAULTS.router) as RouterMode });
 			},
 		},
 		{
@@ -627,8 +751,10 @@ function registerSuperAgentSettings(): void {
 }
 
 export function setupSuperAgent(api: ExtensionAPI): void {
-	apiRef = api;
+	routerApiRef = api;
 	registerSuperAgentSettings();
+	// 硬 guard：主会话的 tool_call 一律先过这道坎（幂等，装一次就够）
+	installRouterGuard(api);
 	// 新会话 / reload：会话级覆盖复位，工具按配置重新摘，状态栏同步
 	api.on("session_start", async () => {
 		sessionLayer = "inherit";
@@ -639,6 +765,10 @@ export function setupSuperAgent(api: ExtensionAPI): void {
 	});
 	// ---------- 提示词注入：只有模式开着才写 <superagent-router> 段 ----------
 	api.on("before_agent_start", async (event) => {
+		// ⚠️ 每次 agent 启动都**重放摘除**：MCP server 是异步连上的，
+		//    session_start 那次摘完以后 `mcp__*` 才注册进来并自动激活 —— 摘一次不够。
+		//    applyRouterTools() 是幂等的，重放只是把激活列表再按档位压一遍。
+		applyRouterTools();
 		const rules = routerProtocol();
 		if (rules) {
 			if (event.systemPromptOptions.sections["superagent-router"] !== rules) {

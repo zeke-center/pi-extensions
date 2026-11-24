@@ -43,7 +43,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { type FormResult, type FormField, type FormPage, showForm, type PickItem, pickFromList } from "./form";
-import { parseReport, reportHeadline, reportRule, readSuperAgent, superagentEnabled, type WorkerReport } from "./superagent";
+import {
+	parseReport,
+	readSuperAgent,
+	reportHeadline,
+	reportRule,
+	setRouterSession,
+	superagentEnabled,
+	type RouterMode,
+	type WorkerReport,
+} from "./superagent";
 import {
 	parsePerms,
 	permSummary,
@@ -4967,6 +4976,42 @@ export function setupDelegate(api: ExtensionAPI): void {
 				return;
 			}
 			ctx.ui.notify(`不认识「${sub}」。用法：/delegate-mode [async|sync]`, "info");
+		},
+	});
+
+	// ---------- /router：Router 档位（默认只派活） ----------
+	api.registerCommand("router", {
+		description:
+			"Router 档位：直接敲看当前档位；blind=只派活（默认）/ readonly=只读 / off=不限制（本会话有效）",
+		handler: async (args: string, ctx) => {
+			const label = (m: string): string => (m === "blind" ? "只派活" : m === "readonly" ? "只读" : "不限制");
+			const st = readSuperAgent();
+			const offHint = st.enabled ? "" : "\n（注意：Super Agent 当前是关的，档位暂不生效）";
+			const sub = (args ?? "").trim().toLowerCase();
+			if (!sub) {
+				ctx.ui.notify(
+					`当前 Router 档位：${label(st.router)}（${st.router}）· 生效原因：${st.decidedBy}${offHint}\n` +
+						"用法：/router blind | readonly | off（本会话有效，重启复位）",
+					"info",
+				);
+				return;
+			}
+			// 中英文都认：blind/只派活、readonly/只读、off/不限制
+			const alias: Record<string, RouterMode> = {
+				blind: "blind",
+				readonly: "readonly",
+				off: "off",
+				只派活: "blind",
+				只读: "readonly",
+				不限制: "off",
+			};
+			const hit = alias[sub];
+			if (!hit) {
+				ctx.ui.notify(`不认识「${sub}」。可用：blind（只派活）/ readonly（只读）/ off（不限制）`, "info");
+				return;
+			}
+			setRouterSession(hit);
+			ctx.ui.notify(`本会话已切到「${label(hit)}」（${hit}）—— 重启 pi 复位成配置值${offHint}`, "info");
 		},
 	});
 

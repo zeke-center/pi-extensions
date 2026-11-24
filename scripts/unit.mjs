@@ -1355,6 +1355,56 @@ allOk =
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-superagent") },
 	) && allOk;
 
+// ---------- 套件：superagent Router 档位 + 硬 guard（纯函数判定） ----------
+// ⚠️ 重新打一份 bundle：runSuite 是往文件尾追加断言，复用上套会重复声明 const。
+const routerAgent = join(tmp, "agent-router");
+mkdirSync(routerAgent, { recursive: true });
+writeFileSync(join(routerAgent, "ai-extensions.json"), `${JSON.stringify({ superagent: { enabled: true } }, null, 2)}\n`, "utf8");
+bundle("superagent.ts", "superagent-router.mjs");
+allOk =
+	runSuite(
+		"superagent：Router 硬件 guard 判定（blind / readonly / off × 工具名）",
+		join(tmp, "superagent-router.mjs"),
+		[
+			'// ---- blind（默认）：只放行 delegate/progress/git_read ----',
+			'ok("blind：delegate 放行", decideRouterToolCall("delegate", "blind").allow === true);',
+			'ok("blind：progress 放行", decideRouterToolCall("progress", "blind").allow === true);',
+			'ok("blind：git_read 放行（要能验收 diff）", decideRouterToolCall("git_read", "blind").allow === true);',
+			'const BLIND_DENY = ["read","grep","bash","codemode","write","edit","apply_patch","multiedit","form"];',
+			'ok("blind：read/grep/bash/codemode/write/edit/apply_patch/multiedit/form 全 deny", BLIND_DENY.every((t) => decideRouterToolCall(t, "blind").allow === false));',
+			'ok("blind：mcp__nas_ubuntu24__ssh_exec deny", decideRouterToolCall("mcp__nas_ubuntu24__ssh_exec", "blind").allow === false);',
+			'ok("blind：mcp__center_pg__query deny（无危险词的也拒）", decideRouterToolCall("mcp__center_pg__query", "blind").allow === false);',
+			'ok("blind：未知工具名 deny（正向白名单，不猜）", decideRouterToolCall("some_future_tool", "blind").allow === false);',
+			'ok("blind：拒绝文案含「不要重试」（防以后改丢）", ROUTER_DENY_TEXT.includes("不要重试"));',
+			'ok("blind：deny 的 reason 就是那段文案", (decideRouterToolCall("bash", "blind").reason ?? "").includes("只派活"));',
+			'// ---- readonly：只拦能写/能执行/危险 MCP ----',
+			'ok("readonly：read / grep 放行", decideRouterToolCall("read", "readonly").allow === true && decideRouterToolCall("grep", "readonly").allow === true);',
+			'ok("readonly：bash / write / codemode deny", ["bash","write","codemode"].every((t) => decideRouterToolCall(t, "readonly").allow === false));',
+			'ok("readonly：mcp__nas_ubuntu24__ssh_exec deny（变相 bash）", decideRouterToolCall("mcp__nas_ubuntu24__ssh_exec", "readonly").allow === false);',
+			'ok("readonly：mcp__center_pg__query 放行（不含危险词）", decideRouterToolCall("mcp__center_pg__query", "readonly").allow === true);',
+			'ok("readonly：拒绝文案也含「不要重试」", (decideRouterToolCall("bash", "readonly").reason ?? "").includes("不要重试"));',
+			'// ---- off ----',
+			'ok("off：bash 放行（就是普通 pi）", decideRouterToolCall("bash", "off").allow === true && decideRouterToolCall("whatever", "off").allow === true);',
+			'// ---- 常量 / 选项表 ----',
+			'ok("默认档位就是 blind", DEFAULTS.router === "blind");',
+			'ok("白名单就是 delegate/progress/git_read", ROUTER_ALLOW.join(",") === "delegate,progress,git_read");',
+			'ok("KEEP_BLIND 与 ROUTER_ALLOW 同步（旧名没跑偏）", KEEP_BLIND === ROUTER_ALLOW);',
+			'ok("ROUTER_OPTIONS 与 ROUTER_VALUES 长度一致", ROUTER_OPTIONS.length === ROUTER_VALUES.length);',
+			'ok("ROUTER 选项顺序对应（blind/readonly/off）", ROUTER_VALUES[0] === "blind" && ROUTER_OPTIONS[0].includes("只派活") && ROUTER_VALUES[1] === "readonly" && ROUTER_OPTIONS[1].includes("只读") && ROUTER_VALUES[2] === "off" && ROUTER_OPTIONS[2].includes("不限制"));',
+			'ok("面板默认值 = DEFAULTS.router", ROUTER_VALUES.includes(DEFAULTS.router));',
+			'// ---- Worker 进程：必须放行（不拦自己人） ----',
+			'ok("配置已开（superagentEnabled 为 true，下面才好比）", superagentEnabled() === true);',
+			'process.env.PI_DELEGATE_PPID = "123";',
+			'ok("Worker 环境（PI_DELEGATE_PPID）→ guard 不生效", shouldGuardRouter() === false);',
+			'delete process.env.PI_DELEGATE_PPID;',
+			'ok("去掉 Worker 标记 → 主会话 guard 生效", shouldGuardRouter() === true);',
+			'// ---- 接线存在性（幂等安装 / 重放） ----',
+			'ok("installRouterGuard / applyRouterTools 都是可调函数", typeof installRouterGuard === "function" && typeof applyRouterTools === "function");',
+			'ok("setRouterSession 该导出了", typeof setRouterSession === "function");',
+		],
+		{ PI_CODING_AGENT_DIR: routerAgent },
+	) && allOk;
+
 // ---------- 套件：permissions（Worker 权限：解析 / 摘要 / 声明） ----------
 bundle("permissions.ts", "permissions.mjs");
 allOk =
@@ -1494,6 +1544,7 @@ allOk =
 			'registerSettings([{ key: "tUiReal", group: "甲组", label: "UI 模式", desc: "这是一个枚举项，用来测面板里改 UI 模式能不能真的存进去", kind: "enum", options: ["panel", "split", "tab", "auto（默认：有 Herdr 就分屏）"], values: ["panel", "split", "tab", "auto"], def: "auto", get: () => storeUi.v, set: (v) => { storeUi.v = v; } }]);',
 			'const rUi = applySettingsValues({ tUiReal: "auto" });',
 			'ok("保存：截断成 auto 也真的存进去了（不再落 failed）", rUi.applied.length === 1 && rUi.failed.length === 0 && storeUi.v === "auto");',
+			'storeUi.v = "panel";', // 回到 panel：否则下面这条会被「解析值 == 当前值 → 不写盘」的保险跳过（不算改动）
 			'const rUi2 = applySettingsValues({ tUiReal: "auto = ≤2 个用 split" });',
 			'ok("保存：旧长标签也能存", rUi2.applied.length === 1 && rUi2.failed.length === 0 && storeUi.v === "auto");',
 			'const dList = getSetting("tList");',
@@ -1526,6 +1577,70 @@ allOk =
 			'ok("分页：项页有「返回 + 该项」两行，且带保存钩子", ip.fields.length === 2 && typeof ip.save === "function");',
 			'ok("分页：项页保存会把值写回去", (() => { ip.save({ tNum: "4200" }); return getSetting("tNum").get() === 4200; })());',
 			'ok("分页：返回行回车 = 弹回上一层（返回 null）", ip.enter(ip.fields[0]) === null);',
+			'ok("分页：总览/组/项三页都带 refresh（页外改过之后能重算显示）", typeof settingsHomePage().refresh === "function" && typeof settingsGroupPage("甲组").refresh === "function" && typeof settingsItemPage(getSetting("tNum")).refresh === "function");',
+			// ---- refresh：页外改过的值要同步回显示 ----
+			// 这就是「改了没保存」的根因：组页那行是**建页时的快照**，项页 ctrl+s 已经写盘，
+			// 组页还显示旧值 → 退出时 applySettingsValues 把旧值当成「用户改了」又写回去。
+			'const refStore = { v: "a" };',
+			'const refBool = { v: true };',
+			'const refCalls = [];',
+			'registerSettings([',
+			'  { key: "tRef", group: "甲组", label: "刷新项", desc: "这是一个枚举项，用来测页外改值后表单显示能不能同步", kind: "enum", options: ["a（甲）", "b（乙）"], values: ["a", "b"], def: "a", get: () => refStore.v, set: (v) => { refCalls.push(v); refStore.v = v; } },',
+			'  { key: "tRefBool", group: "甲组", label: "刷新开关", desc: "这是一个布尔项，用来测刷新后回填 是/否", kind: "bool", def: true, get: () => refBool.v, set: (v) => { refBool.v = v; } },',
+			'  { key: "tRefAct", group: "甲组", label: "刷新动作行", desc: "这是一个动作行，刷新时不能被当成配置值重算", kind: "action", def: "", hint: "摘要", get: () => "", set: () => { refCalls.push("ACT"); } },',
+			']);',
+			'const refFields = [{ key: "tRef", label: "刷新项", value: "a（甲）" }];',
+			'refStore.v = "b";',
+			'refreshFormFields(refFields, (k) => getSetting(k));',
+			'ok("刷新：行值从 a 更新成 b（跟着磁盘走，不再是建页那天的快照）", refFields[0].value === "b（乙）");',
+			'const refActFields = [{ key: "tRefAct", label: "刷新动作行", value: "摘要" }];',
+			'refreshFormFields(refActFields, (k) => getSetting(k));',
+			'ok("刷新：动作行跳过（它的值列是摘要，不是当前值）", refActFields[0].value === "摘要");',
+			'const refGhost = [{ key: "nav.back", label: "← 返回", value: "" }];',
+			'let refThrew = false;',
+			'try { refreshFormFields(refGhost, (k) => getSetting(k)); } catch { refThrew = true; }',
+			'ok("刷新：不存在的 key（导航行）不抛错也不乱改", refThrew === false && refGhost[0].value === "");',
+			'const boolRows = [{ key: "tRefBool", label: "刷新开关", value: "否" }];',
+			'refreshFormFields(boolRows, (k) => getSetting(k));',
+			'refBool.v = false;',
+			'refreshFormFields(boolRows, (k) => getSetting(k));',
+			'ok("刷新：bool 行回填 是/否", boolRows[0].value === "否");',
+			'refBool.v = true;',
+			'refreshFormFields(boolRows, (k) => getSetting(k));',
+			'ok("刷新：bool 行回填 是", boolRows[0].value === "是");',
+			'const gpR = settingsGroupPage("甲组");',
+			'refStore.v = "a";',
+			'gpR.fields.find((f) => f.key === "tRef").value = "b（乙）";', // 模拟旧快照
+			'gpR.refresh();',
+			'ok("分页：组页 refresh 把行值拉回磁盘值", gpR.fields.find((f) => f.key === "tRef").value === "a（甲）");',
+			// 三页的 refresh **真调一遍**（只查 typeof 没用：闭包里的 fields 拼错时 typeof 仍是 function）
+			'const ipInv = settingsItemPage(getSetting("tRef"));',
+			'ipInv.fields[1].value = "b（乙）";',
+			'let invThrew = false;',
+			'try { ipInv.refresh(); settingsHomePage().refresh(); settingsGroupPage("甲组").refresh(); } catch { invThrew = true; }',
+			'ok("分页：总览/组/项三页的 refresh 真能调（项页把显示拉回磁盘值）", invThrew === false && ipInv.fields[1].value === "a（甲）");',
+			// ---- 回归（最重要）：组页旧快照 + 项页写盘 ----
+			'const gsnap = [{ key: "tRef", label: "刷新项", value: "a（甲）" }];',
+			'refStore.v = "a";',
+			'refCalls.length = 0;',
+			'const ipRef = settingsItemPage(getSetting("tRef"));',
+			'ipRef.save({ tRef: "b（乙）" });', // 项页 ctrl+s：真写盘
+			'ok("回归：项页保存真的写盘了（磁盘 = b）", refStore.v === "b" && refCalls.length === 1);',
+			'refreshFormFields(gsnap, (k) => getSetting(k));',
+			'const rRefresh = applySettingsValues({ tRef: gsnap[0].value }, settingsDefs());',
+			'ok("回归：刷新之后退出 → 不再把旧值写回去（set 一次都没多调）", refCalls.length === 1 && rRefresh.applied.length === 0 && refStore.v === "b");',
+			// 同一场景**不刷新** = 就是这次的 bug 本身（锁住成因，防以后又把 refresh 去掉）
+			'const rNoRefresh = applySettingsValues({ tRef: "a（甲）" }, settingsDefs());',
+			'ok("成因：不刷新时退出 → 旧快照被当成改动写回（set(a) 真发生了）", rNoRefresh.applied.length === 1 && refCalls.length === 2 && refStore.v === "a");',
+			// enum 兜底：显示的是「值本身」而不是标签时也算没改
+			'refStore.v = "b";',
+			'refCalls.length = 0;',
+			'const rRaw = applySettingsValues({ tRef: "b" }, settingsDefs());',
+			'ok("保险：enum 行给的是值本身（不是标签）→ 也算没改，不写盘", rRaw.applied.length === 0 && refCalls.length === 0);',
+			'const dAuto = { key: "tAuto", kind: "enum", options: ["panel", "auto（默认：有 Herdr 就分屏）"], values: ["panel", "auto"] };',
+			'ok("解析：auto 三种写法（完整标签/截断/旧长标签）都归到 auto", ["auto（默认：有 Herdr 就分屏）", "auto", "auto = xxx"].every((s) => parseFieldValue(dAuto, s) === "auto"));',
+			'const dAB = { key: "tAB", kind: "enum", options: ["A", "B"], values: ["a", "b"] };',
+			'ok("解析：enum 首尾空格也能兜住（带首尾空格的 b → b）", parseFieldValue(dAB, "  b  ") === "b");',
 			'// 回归：动作行的 set 是「跑起来」，绝不能被批量落地当成「改过的配置」（否则一次选中会执行一堆动作）',
 			'const fired = [];',
 			'registerSettings([{ key: "tAct2", group: "丙组", label: "动作行2", desc: "x", kind: "action", def: "", hint: "可派 · 通用助理", get: () => "", set: () => { fired.push("act"); } }]);',
@@ -1536,6 +1651,72 @@ allOk =
 			'ok("回归：恢复全部默认也不执行动作行", fired.length === 0);',
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-settings") },
+	) && allOk;
+
+// ---------- 套件：form（页栈刷新：项页 ctrl+s 之后组页那行不能再是旧快照） ----------
+// 这是那个 bug 的**整条链**：页栈 + 刷新 + 退出时的批量提交。纯函数测得再好，
+// 漏接了 refreshStack 调用点也一样会把旧值写回磁盘，所以这里直接按键盘跑一遍。
+bundle("form.ts", "form.mjs");
+allOk =
+	runSuite(
+		"form：页栈刷新（项页存完 → 组页旧快照跟着更新）",
+		join(tmp, "form.mjs"),
+		[
+			'const ESCK = String.fromCharCode(27);',
+			'const DOWN = ESCK + "[B";',
+			'const CTRL_S = String.fromCharCode(19);',
+			'const opts = ["a（甲）", "b（乙）"];',
+			'const vals = ["a", "b"];',
+			'const store = { v: "a" };',
+			'const label = (v) => opts[Math.max(0, vals.indexOf(String(v)))];',
+			'const writeBack = (text) => { const i = opts.indexOf(String(text)); store.v = i >= 0 ? vals[i] : String(text); };',
+			'const refreshOf = (rows) => () => { for (const r of rows) r.value = label(store.v); };',
+			'const P = (fields, extra) => ({ title: "t", fields, ...extra });',
+			'// 场景一：项页选 b + ctrl+s → esc 回组页，组页那行必须是 b（不是建页那天的 a）',
+			'store.v = "a";',
+			'const g1 = [{ key: "k1", label: "项", value: label(store.v), kind: "enum", options: opts }];',
+			'const i1 = [{ key: "k1", label: "项", value: label(store.v), kind: "enum", options: opts }];',
+			'let closed = "unset";',
+			'const pane = new FormPane({}, "t", g1, [], (r) => { closed = r; });',
+			'pane.setPages([P(g1, { refresh: refreshOf(g1) }), P(i1, { refresh: refreshOf(i1), save: (v) => { writeBack(v.k1); return true; } })]);',
+			'pane.handleInput("\\r"); // 回车 → 展开 enum',
+			'pane.handleInput(DOWN); // ↓ 选 b',
+			'pane.handleInput("\\r"); // 回车选定',
+			'ok("场景一：项页选定 b 后本页显示 b（不被刷新抹回 a）", i1[0].value === "b（乙）");',
+			'pane.handleInput(CTRL_S); // ctrl+s 真写盘',
+			'ok("场景一：ctrl+s 真写盘了", store.v === "b");',
+			'ok("场景一：组页旧快照已跟着更新成 b", g1[0].value === "b（乙）");',
+			'pane.handleInput(ESCK); // esc 回组页',
+			'ok("场景一：esc 回组页后仍是 b（这就是修的那个 bug）", g1[0].value === "b（乙）");',
+			'pane.handleInput(ESCK); // esc 关面板',
+			'ok("场景一：最外层 esc 才关面板（能正常退出）", closed === null);',
+			'// 场景二：组页里改了 enum（还没 ctrl+s）→ 回车进项页 ctrl+s → esc 回来，改动不能被抹',
+			'store.v = "a";',
+			'const g2 = [',
+			'  { key: "k0", label: "进项页", value: "", kind: "text", drill: true },',
+			'  { key: "k1", label: "项", value: label(store.v), kind: "enum", options: opts },',
+			'];',
+			'const i2 = [{ key: "k1", label: "项", value: label(store.v), kind: "enum", options: opts }];',
+			'const pane2 = new FormPane({}, "t", g2, [], () => {});',
+			'pane2.setPages([P(g2, { refresh: refreshOf(g2), enter: (f) => (f.key === "k0" ? P(i2, { refresh: refreshOf(i2), save: () => true }) : undefined) })]);',
+			'pane2.handleInput(DOWN); // 光标到 enum 行',
+			'pane2.handleInput("\\r");',
+			'pane2.handleInput(DOWN); // 选 b（本页改了，但还没保存）',
+			'pane2.handleInput("\\r");',
+			'ok("场景二：组页 enum 已改成 b", g2[1].value === "b（乙）");',
+			'pane2.handleInput(ESCK + "[A"); // ↑ 回到「进项页」行',
+			'pane2.handleInput("\\r"); // 回车进项页',
+			'pane2.handleInput(CTRL_S); // 项页保存（会触发整栈 refresh）',
+			'pane2.handleInput(ESCK); // esc 回组页（再触发一次刷新）',
+			'ok("场景二：里层保存 + 回退之后，组页没提交的 enum 改动还在", g2[1].value === "b（乙）");',
+			'// 场景三：refresh 自己抛错也不能卡住 ctrl+s',
+			'const pane3 = new FormPane({}, "t", [], [], () => {});',
+			'pane3.setPages([P([], { refresh: () => { throw new Error("boom"); } }), P([], { refresh: () => { throw new Error("boom"); }, save: () => true })]);',
+			'let threw3 = false;',
+			'try { pane3.handleInput(CTRL_S); } catch { threw3 = true; }',
+			'ok("场景三：refresh 抛错不影响 ctrl+s 主流程", threw3 === false);',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-form") },
 	) && allOk;
 
 // ---------- 套件：整装（入口装配后，配置面板里各项都在） ----------

@@ -21,6 +21,7 @@ const KEY_SEQ: Record<string, string[]> = {
 	right: [ESC + "[C", ESC + "OC"],
 	left: [ESC + "[D", ESC + "OD"],
 	"ctrl+c": [String.fromCharCode(3)],
+	"ctrl+s": [String.fromCharCode(19)],
 };
 
 export function matchesKey(data: string, key: string): boolean {
