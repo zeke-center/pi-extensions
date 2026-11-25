@@ -58,6 +58,40 @@ const SHADOW_COPY = ["models.json", "auth.json", "models-store.json"];
 // settings.json 单独处理：**不能整份复制** —— 里面的 packages 会让助理去重新克隆插件。
 
 /**
+ * 「压缩窗口百分比」→ pi 真正认的那个字段（v2.6.0）。
+ *
+ * pi 的压缩只在**绝对 token 阈值**上做文章（`compaction.reserveTokens` ＝ 窗口里给输出/系统
+ * 留多少不用于历史），`docs/settings.md` 里没有百分比口径，也没有按项目/目录的开关：
+ *   `contextTokens > contextWindow - reserveTokens` → 开始压缩
+ * 所以「用到 60% 就压」只能在影子目录里换算成 `reserveTokens = (100% − 60%) × 窗口`。
+ *
+ * 注意：这是**兜底转换**，不是 pi 原生支持的百分比 —— 换模型（窗口变了）要重新派活才会刷新。
+ */
+export function compactReserveTokens(percent: number, contextWindow: number): number {
+	const pct = Math.min(95, Math.max(30, Math.round(percent)));
+	const win = Math.max(1000, Math.round(contextWindow));
+	return Math.max(1, Math.round((win * (100 - pct)) / 100));
+}
+
+/**
+ * 写进影子 settings.json 的压缩补丁：`{ compaction: { reserveTokens } }`。
+ *
+ * 返回 undefined 的条件（宁可不开，也不瞎写）：
+ *   - `percent <= 0` → 用户显式说「不设」
+ *   - 拿不到模型窗口 → 没法换算（pi 只认绝对 token）
+ */
+export function compactSettingsPatch(
+	percent?: number,
+	contextWindow?: number,
+): { compaction: { reserveTokens: number } } | undefined {
+	const p = Number(percent);
+	if (!Number.isFinite(p) || p <= 0) return undefined;
+	const w = Number(contextWindow);
+	if (!Number.isFinite(w) || w <= 0) return undefined;
+	return { compaction: { reserveTokens: compactReserveTokens(p, w) } };
+}
+
+/**
  * 影子目录必须能看见这两个本地二进制。
  * 缺了它们，pane 里起 pi 会打印 `fd not found. Downloading... / ripgrep not found. Downloading...`，
  * 卡几秒再 timeout（用户没梯子），每个子助理都要来一遍 —— 压测里最响的报警就是这个。
@@ -276,6 +310,13 @@ export function buildShadow(
 		 * 只放这里传进来的这些 —— 候选池里没被点名的仍然一个都不带（隔离原则不变）。
 		 */
 		inheritServers?: Record<string, McpServerDef>;
+		/**
+		 * worker 的压缩窗口（%）：多少上下文用量时自动压缩（`superagent.workerCompactPercent`）。
+		 * 0 / 不传 = 不写（用 pi 自己的默认阈值）。
+		 */
+		compactPercent?: number;
+		/** 当前模型的上下文窗口（tokens）。拿不到就**不写**压缩配置（不瞎猜）。 */
+		contextWindow?: number;
 	} = {},
 ): ShadowResult {
 	const agentDir = getAgentDir();
@@ -302,19 +343,43 @@ export function buildShadow(
 			/* 单个文件失败不致命 */
 		}
 	}
-	// settings.json：剔掉 packages 再写（否则助理会去重新克隆插件）
+	// settings.json：剔掉 packages 再写（否则助理会去重新克隆插件）；再叠上压缩窗口。
 	const settingsSrc = join(agentDir, "settings.json");
+	const patch = compactSettingsPatch(opts.compactPercent, opts.contextWindow);
+	let settings: Record<string, unknown> | undefined;
+	let settingsBroken = false;
 	if (existsSync(settingsSrc)) {
 		try {
 			const raw = JSON.parse(readFileSync(settingsSrc, "utf8")) as Record<string, unknown>;
 			delete raw.packages;
-			writeFileSync(join(dir, "settings.json"), `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+			settings = raw;
 		} catch {
+			settingsBroken = true;
 			try {
 				copyFileSync(settingsSrc, join(dir, "settings.json"));
 			} catch {
 				errors.push("settings.json 写入失败");
 			}
+		}
+	}
+	if (patch) {
+		if (settingsBroken) {
+			// 原文件不是合法 JSON，已经原样复制了一份；**不覆盖**它（别把用户的配置搞没）
+			warnings.push(`settings.json 不是合法 JSON，压缩窗口（${opts.compactPercent}%）没写进去`);
+		} else {
+			// 只盖 `compaction.reserveTokens`：用户原来写的 enabled / keepRecentTokens / modelOverrides 必须保住
+			// （整块替换会把它们冲掉 —— 那等于替用户改了压缩策略）。
+			const prev = (settings?.compaction ?? {}) as Record<string, unknown>;
+			settings = { ...(settings ?? {}), compaction: { ...prev, ...patch.compaction } };
+		}
+	} else if (Number(opts.compactPercent) > 0) {
+		warnings.push("拿不到模型上下文窗口，worker 压缩窗口没写（不会瞎猜 token 数）");
+	}
+	if (settings) {
+		try {
+			writeFileSync(join(dir, "settings.json"), `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+		} catch {
+			errors.push("settings.json 写入失败");
 		}
 	}
 

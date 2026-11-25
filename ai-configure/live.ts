@@ -35,7 +35,7 @@ export interface LiveLine {
  * 为什么要有它：以前是「拿到槽位才建小票」，排队中的任务在面板上**完全看不见**，
  * 用户以为派出去的活丢了。现在先建小票再排队，排队期间就显示「⏳ 排队中」。
  */
-export type JobStatus = "running" | "queued" | "done" | "failed" | "timeout";
+export type JobStatus = "running" | "queued" | "done" | "failed" | "timeout" | "partial";
 
 /** 终态（markEnd 只接受这几个，杜绝把 "running" / "queued" 传进去） */
 export type EndStatus = Exclude<JobStatus, "running" | "queued">;
@@ -558,6 +558,8 @@ function statusIcon(job: LiveJob): { text: string; tone: Tone } {
 			return { text: "✗", tone: "err" };
 		case "timeout":
 			return { text: "⏸", tone: "warn" };
+		case "partial":
+			return { text: "⚠", tone: "warn" };
 		default:
 			return { text: "●", tone: "accent" };
 	}
@@ -637,8 +639,22 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const { width, now, detail } = opts;
 	const icon = statusIcon(job);
 	const idx = job.slotIndex ?? 1;
-	const mark = job.status === "done" ? "✅" : job.status === "failed" || job.status === "timeout" ? "❌" : icon.text;
-	const tone: Tone = job.status === "done" ? "ok" : job.status === "failed" || job.status === "timeout" ? "err" : icon.tone;
+	const mark =
+		job.status === "done"
+			? "✅"
+			: job.status === "failed" || job.status === "timeout"
+				? "❌"
+				: job.status === "partial"
+					? "⚠️"
+					: icon.text;
+	const tone: Tone =
+		job.status === "done"
+			? "ok"
+			: job.status === "failed" || job.status === "timeout"
+				? "err"
+				: job.status === "partial"
+					? "warn"
+					: icon.tone;
 	const elapsed = fmtDur((isActiveStatus(job.status) ? now : (job.endedAt ?? job.lastEventAt)) - job.startedAt);
 	const target = job.paneId ? `  → pane ${job.paneId}` : job.tabId ? `  → tab ${job.tabId}` : "";
 	// 见名知意：`数据库助理#1 · 查订单表结构`（不再写 `sa:` 前缀 —— 对用户是噪音）
@@ -698,7 +714,14 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	} else {
 		head.push({ text: `  ${elapsed}`, tone: "muted" });
 		head.push({
-			text: job.status === "done" ? "  完成" : job.status === "timeout" ? "  超时" : "  失败",
+			text:
+				job.status === "done"
+					? "  完成"
+					: job.status === "timeout"
+						? "  超时"
+						: job.status === "partial"
+							? "  轮数到顶"
+							: "  失败",
 			tone: icon.tone,
 		});
 		// 结束态也标一下：这轮是在面板里看的（分屏卡片走 renderPaneJob，行尾有 → pane xxx）

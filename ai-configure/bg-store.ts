@@ -17,7 +17,11 @@ export interface BgTaskFile {
 	task: string;
 	sessionId: string;
 	startedAt: number;
-	status: "running" | "done" | "timeout" | "failed" | "empty";
+	/**
+	 * `partial` = **跑到了轮数上限**被停下（`superagent.maxTurns`）：
+	 * 不算成功也不算失败 —— 已产出的正文照样归档，卡片标 partial，主会话自己决定要不要 resume。
+	 */
+	status: "running" | "done" | "timeout" | "failed" | "empty" | "partial";
 	resultText?: string;
 	finishedAt?: number;
 	delivered?: boolean;

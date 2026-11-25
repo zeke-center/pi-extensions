@@ -226,6 +226,50 @@ tplMd("mcp-parent", ["name: 父", "desc: x", "mcp: inherit"]);
 tplMd("mcp-kid", ["name: 子（不写 mcp）", "desc: x", "extends: mcp-parent"]);
 tplMd("mcp-kid2", ["name: 子（写 mcp: a）", "desc: x", "extends: mcp-parent", "mcp: a"]);
 
+// ---- 顶部注释 / 空行 / 普通文字 + description 别名（这批修复的 fixture）----
+// 以前 `^---` 死锚文件第一行：只要顶部有注释块，整份模板解析失败返回 null（助理从面板消失）
+writeFileSync(
+	join(asstDir, "top-comment.md"),
+	[
+		"<!--",
+		"字段速查：",
+		"  name          名字（唯一，面板显示这个）",
+		"  cwd           工作目录，${cwd} 表示项目根 ⚠️ → 箭头也在注释里",
+		"-->",
+		"",
+		"---",
+		"name: 顶部注释助理",
+		"description: 只读查数据库。需要 SELECT/表结构时派我",
+		"---",
+		"正文里没有注释",
+		"",
+	].join("\n"),
+	"utf8",
+);
+writeFileSync(
+	join(asstDir, "top-text.md"),
+	["说明第一行（不是字段）", "说明第二行", "", "---", "name: 顶部文字助理", "desc: 老写法描述", "---", "正文", ""].join("\n"),
+	"utf8",
+);
+writeFileSync(
+	join(asstDir, "top-hash.md"),
+	["# 我的助理", "---", "name: 顶部井号助理", "description: 井号行不该进正文", "---", "正文", ""].join("\n"),
+	"utf8",
+);
+writeFileSync(join(asstDir, "no-fm.md"), ["没有 frontmatter", "第二行", ""].join("\n"), "utf8");
+writeFileSync(join(asstDir, "open-fm.md"), ["---", "name: 没结尾", "description: x", ""].join("\n"), "utf8");
+writeFileSync(join(asstDir, "desc-only.md"), ["---", "name: 只有 desc", "desc: 老写法描述", "---", "正文", ""].join("\n"), "utf8");
+writeFileSync(
+	join(asstDir, "description-only.md"),
+	["---", "name: 只有 description", "description: Claude 写法描述", "---", "正文", ""].join("\n"),
+	"utf8",
+);
+writeFileSync(
+	join(asstDir, "both-desc.md"),
+	["---", "name: 两个都写", "desc: 老描述", "description: 新描述", "---", "正文", ""].join("\n"),
+	"utf8",
+);
+
 let allOk = true;
 
 // ---------- 套件 3：board（MCP 栏的表头 / 三态标记） ----------
@@ -430,6 +474,38 @@ allOk =
 			'ok("表单：已挂底座时回填 key", __zef2.value === "role-ops");',
 			'const __zef3 = buildFields({ ...__zargs, extendsKey: "hand-written" }).find((f) => f.key === "extends");',
 			'ok("表单：手写的非底座 extends 不被吃掉", __zef3.options.includes("hand-written") && __zef3.value === "hand-written");',
+			'// ---- 顶部注释 / 空行 / 普通文字：`---` 不在第一行也要能解析 ----',
+			'const __tp = (k) => parseTemplate(__asst(k), k);',
+			'const __tc = __tp("top-comment");',
+			'ok("顶部 <!-- 注释 --> + 空行 → 能解析（不返回 null）", !!__tc);',
+			'ok("顶部注释 → 字段照样生效（name/description）", __tc && __tc.name === "顶部注释助理" && __tc.desc.includes("SELECT"));',
+			'ok("顶部注释 → 不进正文（正文不含注释内容）", __tc && __tc.body === "正文里没有注释" && !__tc.body.includes("字段速查"));',
+			'const __tt = __tp("top-text");',
+			'ok("顶部两行普通文字 + --- → 能解析", !!__tt && __tt.name === "顶部文字助理");',
+			'ok("顶部普通文字 → 不进正文", __tt && __tt.body === "正文");',
+			'const __th = __tp("top-hash");',
+			'ok("顶部 # 注释行 + --- → 能解析", !!__th && __th.desc === "井号行不该进正文");',
+			'ok("完全没有 --- → null", __tp("no-fm") === null);',
+			'ok("只有开头 --- 没结尾 --- → null", __tp("open-fm") === null);',
+			'// ---- desc / description 两个名字都认（老文件写 desc，Claude 写法写 description）----',
+			'ok("desc: 生效（回归）", __tp("desc-only").desc === "老写法描述");',
+			'ok("description: 生效", __tp("description-only").desc === "Claude 写法描述");',
+			'ok("两个都写 → 取 description（跟 Claude 一致）", __tp("both-desc").desc === "新描述");',
+			'const __dfld = buildFields({ ...__zargs, desc: __tp("description-only").desc }).find((f) => f.key === "desc");',
+			'ok("面板 desc 字段显示 description 的值（不是「(没有描述)」）", __dfld.value === "Claude 写法描述");',
+			'// ---- 生成的模板：顶部说明块 + 统一 description:，且能被自己的解析器读回 ----',
+			'const __gen = join(process.env.TPROJ, "gen-tpl.md");',
+			'writeTemplate(__gen, { name: "生成助理", description: "只读查数据库。需要 SELECT/表结构时派我", cwd: process.env.TPROJ, mcp: "inherit, center-pg" }, "生成的正文", templateGuide("生成助理"));',
+			'const __gtxt = readFileSync(__gen, "utf8");',
+			'const __glines = __gtxt.split(/\\r?\\n/).filter((l) => l.trim());',
+			'ok("生成的模板：首个非空行是 <!--", __glines[0] === "<!--");',
+			'ok("生成的模板：用 description:（不是 desc:）", /^description: /m.test(__gtxt) && !/^desc:/m.test(__gtxt));',
+			'const __gt = parseTemplate(__gen, "gen-tpl");',
+			'ok("生成的模板：能被自己读回（name/description/mcp）", !!__gt && __gt.name === "生成助理" && __gt.desc.includes("SELECT") && JSON.stringify(__gt.mcp) === JSON.stringify(["center-pg"]) && __gt.mcpInherit === true);',
+			'ok("生成的模板：正文往返一致（注释块没混进正文）", __gt.body === "生成的正文" && !__gt.body.includes("字段速查"));',
+			'// 注释块里含中文 / 箭头 / ${cwd} → 不被当成字段（否则 name 会被解析成「名字（唯一，面板显示这个）」）',
+			'ok("顶部注释里的中文/箭头/${cwd} 不被当成字段", __gt.name === "生成助理" && __gt.desc.includes("SELECT") && !__gt.desc.includes("Router"));',
+			'ok("再次写入：顶部说明块不叠两层", (() => { writeTemplate(__gen, { description: "改过的描述" }, undefined, templateGuide("生成助理")); return readFileSync(__gen, "utf8").split("<!--").length - 1 === 1; })());',
 			'// 底座只读：commitForm 必须拒（防绕过 /assistants edit）',
 			'const __znotes = [];',
 			'await commitForm({ ui: { notify: (m) => __znotes.push(String(m)) } }, { form: { values: { key: "hacked" } }, cwd: process.env.TPROJ, original: { base: true, key: "role-ops" } });',
@@ -790,6 +866,48 @@ allOk =
 			'clearInterval(rcpKeepAlive);',
 		],
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-receipt") },
+	) && allOk;
+
+// ---------- 套件：轮数上限（80% 只发一次 / 到顶停 + partial）----------
+// v2.6.0：worker 会一直「再查一点」，把额度烧在探索上却不交结论。
+// 这里钉死：轮数 = 会话 jsonl 的 assistant 条数；80% 只催一次；到 100% 停 worker；
+// resume 的旧账不算进本次轮数（否则卡片上「resume 接着干」是假的）。
+bundle("delegate.ts", "delegate-turns.mjs");
+allOk =
+	runSuite(
+		"delegate：轮数上限（countAssistantTurns / 80% 只发一次 / 到顶 partial）",
+		join(tmp, "delegate-turns.mjs"),
+		[
+			'const trnKeepAlive = setInterval(() => {}, 50);',
+			'const trnDir = join(tmpdir(), "turn-sess-" + Math.random().toString(36).slice(2, 8));',
+			'mkdirSync(trnDir, { recursive: true });',
+			'const trnFile = (sid) => join(trnDir, "20260101-000000-1_" + sid + ".jsonl");',
+			'const asst = (i) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "第" + i + "轮" }] } }) + String.fromCharCode(10);',
+			'const user = (t) => JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: t }] } }) + String.fromCharCode(10);',
+			'const push = (f, s) => writeFileSync(f, readFileSync(f, "utf8") + s, "utf8");',
+			'writeFileSync(trnFile("sid-count"), user("干活") + asst(1) + "不是 JSON 的半行" + String.fromCharCode(10) + asst(2) + asst(3), "utf8");',
+			'ok("轮数：countAssistantTurns 数 assistant 消息（user / 坏行不算）", countAssistantTurns(trnFile("sid-count")) === 3);',
+			'ok("轮数：文件不存在 / 没传 → 0（宁可漏杀也不误杀）", countAssistantTurns(join(trnDir, "nope.jsonl")) === 0 && countAssistantTurns(undefined) === 0);',
+			'writeFileSync(trnFile("sid-warn"), "", "utf8");',
+			'const trnSent = [];',
+			'let trnN = 0;',
+			'const trnWarn = await waitPaneDone({ index: 1, paneId: "w9:tw", where: "main" }, trnDir, "sid-warn", 20000, undefined, true, { read: () => { trnN += 1; push(trnFile("sid-warn"), asst(trnN)); return { ok: true, text: "π 输入框" }; }, alive: () => true, sampleMs: 10, receiptStableMs: 999999, maxTurns: 5, sendKeys: (p, k) => { trnSent.push(k); return true; } });',
+			'ok("轮数：到顶 → outcome=partial（不是 done/timeout）", trnWarn.outcome === "partial");',
+			'ok("轮数：80% 提醒只发一次（5 轮上限 → 第 4 轮催）", trnSent.length === 1);',
+			'ok("轮数：pane 提醒是单行（换行会被当成回车把半句先提交）", trnSent.length === 1 && !String(Array.isArray(trnSent[0]) ? trnSent[0][0] : trnSent[0]).includes(String.fromCharCode(10)));',
+			'ok("轮数：提醒文案带轮数（4/5）+ 要求收尾", JSON.stringify(trnSent).includes("轮数提醒") && JSON.stringify(trnSent).includes("4/5"));',
+			'ok("轮数：到顶时已产出的正文照样带出（不丢）", /第\\d+轮/.test(trnWarn.text));',
+			'ok("轮数：stallLog 记下到顶（可排查）", trnWarn.stallLog.some((s) => s.includes("到上限 5 轮")));',
+			'writeFileSync(trnFile("sid-resume"), asst(1) + asst(2) + asst(3) + asst(4), "utf8");',
+			'const trnOld = await waitPaneDone({ index: 1, paneId: "w9:tr", where: "main" }, trnDir, "sid-resume", 300, undefined, true, { read: () => ({ ok: true, text: "π 输入框" }), alive: () => true, sampleMs: 10, receiptStableMs: 999999, maxTurns: 5 });',
+			'ok("轮数：resume 的旧消息不算进本次（否则「resume 接着干」是假的）", trnOld.outcome === "timeout");',
+			'ok("轮数：partial 的 pane 处置 = 关掉（worker 必须真停）", planPaneFinish({ outcome: "partial", keepOnError: true }) === "close");',
+			'const trnF = finalizeHerdrRun({ outcome: "partial", text: "半截正文" });',
+			'ok("轮数：partial 落盘终态 = partial + reason=turn-limit", trnF.status === "partial" && trnF.reason === "turn-limit");',
+			'ok("轮数：partial 也带正文（正文照样归档）", /半截正文/.test(String(trnF.resultText)));',
+			'clearInterval(trnKeepAlive);',
+		],
+		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-turns") },
 	) && allOk;
 
 // ---------- 套件 1.7：保留 pane 的处置（停 / 列出 / 关闭 / 回收 / TTL）----------
@@ -1974,6 +2092,22 @@ allOk =
 		'ok("影子·空继承：mcpServers 为空且不报错", (!mInh0.mcpServers || Object.keys(mInh0.mcpServers).length === 0) && sInh0.errors.length === 0 && sInh0.inherited.length === 0);',
 		'const sFb = buildShadow("兜底助理", ["proj-db"], pool, { inheritServers: mainMcp, runSuffix: "fb" });',
 		'ok("影子·兜底：点名但池里没有、主会话有 → 不报 missing", sFb.missing.length === 0 && sFb.names.includes("proj-db"));',
+		'// ---- v2.6.0：压缩窗口（%）→ 影子 settings.json 的 compaction.reserveTokens ----',
+		'writeFileSync(join(dir, "settings.json"), JSON.stringify({ theme: "dark", packages: ["git:x"], compaction: { enabled: true, keepRecentTokens: 12345 } }), "utf8");',
+		'const sCmp = buildShadow("压缩助理", [], pool, { compactPercent: 60, contextWindow: 200000, runSuffix: "cmp" });',
+		'const stCmp = JSON.parse(readFileSync(join(sCmp.dir, "settings.json"), "utf8"));',
+		'ok("影子·压缩：60% × 200k → reserveTokens = 80000", !!stCmp.compaction && stCmp.compaction.reserveTokens === 80000);',
+		'ok("影子·压缩：其它设置照旧（theme 还在、packages 仍被剔掉）", stCmp.theme === "dark" && stCmp.packages === undefined && sCmp.errors.length === 0);',
+		'ok("影子·压缩：用户原有的 compaction 字段不被冲掉（enabled / keepRecentTokens）", stCmp.compaction.enabled === true && stCmp.compaction.keepRecentTokens === 12345);',
+		'writeFileSync(join(dir, "settings.json"), JSON.stringify({ theme: "dark", packages: ["git:x"] }), "utf8");',
+		'const sCmp0 = buildShadow("压缩关助理", [], pool, { compactPercent: 0, contextWindow: 200000, runSuffix: "cmp0" });',
+		'ok("影子·压缩：percent=0 → 不写 compaction（用 pi 默认）", JSON.parse(readFileSync(join(sCmp0.dir, "settings.json"), "utf8")).compaction === undefined);',
+		'const sCmpW = buildShadow("压缩缺窗口助理", [], pool, { compactPercent: 60, runSuffix: "cmpw" });',
+		'ok("影子·压缩：拿不到模型窗口 → 不瞎写，且给 warning", JSON.parse(readFileSync(join(sCmpW.dir, "settings.json"), "utf8")).compaction === undefined && sCmpW.warnings.some((w) => w.includes("压缩")));',
+		'ok("压缩换算：60% × 200k = 80000（reserveTokens）", compactReserveTokens(60, 200000) === 80000);',
+		'ok("压缩换算：越界百分比被夹（10 → 30%，200 → 95%）", compactReserveTokens(10, 100000) === 70000 && compactReserveTokens(200, 100000) === 5000);',
+		'ok("压缩补丁：percent<=0 / 没窗口 → undefined（不写坏值）", compactSettingsPatch(0, 200000) === undefined && compactSettingsPatch(60, undefined) === undefined);',
+		'ok("压缩补丁：正常 → {compaction:{reserveTokens}}", JSON.stringify(compactSettingsPatch(60, 200000)) === JSON.stringify({ compaction: { reserveTokens: 80000 } }));',
 		'ok("影子：cutoff 极大时不误删", reapStaleShadowDirs(365 * 24 * 60 * 60 * 1000) === 0 && existsSync(s3.dir));',
 		"const removed = reapStaleShadowDirs(-1);",
 		'ok("影子：cutoff 为负时全部回收", removed >= 3 && !existsSync(s1.dir) && !existsSync(s2.dir));',
@@ -2077,6 +2211,38 @@ allOk =
 			`ok("回执：宽松模式不标证据", reportHeadline({ ok: true, verdict: "pass", changed: [], ran: [], blocked: [], notes: "" }, "loose").includes("无命令证据") === false);`,
 		],
 		{ PI_CODING_AGENT_DIR: join(tmp, "agent-superagent") },
+	) && allOk;
+
+// ---------- 套件：superagent 轮数上限 / worker 压缩窗口（v2.6.0 纯函数） ----------
+bundle("superagent.ts", "superagent-turns.mjs");
+allOk =
+	runSuite(
+		"superagent：轮数上限（默认 60 / 夹 5~500 / 80% 只催一次）+ 压缩窗口（60 / 0=不设 / 30~95）",
+		join(tmp, "superagent-turns.mjs"),
+		[
+			'const __turnAgent = process.env.PI_CODING_AGENT_DIR;',
+			'mkdirSync(__turnAgent, { recursive: true });',
+			'ok("轮数：默认 60", MAX_TURNS_DEFAULT === 60 && clampMaxTurns(undefined) === 60);',
+			'ok("轮数：坏值 → 默认 60（不把 NaN 当上限）", clampMaxTurns("abc") === 60 && clampMaxTurns(NaN) === 60);',
+			'ok("轮数：下夹 5 / 上夹 500", clampMaxTurns(1) === 5 && clampMaxTurns(9999) === 500);',
+			'ok("轮数：范围内四舍五入", clampMaxTurns(12.6) === 13);',
+			'ok("轮数：模板覆盖全局（100 > 60）", resolveMaxTurns(100, 60) === 100);',
+			'ok("轮数：模板没写 → 全局", resolveMaxTurns(undefined, 30) === 30);',
+			'ok("轮数：都没写 → 默认 60", resolveMaxTurns(undefined, undefined) === 60);',
+			'ok("轮数：模板写 1 → 夹到 5（不会被当成「没写」）", resolveMaxTurns(1, 60) === 5);',
+			'ok("软着陆：60 → 48（80%）", turnWarnAt(60) === 48);',
+			'ok("软着陆：100 → 80", turnWarnAt(100) === 80);',
+			'ok("轮数动作：47 继续 / 48 催 / 59 继续 / 60 停", turnAction(47, 60, false) === "none" && turnAction(48, 60, false) === "warn" && turnAction(59, 60, true) === "none" && turnAction(60, 60, true) === "stop");',
+			'ok("轮数动作：提醒只发一次（warned=true 后不再 warn）", turnAction(48, 60, true) === "none" && turnAction(55, 60, true) === "none");',
+			'ok("轮数动作：坏 turns → none（不会误杀）", turnAction(undefined, 60, false) === "none");',
+			'ok("压缩窗口：默认 60 / 0 保留 / 越界夹 30~95 / 坏值→60", WORKER_COMPACT_DEFAULT === 60 && clampWorkerCompactPercent(0) === 0 && clampWorkerCompactPercent(-5) === 0 && clampWorkerCompactPercent(10) === 30 && clampWorkerCompactPercent(200) === 95 && clampWorkerCompactPercent("x") === 60);',
+			'ok("配置：没写过 → 轮数 60 / 压缩 60（默认值）", readMaxTurns() === 60 && readWorkerCompactPercent() === 60);',
+			'writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "ai-extensions.json"), JSON.stringify({ superagent: { maxTurns: 100, workerCompactPercent: 0 } }), "utf8");',			'ok("配置：superagent.maxTurns=100 → 100", readMaxTurns() === 100);',
+			'ok("配置：workerCompactPercent=0 → 0（不设，用 pi 默认）", readWorkerCompactPercent() === 0);',
+			'writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "ai-extensions.json"), JSON.stringify({ superagent: { maxTurns: 3, workerCompactPercent: 10 } }), "utf8");',
+			'ok("配置：越界也被夹（3 → 5，10 → 30）", readMaxTurns() === 5 && readWorkerCompactPercent() === 30);',
+		],
+		{ PI_CODING_AGENT_DIR: join(tmp, "agent-turns-cfg") },
 	) && allOk;
 
 // ---------- 套件：superagent 回执约束（reportRuleLines / reportRule 长短与开关） ----------

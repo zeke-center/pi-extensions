@@ -45,13 +45,18 @@ import { Type } from "typebox";
 import { type FormResult, type FormField, type FormPage, showForm, type PickItem, pickFromList } from "./form";
 import {
 	batchLiveEnabled,
+	clampMaxTurns,
 	parseReport,
 	readSuperAgent,
 	readMaxConcurrent,
+	readMaxTurns,
+	readWorkerCompactPercent,
 	reportHeadline,
 	reportRule,
+	resolveMaxTurns,
 	setRouterSession,
 	superagentEnabled,
+	turnAction,
 	type RouterMode,
 	type WorkerReport,
 } from "./superagent";
@@ -155,6 +160,8 @@ interface Template {
 	mcpInherit: boolean;
 	/** 默认超时毫秒（frontmatter.timeout，如 10m / 90s）；调用参数仍可覆盖 */
 	timeoutMs?: number;
+	/** 最多轮数（frontmatter.maxTurns）。不写 = 用全局配置（`superagent.maxTurns`，默认 60） */
+	maxTurns?: number;
 	/** 继承的父模板 key（frontmatter.extends） */
 	extends?: string;
 	/** base:true → 只给 extends 用，不直接派发（undefined = 没写） */
@@ -197,7 +204,11 @@ interface Names {
 	id: string;
 }
 
-type Outcome = "done" | "timeout" | "failed" | "empty" | "busy";
+/**
+ * `partial` = 跑到轮数上限（`superagent.maxTurns`）被停下：既不算成功也不算失败，
+ * 已产出的正文照样归档，卡片 / `.bg` 标 `partial`（主会话自己决定要不要 resume）。
+ */
+type Outcome = "done" | "timeout" | "failed" | "empty" | "busy" | "partial";
 /** pane 里等到的结局：多一个 "stalled"（看门狗收掉的）—— 它不对应 RunResult.outcome，而是**转降级 rpc 重跑** */
 type PaneOutcome = Outcome | "stalled";
 
@@ -226,6 +237,8 @@ interface RunResult {
 	resumed: boolean;
 	/** pane 这条路降级过（派发失败 / 卡死 / 槽位等不到）→ 批次汇总卡里标 ⚠️ */
 	degradeNote?: string;
+	/** 本次运行实际生效的轮数上限（模板 maxTurns 覆盖全局；卡片文案用） */
+	maxTurns?: number;
 }
 
 // ======================= 模板加载 =======================
@@ -288,6 +301,23 @@ function parseBool(v: string, dflt: boolean): boolean {
 	return dflt;
 }
 
+/**
+ * 找 frontmatter 的边界：返回 [开头 --- 的行号, 结尾 --- 的行号]，找不到返回 null。
+ *
+ * 只认「整行恰好是 ---」（允许首尾空白），**不要求它出现在文件第一行**：
+ * 现成助理文件普遍在顶部写了「字段速查」HTML 注释块 / 空行 / 一行标题，
+ * 以前死锚 `^---` 会整份解析失败返回 null —— 助理直接从面板上消失。
+ */
+/** desc 空了时的占位符。Router 靠 desc 挑人，所以列表/编辑页要能明显看出「这个助理挑不到」 */
+const DESC_MISSING = "(没有描述)";
+function frontmatterSpan(lines: string[]): [number, number] | null {
+	const isDelim = (l: string): boolean => l.trim() === "---";
+	const start = lines.findIndex(isDelim);
+	if (start < 0) return null;
+	for (let i = start + 1; i < lines.length; i++) if (isDelim(lines[i])) return [start, i];
+	return null; // 只有开头 --- 没有结尾 --- → 不算 frontmatter（保持原行为）
+}
+
 /** 极简 frontmatter 解析：--- 之间是 key: value，其余是正文 */
 function parseTemplate(file: string, key: string): Template | null {
 	let raw: string;
@@ -296,12 +326,13 @@ function parseTemplate(file: string, key: string): Template | null {
 	} catch {
 		return null;
 	}
-	const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+	const lines = raw.split(/\r?\n/);
+	const span = frontmatterSpan(lines);
 	const meta: Record<string, string> = {};
 	let body = raw;
-	if (m) {
-		body = raw.slice(m[0].length);
-		for (const line of m[1].split(/\r?\n/)) {
+	if (span) {
+		body = lines.slice(span[1] + 1).join("\n"); // 开头那块注释/空行/文字一律丢弃（也不进正文）
+		for (const line of lines.slice(span[0] + 1, span[1])) {
 			const i = line.indexOf(":");
 			if (i <= 0) continue;
 			const k = line.slice(0, i).trim().toLowerCase();
@@ -310,8 +341,13 @@ function parseTemplate(file: string, key: string): Template | null {
 		}
 	}
 
+	// desc 与 description 都认：本项目的模板一直写 `desc:`，但大量现成文件（以及 Claude 的
+	// subagent 写法）用的是 `description:` —— 只认 desc 会让它们全变成「(没有描述)」，Router 挑不到人。
+	// 两个都写时以 `description` 为准（跟 Claude 的取法一致）。
+	const desc = meta.description || meta.desc;
+
 	// cwd 可以由 extends 继承、也可以省略（省略 = 跟随当前项目），所以只有「什么都没写」才算无效模板
-	if (!meta.cwd && !meta.extends && !meta.name && !meta.desc) return null;
+	if (!meta.cwd && !meta.extends && !meta.name && !desc) return null;
 
 	// mcp：`inherit` 是保留字，挑出来单独一个布尔（不是候选池里的名字）
 	const mcpRaw = meta.mcp ? splitList(meta.mcp) : [];
@@ -322,12 +358,14 @@ function parseTemplate(file: string, key: string): Template | null {
 	return {
 		key,
 		name: meta.name || key,
-		desc: meta.desc || "(没有描述)",
+		desc: desc || DESC_MISSING,
 		cwd: meta.cwd ? expandHome(meta.cwd) : "",
 		model: meta.model || undefined,
 		mcp: mcpNames,
 		mcpInherit,
 		timeoutMs: meta.timeout ? parseDuration(meta.timeout) : undefined,
+		// frontmatter 的键会先被 toLowerCase()，所以 `maxTurns:` 到这里是 `maxturns`
+		maxTurns: meta.maxturns || meta.max_turns ? clampMaxTurns(meta.maxturns ?? meta.max_turns) : undefined,
 		extends: meta.extends || undefined,
 		base: meta.base ? parseBool(meta.base, false) : undefined,
 		demo: meta.demo ? parseBool(meta.demo, false) : undefined,
@@ -377,6 +415,7 @@ function resolveTemplate(t: Template, byKey: Map<string, Template>, seen: Set<st
 		mcp: mcpDeclared ? t.mcp : p.mcp,
 		mcpInherit: mcpDeclared ? t.mcpInherit : p.mcpInherit,
 		timeoutMs: t.timeoutMs ?? p.timeoutMs,
+		maxTurns: t.maxTurns ?? p.maxTurns,
 		mcpExposure: t.mcpExposure ?? p.mcpExposure,
 		tools: t.tools?.length ? t.tools : p.tools,
 		denyTools: t.denyTools?.length ? t.denyTools : p.denyTools,
@@ -615,6 +654,13 @@ const argv = JSON.parse(process.env.PI_DELEGATE_ARGV || "[]");
 const ppid = Number(process.env.PI_DELEGATE_PPID || "0");
 if (!argv.length || !ppid) process.exit(2);
 const child = spawn(process.execPath, argv, { stdio: "inherit", shell: false });
+/** 进程还活着吗（pid 有效且无 ESRCH）。用于"别杀活人"的兜底。 */
+function pidAlive(pid) {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) {
+    return (e && e.code) === "EPERM"; // EPERM = 存在但没权限 → 视为活着
+  }
+}
 let stopped = false;
 function stop() {
   if (stopped) return;
@@ -623,8 +669,23 @@ function stop() {
   try { child.kill("SIGKILL"); } catch (e) {}
   process.exit(0);
 }
+let deadHits = 0;                // 连续「父进程确认已退出」的次数
+let parentSeenAt = Date.now();   // 最后一次确认父进程还活着的时刻（确认活着就刷新）
 const timer = setInterval(function () {
-  try { process.kill(ppid, 0); } catch (e) { stop(); }
+  // ---- 先探活：父进程还活着就绝不杀 -------
+  // 以前是 try/kill(ppid,0)/catch stop() —— 一次抖动 / EPERM 就 SIGKILL 正在干活的 worker。
+  if (pidAlive(ppid)) { deadHits = 0; parentSeenAt = Date.now(); return; }
+  // 探活失败 ≠ 已经死了：只有 ESRCH（pidAlive 返回 false）才算，且要连续 2 次（约 4s）。
+  deadHits += 1;
+  if (deadHits < 2) {
+    console.error("[看门狗] 父进程 pid " + ppid + " 探活失败（第 " + deadHits + " 次，可能是抖动/EPERM），先不杀 worker");
+    return;
+  }
+  // ---- 到这里才认「父进程死了」：worker 还活着就记一行，然后收掉（不留孤儿）----
+  if (pidAlive(child.pid)) {
+    console.error("[看门狗] 父进程 pid " + ppid + " 已退出（最后确认活着：" + parentSeenAt + "）→ 收掉 worker pid " + child.pid);
+  }
+  stop();
 }, 2000);
 child.on("close", function (code) { clearInterval(timer); process.exit(code === null ? 1 : code); });
 child.on("error", function () { clearInterval(timer); process.exit(1); });
@@ -768,6 +829,48 @@ function windDownText(secLeft: number): string {
 }
 
 /**
+ * 轮数用到 80% 时的提醒（走 RPC 的 steer，**整个运行只发一次**）。
+ *
+ * 为什么需要：时间提醒只看墙钟，轮数提醒看「它改了多少次主意」——
+ * 一个 worker 可能时间还剩一半，却已经把 60 轮里的 50 轮花在来回读同一个目录上。
+ * 这时它不知道“额度快没了”，会继续「再查一点」，最后一轮都交不出结论。
+ */
+function turnWarnText(turns: number, maxTurns: number): string {
+	return [
+		`【轮数提醒】你已用 ${turns}/${maxTurns} 轮（上限的 80% 已过）。`,
+		"立刻停止探索：不要再开新的排查方向，不要再读新文件。",
+		"把**已经确认**的结论、改了哪些文件、跑过什么，按交卡格式交回来。",
+		"到 100% 会被直接停下，那时只剩余额里已经写出来的内容。",
+	].join("\n");
+}
+
+/**
+ * 同上，但压成**一行**。
+ *
+ * 为什么 pane 模式要单行：pane 里靠 `pane send-keys` 敲进 pi 的输入框，
+ * 换行符会被当成回车把半句话先提交出去（主会话就收到几条碎消息）。
+ */
+function turnWarnLine(turns: number, maxTurns: number): string {
+	return (
+		`【轮数提醒】你已用 ${turns}/${maxTurns} 轮（已过 80%）。` +
+		"立刻停止探索，不要再开新的排查方向；把已经确认的结论 / 改了哪些文件 / 跑过什么按交卡格式交回来。" +
+		"到 100% 会被直接停下。"
+	);
+}
+
+/**
+ * 开场就把轮数上限告诉它（跟 `deadlineRule` 同一个道理：worker 不知道自己在烧额度）。
+ * 写进 `--append-system-prompt`，只占一次 token，不占每轮。
+ */
+function turnRule(maxTurns: number): string {
+	return [
+		`【轮数上限】你最多跑 ${maxTurns} 轮（一轮 = 你的一条回复）。`,
+		"用到 80% 会收到一句提醒；到 100% 会被直接停下（正文照样归档，但卡片标 partial）。",
+		"别把额度花在来回探索上：先给结论，再补证据。",
+	].join("\n");
+}
+
+/**
  * 硬收尾的「追问」文案。
  *
  * 为什么硬档是 `abort` + 追问，而不是只发一个更硬的 steer：
@@ -865,6 +968,11 @@ interface Sink {
 	toolRuns: ToolRunBrief[];
 	/** 实时视图：每个事件同时喂给它，面板才看得到「它现在在干什么」 */
 	live?: LiveJob;
+	/**
+	 * 已经跑了几轮（= assistant 消息条数）。rpc / 旧 json 两条路都靠 `handleEvent` 累加，
+	 * 轮数上限（`superagent.maxTurns`）和 80% 收尾提醒都读它。
+	 */
+	turns: number;
 }
 
 function clampTail(s: string, limit: number): string {
@@ -1094,6 +1202,9 @@ export function finalizeHerdrRun(input: HerdrFinalizeInput): HerdrFinalizeFields
 		return fields("failed", "error", input.error);
 	}
 	switch (input.outcome) {
+		case "partial":
+			// 到轮数上限被停下：既不算失败也不算成功 —— 正文照样归档，卡片标 partial
+			return fields("partial", "turn-limit");
 		case "done":
 			// 跑完了但**没交 `<result>`**：以前会被当成 done 混过去（卡片上看起来“成功”），
 			// 现在明确标 empty —— 既不是 failed，也绝不留在 running。
@@ -1363,6 +1474,7 @@ function handleEvent(obj: EventRecord, sink: Sink): void {
 			sink.tools.push(String(ev.toolCall.name));
 		}
 	} else if (obj.type === "message_end" && obj.message?.role === "assistant") {
+		sink.turns += 1; // 一轮 = 它的一条 assistant 回复（轮数上限就数这个）
 		const t = extractText(obj.message.content);
 		if (t) sink.final = t;
 	} else if (obj.type === "tool_execution_start") {
@@ -2263,8 +2375,39 @@ export type PaneFinishPlan = "close" | "stop-keep";
 export function planPaneFinish(input: { outcome: string; aborted?: boolean; keepOnError: boolean }): PaneFinishPlan {
 	if (input.outcome === "done") return "close";
 	if (input.outcome === "empty") return "close";
+	// 到轮数上限：worker 得**停掉**（它还在 pane 里等着继续跑），所以直接关
+	if (input.outcome === "partial") return "close";
 	// ESC 中止（aborted）和超时/失败一样处理：**必须先把里面的 pi 停掉**，否则 pane 里留个活进程
 	return input.keepOnError ? "stop-keep" : "close";
+}
+
+/**
+ * 会话 jsonl 里已经跑了几轮（= `message` 且 `role: assistant` 的条数）。
+ *
+ * 为什么数 jsonl 而不数事件：pane 分支根本没有事件流（pi 在 pane 里是全屏 TUI），
+ * 只能靠它自己写的会话文件。rpc 分支则直接数事件（见 `runAssistant`）。
+ * 读不到文件 / 行不是 JSON → 当作 0（宁可漏杀，也别因误读把活掐了）。
+ */
+export function countAssistantTurns(file: string | undefined): number {
+	if (!file) return 0;
+	let lines: string[];
+	try {
+		lines = readFileSync(file, "utf8").split(/\r?\n/);
+	} catch {
+		return 0;
+	}
+	let n = 0;
+	for (const line of lines) {
+		const s = line.trim();
+		if (!s || s.charCodeAt(0) !== 123 /* { */) continue;
+		try {
+			const o = JSON.parse(s) as { type?: string; message?: { role?: string } };
+			if (o.type === "message" && o.message?.role === "assistant") n += 1;
+		} catch {
+			/* 半行 / 非 JSON → 跳过 */
+		}
+	}
+	return n;
 }
 
 /**
@@ -2278,17 +2421,28 @@ export interface PaneWaitOps {
 	read(paneId: string): { ok: boolean; text: string };
 	/** pane 还在吗 */
 	alive(paneId: string): boolean;
+	/** 往 pane 里敲键（80% 收尾提醒用；默认 `paneSendKeys`，单测注入假桩） */
+	sendKeys?(paneId: string, keys: string | string[]): boolean;
 	/** 采样 / 抛错重试间隔（默认 `PANE_SAMPLE_MS`；单测注入小值，生产别改） */
 	sampleMs?: number;
 	/** 回执稳定窗口（默认 `PANE_RECEIPT_STABLE_MS`；单测注入小值，生产别改） */
 	receiptStableMs?: number;
 	/** 连续读失败后的降频间隔（默认 `PANE_SAMPLE_SLOW_MS`；单测注入小值，生产别改） */
 	slowSampleMs?: number;
+	/**
+	 * 轮数上限（`superagent.maxTurns`）。给了就数会话 jsonl 的 assistant 条数，
+	 * 到 80% 发一次「开始收尾」（`paneSendKeys`），到 100% 返回 `partial`。
+	 *
+	 * 基线：第一次读到会话文件时记下当前条数，只算**本次**新增的 —— 否则 resume 一个
+	 * 已经跑满的会话会立刻被砍（卡片上白写着「resume 能接着干」）。
+	 */
+	maxTurns?: number;
 }
 
 const realPaneWaitOps: PaneWaitOps = {
 	read: (paneId) => paneReadEx(paneId),
 	alive: (paneId) => paneList().some((p) => p.paneId === paneId),
+	sendKeys: (paneId, keys) => paneSendKeys(paneId, keys),
 };
 
 /**
@@ -2319,6 +2473,11 @@ export async function waitPaneDone(
 	// 降频档：生产固定 2000ms；单测注入小值（否则真睡 2s，把用例拖慢）
 	const slowSampleMs = Number.isFinite(ops.slowSampleMs) ? Number(ops.slowSampleMs) : PANE_SAMPLE_SLOW_MS;
 	const receiptStableMs = Number.isFinite(ops.receiptStableMs) ? Number(ops.receiptStableMs) : PANE_RECEIPT_STABLE_MS;
+	const maxTurns = Number(ops.maxTurns);
+	const turnLimit = Number.isFinite(maxTurns) && maxTurns > 0 ? clampMaxTurns(maxTurns) : 0;
+	/** 轮数基线（第一次读到会话文件时定） + 提醒发过没（**只发一次**） */
+	let baseTurns: number | null = null;
+	let turnWarned = false;
 	let text = "";
 	// ---- 卡死看门狗的账 ----
 	let lastSeen = ""; // 上一次看到的「屏幕 + 会话正文」指纹
@@ -2338,6 +2497,26 @@ export async function waitPaneDone(
 			const file = findSessionFileIn(sessionDir, sessionId);
 			const t = lastAssistantTextIn(file);
 			if (t) text = t;
+			// ---- 轮数上限：80% 催一次收尾 / 到顶就停（已产出的正文照样归档，卡片标 partial）----
+			if (turnLimit) {
+				const turnsNow = countAssistantTurns(file);
+				if (baseTurns === null) baseTurns = turnsNow; // 只算本次新增（resume 的旧账不算）
+				const used = Math.max(0, turnsNow - baseTurns);
+				const action = turnAction(used, turnLimit, turnWarned);
+				if (action === "stop") {
+					stallLog.push(`[轮数] 到上限 ${turnLimit} 轮 → 停下（partial）`);
+					return { outcome: "partial", text: text || ops.read(slot.paneId).text, tail: "", stallLog };
+				}
+				if (action === "warn") {
+					turnWarned = true; // 先记账：发失败也不重发（每轮重复敲字比不发更扰民）
+					stallLog.push(`[轮数] 用到 ${used}/${turnLimit}（过 80%）→ 发一次收尾提醒`);
+					try {
+						(ops.sendKeys ?? paneSendKeys)(slot.paneId, [turnWarnLine(used, turnLimit), "Enter"]);
+					} catch {
+						/* 敲不进去不影响继续跑：到顶照样会停 */
+					}
+				}
+			}
 			const read = ops.read(slot.paneId);
 			const tail = clampTail(read.text, STDERR_LIMIT);
 			const alive = ops.alive(slot.paneId);
@@ -2504,7 +2683,13 @@ async function tryRunInHerdr(
 		try {
 			markEnd(
 				job,
-				outcome === "done" ? "done" : outcome === "timeout" ? "timeout" : "failed",
+				outcome === "done"
+					? "done"
+					: outcome === "timeout"
+						? "timeout"
+						: outcome === "partial"
+							? "partial"
+							: "failed",
 				withDegrade(
 					job,
 					error ??
@@ -2512,7 +2697,9 @@ async function tryRunInHerdr(
 							? "分屏里跑完了（pane 已收起）"
 							: outcome === "timeout"
 								? "超时（pane 留着，要看就切过去）"
-								: "失败（pane 保留，用 /pane-close 关闭）"),
+								: outcome === "partial"
+									? "到轮数上限被停下（pane 已收起，要接着做用 resume）"
+									: "失败（pane 保留，用 /pane-close 关闭）"),
 				),
 			);
 		} catch {
@@ -2653,7 +2840,10 @@ async function tryRunInHerdr(
 		stage = "wait";
 		let res: Awaited<ReturnType<typeof waitPaneDone>>;
 		try {
-			res = await waitPaneDone(slot, opt.sessionDir, opt.names.id, opt.timeoutMs, opt.signal, delivered);
+			res = await waitPaneDone(slot, opt.sessionDir, opt.names.id, opt.timeoutMs, opt.signal, delivered, {
+				...realPaneWaitOps,
+				maxTurns,
+			});
 		} catch (e) {
 			// waitPaneDone 内部已经接住了大部分异常，这里是最后一道：
 			// 绝不让它的 reject 把 run 悬空（以前就是这么静默 reject → 永不 settle）。
@@ -2831,7 +3021,9 @@ function sessionFileFor(key: string, id: string): string | undefined {
 
 async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<RunResult> {
 	const started = Date.now();
-	const sink: Sink = { partial: "", tools: [], final: "", stderr: "", toolRuns: [] };
+	const sink: Sink = { partial: "", tools: [], final: "", stderr: "", toolRuns: [], turns: 0 };
+	/** 本次生效的轮数上限：模板 frontmatter `maxTurns` > 全局配置 > 默认 60 */
+	const maxTurns = resolveMaxTurns(tpl.maxTurns, readMaxTurns());
 	/** 到点前发过的收尾动作（要在 base() 里带上，所以提到这层） */
 	const windDownLog: string[] = [];
 	const base = (outcome: Outcome, exitCode: number | null): RunResult => ({
@@ -2853,6 +3045,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		tpl,
 		task,
 		resumed: opt.resumed,
+		maxTurns,
 	});
 
 	// 同会话互斥：该会话正在别处跑（另一次 resume / 另一个 pi 实例）→ 直接拒绝，绝不起第二个进程。
@@ -2939,6 +3132,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	const body = [
 		tpl.body,
 		deadlineRule(Math.round(opt.timeoutMs / 1000), opt.resumed),
+		turnRule(maxTurns), // 开场就把轮数上限告诉它（worker 不知道自己在烧额度）
 		reportRule(), // Super Agent 开着时要求结构化回执（关着就是空串，等于没加）
 		superagentEnabled() ? permissionRule(tpl.perms, tpl.cwd) : "", // L2：先告诉它边界，别让它靠试
 	]
@@ -2957,6 +3151,15 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	return new Promise<RunResult>((done) => {
 		let timedOut = false;
 		let settled = false;
+		/** 轮数到顶已经叫停过（close 时据此判 partial，而不是 done/timeout） */
+		let turnLimitHit = false;
+		/** 80% 提醒已经发过（**只发一次**） */
+		let turnWarned = false;
+		/**
+		 * 每跑完一轮（assistant 消息）就按轮数上限做一次决策（在收尾块里赋值）。
+		 * 为什么先给空实现：rpc 的事件订阅在下面注册，不能等赋值才接。
+		 */
+		let onTurn: () => void = () => {};
 
 		// ---------- 槽位释放：单次兜底 ----------
 		// 为什么要提前到「子进程退出的那一刻」：回执解析 / 落盘 / 面板收尾都占时间，
@@ -2971,7 +3174,6 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		};
 		/** kill 发出后等不到 close 的兜底（宁可信错，也绝不泄漏槽位） */
 		let escapeTimer: ReturnType<typeof setTimeout> | undefined;
-
 		// ---------- 到点前优雅收尾（RPC 专属状态）----------
 		let softTimer: ReturnType<typeof setTimeout> | undefined;
 		let hardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3018,6 +3220,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			rpc = new RpcChannel(child);
 			rpc.onEvent((rec) => {
 				handleEvent(rec, sink);
+				if (rec.type === "message_end") onTurn();
 				if (rec.type === "agent_settled") {
 					// 硬收尾阶段：这一条 settled 是 `abort` 把它打断产生的 → **不是**收工，而是追问交卡。
 					// 追问那一次跑完后再 settled，才真正收工。
@@ -3061,7 +3264,14 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			opt.signal?.removeEventListener("abort", onAbort);
 			liveJobs.delete(child);
 			// 面板终态：写在这里而不是事件里 —— agent_end 不代表进程结束（可能还会重试/续跑）
-			const liveStatus: EndStatus = outcome === "timeout" ? "timeout" : outcome === "failed" ? "failed" : "done";
+			const liveStatus: EndStatus =
+				outcome === "timeout"
+					? "timeout"
+					: outcome === "failed" || outcome === "busy"
+						? "failed"
+						: outcome === "partial"
+							? "partial"
+							: "done";
 			markEnd(
 				job,
 				liveStatus,
@@ -3069,11 +3279,13 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 					job,
 					outcome === "timeout"
 						? "超时被停止（要接着做用 resume）"
-						: outcome === "empty"
-							? "跑了但没吐结论"
-							: exitCode && exitCode !== 0
-								? `子进程退出码 ${exitCode}`
-								: undefined,
+						: outcome === "partial"
+							? `到轮数上限（${maxTurns} 轮）被停下 —— 要接着做用 resume`
+							: outcome === "empty"
+								? "跑了但没吐结论"
+								: exitCode && exitCode !== 0
+									? `子进程退出码 ${exitCode}`
+									: undefined,
 				),
 			);
 			const r = base(outcome, exitCode);
@@ -3112,6 +3324,33 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			}, ESCAPE_RELEASE_MS);
 			// 纯兜底定时器，不该拖着进程不让退
 			escapeTimer.unref?.();
+		};
+
+		// ---------- 轮数上限（v2.6.0）----------
+		// 80%：发一句「开始收尾」（rpc 走 steer，**整个运行只发一次**）
+		// 100%：停 worker。已产出的正文照样归档，终态标 partial
+		// 旧 `-p --mode json` 是单向的（stdin 已关）→ 发不了提醒，只做到顶停。
+		onTurn = (): void => {
+			if (settled || turnLimitHit) return;
+			const used = sink.turns;
+			const action = turnAction(used, maxTurns, turnWarned);
+			if (action === "warn") {
+				if (!rpc) return; // 单向模式：没有 steer 通道，只能等到顶再停
+				turnWarned = true;
+				windDownLog.push("轮数提醒");
+				rpc.send({ type: "steer", message: turnWarnText(used, maxTurns) });
+				return;
+			}
+			if (action !== "stop") return;
+			turnLimitHit = true;
+			windDownLog.push(`轮数到顶 ${maxTurns}`);
+			try {
+				sink.stderr = clampTail(`${sink.stderr}\n[轮数] 到上限 ${maxTurns} 轮 → 停下（partial）`, STDERR_LIMIT);
+			} catch {
+				/* ignore */
+			}
+			killTree(child);
+			armEscape("partial");
 		};
 
 		const timer = setTimeout(() => {
@@ -3166,7 +3405,10 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		}
 
 		// RPC 路径由 RpcChannel 内部订阅（这里 jsonRead 是 undefined，等于不挂）
-		child.stdout?.on("data", (d: Buffer) => jsonRead?.(d.toString("utf8")));
+		child.stdout?.on("data", (d: Buffer) => {
+			jsonRead?.(d.toString("utf8"));
+			if (!rpc) onTurn(); // 单向模式也数轮：到顶照样停（只是发不了 80% 提醒）
+		});
 		child.stderr?.on("data", (d: Buffer) => {
 			sink.stderr = clampTail(sink.stderr + d.toString("utf8"), STDERR_LIMIT);
 		});
@@ -3182,6 +3424,9 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			if (settled) return;
 			if (opt.signal?.aborted) {
 				finish("failed", code);
+			} else if (turnLimitHit) {
+				// 到轮数上限被我们主动叫停：不是失败也不是超时 —— 正文归档、标 partial
+				finish("partial", code);
 			} else if (timedOut) {
 				finish("timeout", code);
 			} else if (hardWindDownFired) {
@@ -3274,6 +3519,7 @@ const HEADS: Record<Outcome, (name: string, secs: number, extra: string) => stri
 	failed: (n, s, e) => `【${n}】失败（${s}s${e}）`,
 	empty: (n, s) => `【${n}】跑了但没输出（${s}s）`,
 	busy: (n, s) => `【${n}】没启动：会话正忙（${s}s）`,
+	partial: (n, s, m) => `【${n}】到轮数上限被停下${m}（${s}s）`,
 };
 
 function renderCard(r: RunResult): string {
@@ -3337,6 +3583,23 @@ function renderCard(r: RunResult): string {
 				`要接着做就再调一次 delegate，带上 resume: "${r.names.id}" 和补充的时间 —— 它的历史都在，会接着做而不是重做。`,
 			);
 			body = parts.join("\n");
+			break;
+		}
+		case "partial": {
+			const cap = r.maxTurns ?? readMaxTurns();
+			head = HEADS.partial(name, secs, `（maxTurns ${cap}）`);
+			const gave = r.text.trim() || r.partial.trim();
+			body = [
+				`状态: 到轮数上限被停下（partial）—— 它把 maxTurns（${cap} 轮）跑完了还没收尾`,
+				"",
+				gave || "(它连文字都没来得及吐)",
+				"",
+				tools ? `它调用过：${tools}` : "",
+				r.windDownLog.length ? `收尾动作：${r.windDownLog.join(" → ")}` : "",
+				`要接着做就再调一次 delegate，带上 resume: "${r.names.id}" —— 历史都在，会接着干（也可以先调高 maxTurns）。`,
+			]
+				.filter((x) => x !== "")
+				.join("\n");
 			break;
 		}
 		case "failed":
@@ -3529,12 +3792,14 @@ export function buildBatchCard(items: BatchItem[], batchId?: string): string {
 	const degraded = list.filter((i) => Boolean(i.note)).length;
 	const failed = list.filter((i) => !i.note && (i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty")).length;
 	const timedOut = list.filter((i) => !i.note && i.outcome === "timeout").length;
+	const partialN = list.filter((i) => !i.note && i.outcome === "partial").length;
 	const totalMs = list.reduce((m, i) => Math.max(m, Number(i.elapsedMs) || 0), 0);
 	const segs: string[] = [];
 	if (doneOk) segs.push(`${doneOk} 成功`);
 	if (degraded) segs.push(`${degraded} 降级`);
 	if (failed) segs.push(`${failed} 失败`);
 	if (timedOut) segs.push(`${timedOut} 超时`);
+	if (partialN) segs.push(`${partialN} 到轮数上限`);
 	const head = `【批次 ${list.length} 个】${segs.length ? segs.join(" · ") : "没有任务"}（合计 ${Math.round(totalMs / 1000)}s）`;
 
 	const rows = list.map((it, i) => {
@@ -3543,6 +3808,7 @@ export function buildBatchCard(items: BatchItem[], batchId?: string): string {
 		if (it.note) return `⚠️ ${who}  ${oneLine(it.note, BATCH_CONCLUSION_MAX)}`;
 		if (it.outcome === "done") return `✅ ${who}  ${batchConclusion(it.text, it.report)}（${secs}s）`;
 		if (it.outcome === "timeout") return `⏱ ${who}  超时（${secs}s）`;
+		if (it.outcome === "partial") return `⚠️ ${who}  到轮数上限被停下（partial，${secs}s）`;
 		if (it.outcome === "empty") return `❌ ${who}  跑完没输出（${secs}s）`;
 		const why = it.error ? oneLine(it.error, BATCH_CONCLUSION_MAX) : it.outcome === "busy" ? "会话正忙，没启动" : "失败";
 		return `❌ ${who}  ${why}（${secs}s）`;
@@ -3642,6 +3908,7 @@ function batchLiveHeadline(item: BatchItem): string {
 		return line ? oneLine(line, BATCH_LIVE_MAX_CHARS) : "（无结论）";
 	}
 	if (item.outcome === "timeout") return "超时";
+	if (item.outcome === "partial") return "到轮数上限";
 	if (item.outcome === "empty") return "跑完没输出";
 	if (item.outcome === "busy") return "会话正忙，没启动";
 	return oneLine(item.error || "失败", BATCH_LIVE_MAX_CHARS);
@@ -3723,9 +3990,10 @@ function noteBatchItem(batch: BatchState, seq: number, item: BatchItem): void {
 			resultPath: v.resultPath ?? (v.sessionId ? archivePathOf.get(v.sessionId) : undefined),
 		}));
 	const anyFail = items.some((i) => i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty");
+	const anyPartial = items.some((i) => i.outcome === "partial");
 	const allTimeout = items.length > 0 && items.every((i) => i.outcome === "timeout");
 	const card = buildBatchCard(items, batch.id);
-	const status: BgTaskFile["status"] = allTimeout ? "timeout" : anyFail ? "failed" : "done";
+	const status: BgTaskFile["status"] = allTimeout ? "timeout" : anyFail ? "failed" : anyPartial ? "partial" : "done";
 	const finishedAt = Date.now();
 	// 批次汇总卡原文也归档一份（`kind:"batch"`）。
 	// 注意：这里**只归档汇总卡** —— 每个任务的完整正文已经在单任务收尾
@@ -3899,6 +4167,7 @@ function outcomeToStatus(o: Outcome): BgTaskFile["status"] {
 		case "done": return "done";
 		case "timeout": return "timeout";
 		case "empty": return "empty";
+		case "partial": return "partial";
 		case "busy": return "failed";
 		default: return "failed";
 	}
@@ -3924,44 +4193,99 @@ function notFound(ctx: ExtensionContext, cwd: string, what: string): void {
 }
 
 /** 向用户要一行文本（input 不可用就退化成 editor） */
-/** 写模板文件：不认识的键原样保留；body 传了才换正文 */
-function writeTemplate(file: string, updates: Record<string, string | undefined>, body?: string): void {
+
+/**
+ * 新建模板时写在文件最前面的说明块（`---` 之前）。
+ *
+ * 用 HTML 注释包着：解析器会忽略 `---` 之前的一切，所以它不会污染字段、也不会进正文；
+ * 但对人（`/assistants open` 看原文、手改文件）就是一张字段速查表。
+ */
+function templateGuide(name: string): string {
+	return [
+		"<!--",
+		`${name || "(助理名)"} · 助理配置（改完下一次派活生效，不用 reload）`,
+		"",
+		"字段速查：",
+		"  name          名字（唯一，面板显示这个）",
+		"  description   ⚠️ Router 靠它挑人，别空着。写清「什么活该派给我」+ 触发词",
+		"  extends       继承底座（role-dev / role-ops / role-doc / role-review，可省略）",
+		"  cwd           工作目录，${cwd} 表示项目根",
+		"  mcp           要连的 MCP：名字 / inherit（继承主会话）/ 留空=一个不连",
+		"  fs            文件权限：read | write",
+		"  exec          执行权限：none | any | cmds",
+		"  net           联网：none | allow",
+		"  paths         可写目录（fs=write 时生效）",
+		"  timeout       单次超时，如 8m",
+		"  maxTurns      最多轮数（默认 60，到 80% 会被要求收尾）",
+		"",
+		"详细说明见 README「助理模板字段」。",
+		"-->",
+	].join("\n");
+}
+
+/** 同一个字段的别名：写盘统一成左侧那个（`desc` 是老写法，`description` 是 Claude 写法） */
+const TEMPLATE_KEY_ALIAS: Record<string, string> = { desc: "description" };
+
+/** 写模板文件：不认识的键原样保留；body 传了才换正文；传了 guide 就重写顶部说明块 */
+function writeTemplate(
+	file: string,
+	updates: Record<string, string | undefined>,
+	body?: string,
+	guide?: string,
+): void {
 	let raw = "";
 	if (existsSync(file)) raw = readFileSync(file, "utf8");
-	const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
-	const oldBody = fm ? raw.slice(fm[0].length) : raw;
+	const all = raw ? raw.split(/\r?\n/) : [];
+	const span = frontmatterSpan(all); // 顶部允许有注释块/空行（手写的也一样）
+	const oldBody = span ? all.slice(span[1] + 1).join("\n") : raw;
+	const oldTop = span ? all.slice(0, span[0]).join("\n") : "";
+
+	// updates 里的键先归一（`desc` → `description`），否则老文件会同时留下两行同一字段
+	const want: Record<string, string | undefined> = {};
+	for (const [k, v] of Object.entries(updates)) want[TEMPLATE_KEY_ALIAS[k] ?? k] = v;
+
 	const lines: string[] = [];
 	const handled = new Set<string>();
-	if (fm) {
-		for (const line of fm[1].split(/\r?\n/)) {
+	if (span) {
+		for (const line of all.slice(span[0] + 1, span[1])) {
 			const i = line.indexOf(":");
 			if (i <= 0) {
 				if (line.trim()) lines.push(line);
 				continue;
 			}
-			const k = line.slice(0, i).trim().toLowerCase();
+			const rawKey = line.slice(0, i).trim().toLowerCase();
+			const k = TEMPLATE_KEY_ALIAS[rawKey] ?? rawKey;
 			// updates 里出现过的键归我们管：有新值就写，空串 / undefined 就把这行删掉
-			if (k in updates) {
+			if (k in want) {
 				handled.add(k);
-				const v = updates[k];
-				if (v !== undefined && v !== "") lines.push(`${k}: ${v}`);
+				const v = want[k];
+				if (v !== undefined && v !== "") lines.push(`${k}: ${v}`); // 别名就地升级成 description:
 			} else {
 				lines.push(line);
 			}
 		}
 	}
-	for (const [k, v] of Object.entries(updates)) {
+	for (const [k, v] of Object.entries(want)) {
 		if (handled.has(k) || v === undefined || v === "") continue;
 		lines.push(`${k}: ${v}`);
 	}
+
+	// 顶部说明块：传了 guide 就换成新的；没传就原样保留（不叠两层）
+	const top = guide !== undefined ? guide : oldTop.trim() ? oldTop : "";
+	const out: string[] = [];
+	if (top.trim()) out.push(top.trimEnd(), "");
+	out.push("---", ...lines, "---", (body ?? oldBody).trim());
 	mkdirSync(dirname(file), { recursive: true });
-	writeFileSync(file, `---\n${lines.join("\n")}\n---\n${(body ?? oldBody).trim()}\n`, "utf8");
+	writeFileSync(file, `${out.join("\n")}\n`, "utf8");
 }
 
 /** 从助理文件正文里抠出 frontmatter 的 `mcp:` 行（没有这行 → ""）。回读自检用。（导出：单元测试直接用） */
 export function mcpLineInText(text: string): string {
-	const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
-	for (const line of (fm?.[1] ?? "").split(/\r?\n/)) {
+	// 跟 parseTemplate 用同一套边界：开头允许有「字段速查」注释块（新建的模板都带）
+	const all = text.split(/\r?\n/);
+	const span = frontmatterSpan(all);
+	if (!span) return "";
+	for (const line of all.slice(span[0] + 1, span[1])) {
 		const i = line.indexOf(":");
 		if (i > 0 && line.slice(0, i).trim().toLowerCase() === "mcp") return line.slice(i + 1).trim();
 	}
@@ -4112,6 +4436,35 @@ export function modelChoices(ctx: ExtensionContext): string[] {
 	return out;
 }
 
+/**
+ * 当前会话模型的上下文窗口（tokens）—— worker 压缩阈值要靠它换算成 `reserveTokens`。
+ *
+ * 模板指定了别的模型 → 先去可用列表里找它；找不到就返回 undefined。
+ * **不许瞎猜**：把压缩阈值写错比不写更糟（可能每轮都在压 = 上下文全丢）。
+ */
+export function modelContextWindow(ctx: ExtensionContext, modelArg?: string): number | undefined {
+	type M = { provider?: string; id?: string; contextWindow?: number };
+	const win = (m?: M): number | undefined => {
+		const w = Number(m?.contextWindow);
+		return Number.isFinite(w) && w > 0 ? w : undefined;
+	};
+	const q = modelArg ? modelArg.trim() : "";
+	if (!q) return win(ctx.model as M | undefined);
+	const cands: M[] = [];
+	const push = (m?: M): void => {
+		if (m?.id) cands.push(m);
+	};
+	push(ctx.model as M | undefined);
+	try {
+		for (const s of ctx.scopedModels ?? []) push(s.model as M);
+		for (const m of (ctx.modelRegistry?.getAvailable?.() ?? []) as M[]) push(m);
+	} catch {
+		/* 拿不到列表就只剩 ctx.model */
+	}
+	const hit = cands.find((m) => `${m.provider}/${m.id}` === q || m.id === q);
+	return hit ? win(hit) : undefined;
+}
+
 /** 模型行：能枚举出可用模型就给下拉，否则（拿不到）退回手输，别把功能弄坏 */
 function modelField(value: string, options: string[]): FormField {
 	if (!options.length) {
@@ -4181,7 +4534,10 @@ function buildFields(o: {
 			label: "描述",
 			value: o.desc,
 			kind: "long",
-			hint: "(写「什么时候用我」，主 pi 靠它决定派谁 · 回车在面板内编辑)",
+			hint:
+				o.desc.trim() && o.desc !== DESC_MISSING
+					? "(写「什么时候用我」，主 pi 靠它决定派谁 · 回车在面板内编辑)"
+					: "(写「什么时候用我」 · 回车在面板内编辑)\n⚠ 留空会导致 Router 挑不到这个助理（仍可保存）",
 		},
 		{
 			key: "extends",
@@ -4330,9 +4686,11 @@ async function commitForm(
 	const wantMcp = mcpRaw.filter((n) => n.toLowerCase() !== MCP_INHERIT);
 	const mcpValue = [mcpInherit ? MCP_INHERIT : "", ...wantMcp].filter(Boolean).join(", ");
 
+	const nameOut = (v.name ?? "").trim() || key;
 	const updates: Record<string, string | undefined> = {
-		name: (v.name ?? "").trim() || key,
-		desc: (v.desc ?? "").trim(),
+		name: nameOut,
+		// 统一写 `description:`（Claude 写法，也是 Router 真正读的那个）；老文件的 `desc:` 由 writeTemplate 就地升级
+		description: (v.desc ?? "").trim(),
 		cwd: cwdIn,
 		model: normModel(v.model),
 		timeout,
@@ -4371,7 +4729,8 @@ async function commitForm(
 	}
 
 	try {
-		writeTemplate(file, updates, body);
+		// 新建的模板带上顶部字段速查（注释块）：编辑老文件时不重写，避免改动别人的文件头
+		writeTemplate(file, updates, body, o.original ? undefined : templateGuide(nameOut));
 	} catch (e) {
 		ctx.ui.notify(`写入失败：${(e as Error).message}`, "error");
 		return;
@@ -4409,7 +4768,8 @@ function listAssistants(ctx: ExtensionContext, cwd: string): void {
 		`• ${t.key} — ${t.name}\n` +
 		`    ${t.desc}\n` +
 		`    cwd: ${t.cwd}　mcp: ${mcpLabel(t)}　timeout: ${t.timeoutMs ? `${Math.round(t.timeoutMs / 60000)}m` : "默认"}` +
-		(t.extends ? `\n    extends: ${t.extends}` : "");
+		(t.extends ? `\n    extends: ${t.extends}` : "") +
+		(t.desc === DESC_MISSING ? `　⚠ 无描述（/assistants edit ${t.key} 补一句，否则 Router 挑不到它）` : "");
 	const fmtBase = (t: Template): string =>
 		fmt(t) +
 		`\n    → 基于它建：/assistants new <你的名字> ${t.key}　看原文：/assistants show ${t.key}`;
@@ -4544,7 +4904,7 @@ function copyToProject(ctx: ExtensionContext, cwd: string, tpl: Template): void 
 			dest,
 			{
 				name: tpl.name,
-				desc: tpl.desc,
+				description: tpl.desc,
 				cwd,
 				model: tpl.model ?? "",
 				timeout: tpl.timeoutMs ? `${Math.round(tpl.timeoutMs / 60000)}m` : "",
@@ -4562,6 +4922,7 @@ function copyToProject(ctx: ExtensionContext, cwd: string, tpl: Template): void 
 				budget: tpl.perms.budget ?? "",
 			},
 			tpl.body,
+			templateGuide(tpl.name), // 新文件：带上顶部字段速查
 		);
 		ctx.ui.notify(
 			`✓ 已复制到本项目：${dest}\n\n全局那份没动。重新打开面板就能看到「本项目」的它（项目级会覆盖同名的全局）。`,
@@ -5502,12 +5863,14 @@ interface LockInfo {
 	startedAt: number;
 }
 
-function pidAlive(pid: number): boolean {
+/** 进程还活着吗（pid 有效且无 ESRCH）。用于"别杀活人"的兜底。 */
+function pidAlive(pid: number | undefined): boolean {
+	if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException)?.code === "EPERM"; // EPERM = 存在但没权限 → 视为活着
 	}
 }
 
@@ -5864,6 +6227,10 @@ export function setupDelegate(api: ExtensionAPI): void {
 					exposure: tpl.mcpExposure,
 					// `mcp: inherit` → 把主会话那套显式写进影子（不是靠它自己去读）
 					inheritServers: tpl.mcpInherit ? inheritedServers() : undefined,
+					// worker 压缩窗口（%）：换算成 pi 认的 `compaction.reserveTokens` 写进影子 settings.json。
+					// 拿不到模型窗口 → buildShadow 自己跳过并给 warning（不瞎猜 token 数）。
+					compactPercent: readWorkerCompactPercent(),
+					contextWindow: modelContextWindow(ctx, tpl.model),
 					// 每次派发一个独立影子目录：同一个助理并发派发不再互相覆盖 mcp.json
 					runSuffix: Math.random().toString(36).slice(2, 8),
 				});

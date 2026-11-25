@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.9**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.6.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -869,13 +869,58 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 
 文件名（去掉 `.md`）就是 `key`。
 
+#### 文件长什么样（v2.6.0：顶部可以放 `<!-- -->` 说明块）
+
+`---` **之前**可以随便写说明文字，最常见的写法是用 HTML 注释包一块「字段速查」——
+解析器只认第一个 `---` 开始的那块 frontmatter，**前面的内容一律跳过**（v2.6.0 起修好了，
+以前顶部有东西整份模板会失效）。`/assistants new` 新建时就是直接生成下面这份：
+
+```markdown
+<!--
+db · 助理配置（改完下一次派活生效，不用 reload）
+
+字段速查：
+  name          名字（唯一，面板显示这个）
+  description   ⚠️ Router 靠它挑人，别空着。写清「什么活该派给我」+ 触发词
+  extends       继承底座（role-dev / role-ops / role-doc / role-review，可省略）
+  cwd           工作目录，${cwd} 表示项目根
+  mcp           要连的 MCP：名字 / inherit（继承主会话）/ 留空=一个不连
+  fs            文件权限：read | write
+  exec          执行权限：none | any | cmds
+  net           联网：none | allow
+  paths         可写目录（fs=write 时生效）
+  timeout       单次超时，如 8m
+  maxTurns      最多轮数（默认 60，到 80% 会被要求收尾）
+
+详细说明见 README「助理模板字段」。
+-->
+
+---
+name: 数据库助理
+description: 查库表结构、写只读 SQL、排慢查询。用户提到「查数据 / 表结构 / SQL」时用我。
+cwd: ${cwd}
+mcp: inherit
+fs: read
+net: none
+timeout: 8m
+maxTurns: 40
+---
+
+你是一个数据库助理。拿到任务先确认库和表，再动手查。
+```
+
+> 描述写成 `description:` 或老的 `desc:` **都认**（v2.6.0 起；两个都写时以 `description` 为准），
+> 按 Claude 的 subagent 写法写的文件直接能用，不用改。描述留空时 `/assistants` 里会显示
+> `⚠ 无描述` —— Router 就是靠这句话挑人的，空着等于永远选不中（不拦保存，但别留空）。
+
 #### 字段
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `cwd` | | **在哪儿干活**。文件读写、相对路径、项目 `AGENTS.md` 都看它。**省略 = 跟随主进程当前所在的项目目录**（所以模板能跨机器复用，别在里面写死绝对路径） |
 | `name` | | 显示名（中文也行）。省掉用文件名 |
-| `desc` | | **什么时候该叫我**。不只是给人看的 —— 主 pi 就是靠这句话决定派谁，所以写「什么时候用我」，别写「我是谁」 |
+| `description` | | **什么时候该叫我**。不只是给人看的 —— 主 pi 就是靠这句话决定派谁，所以写「什么时候用我」，别写「我是谁」。**旧写法 `desc` 也认**（两个都写时以 `description` 为准） |
+| `maxTurns` | | 这个助理最多跑多少轮（v2.6.0）。留空 = 用全局 `superagent.maxTurns`（默认 60）；模板写了就以模板为准（5~500）。到 80% 会被要求「停止探索、立刻总结」，到顶就停下标 `partial` |
 | `mcp` | | 要挂的 MCP 名字，逗号分隔（`mcp: my-db, my-server`）。**留空 = 一个都不挂**。写 `inherit` = 继承主会话的 MCP，见下 |
 | `timeout` | | 默认超时，如 `10m` / `90s` / `1.5h`。省掉 = 5 分钟 |
 | `model` | | 指定模型（如 `deepseek-v4-pro` 或 `provider/id`）。**留空 = 继承主会话当前模型** |
@@ -1217,6 +1262,8 @@ mcp: my-db
 | `batchLive` | `false` | 批量任务每完成一件就回投一条 **≤60 字**短进度卡（一批最多 4 条） |
 | `maxConcurrent` | `8` | 同时最多跑几个子助理（可调 **1~16**）；**每 4 个占一个 tab**，到这个上限才排队 |
 | `resultsKeepDays` | `30` | 结果归档保留多少天；**`0` = 不清理** |
+| `maxTurns` | `60` | 子助理最多跑多少轮（可调 **5~500**）；**到 80% 自动要求「停止探索，立刻总结并交回执」，到 100% 停掉并标 `partial`**（模板 frontmatter `maxTurns` 可单独覆盖）。轮数是本扩展自己数的（pi 没有 `--max-turns`） |
+| `workerCompactPercent` | `60` | 子助理在上下文用到这个百分比时**提前压缩**（**`0` = 不设，用 pi 自己的默认阈值**；有效范围 30~95）。长任务不再突然「失忆」 |
 
 - **降级**：`split` / `tab` / `auto` 都需要 Herdr；非 Herdr 环境（没装 CLI / 不是交互式 TUI）**自动降级回 `panel`**，不会派成空任务。Super Agent 全局关掉时也强制 `panel`。
 - **布局**（v2.5.7 起**子助理不再占主窗口**）：
@@ -1249,6 +1296,7 @@ mcp: my-db
 | 按 ESC 停不下来 | 以前只跳出等待 | 现在 ESC 也会停掉 pane 里的进程 |
 | 收到「投递未生效」提示 | 流式竞态或主会话忙 | 会自动重试 6 次、退避封顶 60 秒；仍失败看 `/agents bg`，正文用 `/batch <id>` 取 |
 | 卡片只有摘要没有正文 | v2.5.6 设计如此 | 正文在 `~/.pi/agent/results/`，用 `/batch <id>` 看 |
+| **子助理跑 2 分钟就断、回投只有半句话** | v2.6.0 之前：父进程换代 / `/reload` 会触发 SIGKILL，杀的时候没确认进程真死，半路被抹掉 | **v2.6.0 已修**（杀之前先确认进程真死了，实测 183 秒长任务完整跑完）；如仍出现请贴 `herdr.log` 给作者 |
 | 子助理连不上库 / 服务器 | 模板里没写 `mcp:`（默认一个都不连），或名字不在候选池 | 检查是否写了 `mcp:`；想跟主会话一致就写 `mcp: inherit`；改完要**重新派活**（下一次才生效） |
 
 ---

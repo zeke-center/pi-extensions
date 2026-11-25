@@ -179,6 +179,110 @@ export function readMaxConcurrent(): number {
 	return Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(n)));
 }
 
+// ---------------------- 最大轮数（v2.6.0）----------------------
+
+/** 一个 worker 最多跑几轮（= 会话里 assistant 消息条数）。默认 60 */
+export const MAX_TURNS_DEFAULT = 60;
+export const MAX_TURNS_MIN = 5;
+export const MAX_TURNS_MAX = 500;
+/**
+ * 夹取最大轮数：范围内四舍五入；坏值 / 没写 → 默认 60。
+ *
+ * 为什么下限是 5：再小就等于「刚开工就被叫停」，任何多步任务都做不完；
+ * 上限 500：再大基本等于不设上限，只会把额度烧光。
+ */
+export function clampMaxTurns(v: unknown): number {
+	const n = Number(v);
+	if (!Number.isFinite(n)) return MAX_TURNS_DEFAULT;
+	return Math.min(MAX_TURNS_MAX, Math.max(MAX_TURNS_MIN, Math.round(n)));
+}
+
+/**
+ * 生效的最大轮数：**模板 > 全局配置 > 默认 60**（模板 frontmatter `maxTurns` 覆盖全局）。
+ *
+ * 纯函数（单测直接用），不吃配置。
+ */
+export function resolveMaxTurns(templateMax?: number, globalMax?: number): number {
+	const t = Number(templateMax);
+	if (Number.isFinite(t) && t > 0) return clampMaxTurns(t);
+	const g = Number(globalMax);
+	if (Number.isFinite(g) && g > 0) return clampMaxTurns(g);
+	return MAX_TURNS_DEFAULT;
+}
+
+/**
+ * 全局最大轮数（`ai-extensions.json` → `superagent.maxTurns`）。
+ *
+ * 优先级：**模板 frontmatter `maxTurns` > 这里 > 默认 60**（`resolveMaxTurns` 里合并）。
+ * pi 自己**没有** `--max-turns` / `--max-steps` 之类的参数（`pi --help` 里没有，
+ * docs/*.md 也搜不到），所以轮数是本扩展自己数的：worker 的 session jsonl 里
+ * `role:"assistant"` 的消息条数。
+ */
+export function readMaxTurns(): number {
+	const raw = readExtCfg().superagent;
+	const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	return clampMaxTurns(obj.maxTurns);
+}
+
+/** 软着陆比例：轮数用到 80% 就催一次收尾（60 → 48） */
+export const TURN_WARN_RATIO = 0.8;
+
+/** 软着陆轮数：`ceil(80% × maxTurns)` —— 60 → 48（纯函数） */
+export function turnWarnAt(maxTurns: unknown): number {
+	return Math.max(1, Math.ceil(clampMaxTurns(maxTurns) * TURN_WARN_RATIO));
+}
+
+/** `turnAction()` 的结论：继续 / 催一次收尾 / 停 */
+export type TurnAction = "none" | "warn" | "stop";
+
+/**
+ * 这个轮数该做什么（纯函数，单测直接用）。
+ *
+ * - `"stop"`：到 100% → 停 worker。已产出的正文照样归档，卡片标 `partial`
+ * - `"warn"`：首次越过 80% → 发一句「停止探索、立刻交回执」
+ *   ⚠️ **只发一次**：调用方必须把 `warned` 记在本次运行里。
+ *   每轮都发等于每轮都在打断它，活干不完还白烧 token。
+ * - `"none"`：继续跑
+ *
+ * 为什么到顶是「停」而不是再催一次：连 80% 的提醒都没让它收手，后面每多一轮都是纯浪费。
+ */
+export function turnAction(turns: unknown, maxTurns: unknown, warned: boolean): TurnAction {
+	const max = clampMaxTurns(maxTurns);
+	const n = Number(turns);
+	const used = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+	if (used >= max) return "stop";
+	if (!warned && used >= turnWarnAt(max)) return "warn";
+	return "none";
+}
+
+// ---------------------- worker 压缩窗口（v2.6.0）----------------------
+
+/** worker 在上下文用到多少百分比时压缩。默认 60（比 pi 的默认更早收） */
+export const WORKER_COMPACT_DEFAULT = 60;
+export const WORKER_COMPACT_MIN = 30;
+export const WORKER_COMPACT_MAX = 95;
+/**
+ * 夹取压缩百分比。**0 = 不设（用 pi 默认）**，其余夹到 30~95。
+ *
+ * 为什么 0 是合法值：有些人就是想让 worker 用 pi 的默认阈值（16k 预留）。
+ * 为什么下限 30：再早就一直在压缩，等于把上下文全丢掉，活干不完。
+ */
+export function clampWorkerCompactPercent(v: unknown): number {
+	const n = Number(v);
+	if (!Number.isFinite(n)) return WORKER_COMPACT_DEFAULT;
+	const r = Math.round(n);
+	if (r <= 0) return 0; // 显式 0（或负数）= 不设
+	return Math.min(WORKER_COMPACT_MAX, Math.max(WORKER_COMPACT_MIN, r));
+}
+
+/** 全局压缩百分比（`ai-extensions.json` → `superagent.workerCompactPercent`） */
+export function readWorkerCompactPercent(): number {
+	const raw = readExtCfg().superagent;
+	const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	if (obj.workerCompactPercent === undefined) return WORKER_COMPACT_DEFAULT;
+	return clampWorkerCompactPercent(obj.workerCompactPercent);
+}
+
 /** 模式开了没 —— 别的模块统一从这里读 */
 export function superagentEnabled(): boolean {
 	return readSuperAgent().enabled;
@@ -924,6 +1028,41 @@ function registerSuperAgentSettings(): void {
 				patchSuperAgent({
 					maxConcurrent: Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(Number(v) || MAX_CONCURRENT_DEFAULT))),
 				}),
+		},
+		{
+			key: "superagent.maxTurns",
+			group: SUPERAGENT_GROUP,
+			label: "最大轮数",
+			desc:
+				"一个子助理最多跑几轮（= 它会话里 assistant 消息的条数），默认 **60**，范围 5~500。\n\n" +
+				"**软着陆**：到 80%（默认 48 轮）给它发一句「停止探索、立刻交回执」；" +
+				"到 100% 直接停掉 worker，已产出的正文照样归档，卡片标 `⚠ 达到轮数上限（partial）`。\n\n" +
+				"单个助理可以在模板 frontmatter 里写 `maxTurns: 100` 覆盖这里（模板 > 这里 > 默认 60）。\n\n" +
+				"为什么需要它：轮数失控的 worker 会一直「再查一点」，把额度烧在探索上却不交结论。",
+			kind: "number",
+			min: MAX_TURNS_MIN,
+			max: MAX_TURNS_MAX,
+			def: MAX_TURNS_DEFAULT,
+			get: () => readMaxTurns(),
+			set: (v) => patchSuperAgent({ maxTurns: clampMaxTurns(v) }),
+		},
+		{
+			key: "superagent.workerCompactPercent",
+			group: SUPERAGENT_GROUP,
+			label: "Worker 压缩窗口（%）",
+			desc:
+				"子助理的上下文用到 **多少百分比** 时自动压缩，默认 **60**（比 pi 的默认更早收），范围 30~95；" +
+				"**0 = 不设**（用 pi 自己的默认阈值）。\n\n" +
+				"落地方式：pi 只支持绝对 token 阈值（`compaction.reserveTokens`），所以派活时按" +
+				"「100% − 本值」× 当前模型窗口 换算后写进**影子目录的 settings.json**（worker 用 " +
+				"`PI_CODING_AGENT_DIR=<影子>` 跑，只影响子助理，不动你自己的会话）。\n\n" +
+				"拿不到模型窗口时不会瞎写：跳过并在影子目录警告里说明。",
+			kind: "number",
+			min: 0,
+			max: WORKER_COMPACT_MAX,
+			def: WORKER_COMPACT_DEFAULT,
+			get: () => readWorkerCompactPercent(),
+			set: (v) => patchSuperAgent({ workerCompactPercent: clampWorkerCompactPercent(v) }),
 		},
 		{
 			key: "superagent.overflowSlots",
