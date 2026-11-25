@@ -5916,9 +5916,29 @@ function bgDeliveryBigText(t: BgTaskFile, head: string, body: string, path: stri
  * ⚠️ 「大任务只给状态 + 路径」踩过坑：连 1352 字、正文就是 4 行结论的任务也被归档，
  *    主会话和用户都看不到结论 —— 回投的意义（让人知道结果）就没了。
  */
+/**
+ * 补投提示（纯函数）：卡片完成超过 `STALE_DELIVER_MS` 才投出去 → 前面加一行说明。
+ * 返回空串 = 不需要提示（正常实时投递）。
+ */
+export const STALE_DELIVER_MS = 90_000;
+export function staleDeliveryNote(t: BgTaskFile, now: number = Date.now()): string {
+	const doneAt = Number(t.finishedAt) || Number(t.startedAt) || 0;
+	if (!doneAt) return "";
+	const age = now - doneAt;
+	if (age < STALE_DELIVER_MS) return "";
+	const mins = Math.max(1, Math.round(age / 60_000));
+	return `⏳ 补投：这张卡是 ${mins} 分钟前那次运行的结果（不是刚刚跑的），别当成新的`;
+}
+
 function bgDeliveryText(t: BgTaskFile): string {
 	// 批次汇总卡：卡里已经带了每个任务的一行结论 + 找回/归档方式 → 原样投（不套壳）
-	if (t.batch) return clampDelivery(trimOrPlaceholder(t.resultText, "（批次没有结果文本）"), DELIVERY_MAX);
+	if (t.batch) {
+		const raw = trimOrPlaceholder(t.resultText, "（批次没有结果文本）");
+		// 「补投」提示：投递重试过的卡片，正文是**当时**写的，容易被当成最新结果
+		// （实测：修好显示后用户仍收到旧卡，以为修复没生效）。超过 90 秒才投出去的，明说。
+		const late = staleDeliveryNote(t);
+		return clampDelivery(late ? late + "\n" + raw : raw, DELIVERY_MAX);
+	}
 	const head = `子Agent「${t.name}」回来了（${t.status}）`;
 	const body = String(t.resultText ?? "").trim();
 	const path = String(t.resultPath ?? "").trim();
