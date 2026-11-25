@@ -501,8 +501,16 @@ export function shadowRoot(): string {
 	return join(getAgentDir(), "shadow");
 }
 
-/** 回收过期的影子目录（每次派发都会新建一个，session_start 时清超 24h 的） */
-export function reapStaleShadowDirs(maxAgeMs = 24 * 60 * 60 * 1000): number {
+/** 影子目录存活上限：一天派 50 个 × 每个带一份扩展副本，24h 会攒一堆旧代码快照 */
+export const SHADOW_TTL_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * 回收过期的影子目录（每次派发都会新建一个，session_start 时清超 2h 的）
+ *
+ * 以前是 24h —— 实测一天攒了 50 个目录，每个 22~650KB 且各带一份**当时的**扩展代码副本，
+ * 排查「为什么这个子助理行为不对」时会被这些旧快照骗。
+ */
+export function reapStaleShadowDirs(maxAgeMs = SHADOW_TTL_MS): number {
 	const root = shadowRoot();
 	let entries: string[] = [];
 	try {

@@ -6438,7 +6438,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 		reapStaleBgTasks(); // 先清理上个会话留下的孤儿任务
 		reapDeliveredBgTasks(); // 再回收「已投递成功且超 24h」的记账小票（不碰会话文件）
 		reapStaleLocks(); // 再回收 pid 已死/超时的会话运行锁
-		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 24h 的删）
+		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 SHADOW_TTL_MS=2h 的删）
 		// 归档目录保留 `superagent.resultsKeepDays` 天（默认 30，0 = 不清理）
 		try {
 			pruneArchivedResults();

@@ -1962,6 +1962,8 @@ allOk =
 			'ok("补投：5 分钟前完成 → 带「补投」+「5 分钟前」", lateNote.includes("补投") && lateNote.includes("5 分钟前"));',
 			'ok("补投：没有 finishedAt/startedAt → 不加提示（不瞎编）", staleDeliveryNote({}, nowMs) === "");',
 			'ok("补投：阈值常量 = 90 秒", STALE_DELIVER_MS === 90_000);',
+			'// 影子目录 TTL：一天 50 个 × 每个带扩展副本 → 24h 太宽松',
+			'ok("影子 TTL = 2 小时（不是 24h）", SHADOW_TTL_MS === 2 * 60 * 60 * 1000);',
 			'// ---- 真机（临时 .bg）：8 个 item → 4 条短卡 + 1 条汇总卡 ----',
 			'const blBefore = listBgTasks().map((t) => t.id);',
 			'const blBatch = openBatch(8, { key: "batch", task: "8 件事", ownerSessionFile: "F", ownerSessionId: "S", deadlineAt: Date.now() + 600000 });',
