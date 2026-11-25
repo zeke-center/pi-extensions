@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.7**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.8**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -904,7 +904,7 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `cwd` | | **在哪儿干活**。文件读写、相对路径、项目 `AGENTS.md` 都看它。**省略 = 跟随主进程当前所在的项目目录**（所以模板能跨机器复用，别在里面写死绝对路径） |
 | `name` | | 显示名（中文也行）。省掉用文件名 |
 | `desc` | | **什么时候该叫我**。不只是给人看的 —— 主 pi 就是靠这句话决定派谁，所以写「什么时候用我」，别写「我是谁」 |
-| `mcp` | | 要挂的 MCP 名字，逗号分隔（`mcp: my-db, my-server`）。**留空 = 一个都不挂** |
+| `mcp` | | 要挂的 MCP 名字，逗号分隔（`mcp: my-db, my-server`）。**留空 = 一个都不挂**。写 `inherit` = 继承主会话的 MCP，见下 |
 | `timeout` | | 默认超时，如 `10m` / `90s` / `1.5h`。省掉 = 5 分钟 |
 | `model` | | 指定模型（如 `deepseek-v4-pro` 或 `provider/id`）。**留空 = 继承主会话当前模型** |
 | `mcp_exposure` | | `codemode`（默认）/ `direct`（专职助理更省事）/ `deferred` |
@@ -917,6 +917,18 @@ Windows 下杀的是**整棵进程树**（`taskkill /T`），所以助理自己�
 | `deny_tools` | | 额外禁用的工具，逗号分隔（追加到默认的 `delegate,progress` 黑名单） |
 | `isolate_env` | | `true` = **环境变量隔离**：子进程只拿一份白名单（系统必需变量 + `PI_*`/`NODE_*`/`npm_*`）。默认 `false`（继承全部）。⚠️ 模型 key 若只放在环境变量里，要用 `env_passthrough` 显式保留 |
 | `env_passthrough` | | `isolate_env: true` 时额外保留的环境变量名，逗号分隔（如 `ANTHROPIC_API_KEY`） |
+
+#### 助理能连哪些 MCP
+
+| 写法 | 效果 |
+|---|---|
+| （不写） | **一个都不连**（默认，最安全） |
+| `mcp: center-pg` | 只连候选池里这几个 |
+| `mcp: inherit` | **继承主会话的 MCP**（用户级 `~/.pi/agent/mcp.json` + 项目级 `.pi/mcp.json`） |
+| `mcp: inherit, center-pg` | 继承 + 再从候选池补一个（同名以显式写的为准） |
+
+⚠️ `inherit` 会把主会话**全部** MCP 交给子助理（可能含可写库、SSH），等于放大权限 ——
+只给可信助理开；派活卡片上会提示「⚠ 已继承主会话 MCP（N 个…）」。
 
 #### 权限（Super Agent 模式生效）
 
@@ -1065,6 +1077,9 @@ mcp: my-db
 | 项目级 | `<cwd>/.pi/mcp.json` | `/ai` 从配置中心拉的线上连接会落到这里 |
 
 `/assistants edit <key>` 里那个多选框列的就是这三处合起来的候选池，并标注每个是从哪来的。文件不存在会自动建空壳。
+
+> `mcp: inherit` **不走候选池**，直接读主会话配置（用户级 + 项目级，项目级优先）；候选池里没被点名的 server 仍然一个都不带。
+> 多选框最上面「继承主会话 MCP」就是这一项，可以和候选池里的 server 一起勾。
 
 #### 隔离原理（为什么 `mcp` 说了算）
 
@@ -1262,6 +1277,7 @@ mcp: my-db
 | 按 ESC 停不下来 | 以前只跳出等待 | 现在 ESC 也会停掉 pane 里的进程 |
 | 收到「投递未生效」提示 | 流式竞态或主会话忙 | 会自动重试 6 次、退避封顶 60 秒；仍失败看 `/agents bg`，正文用 `/batch <id>` 取 |
 | 卡片只有摘要没有正文 | v2.5.6 设计如此 | 正文在 `~/.pi/agent/results/`，用 `/batch <id>` 看 |
+| 子助理连不上库 / 服务器 | 模板里没写 `mcp:`（默认一个都不连），或名字不在候选池 | 检查是否写了 `mcp:`；想跟主会话一致就写 `mcp: inherit`；改完要**重新派活**（下一次才生效） |
 
 ---
 

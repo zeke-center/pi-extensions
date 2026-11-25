@@ -109,7 +109,7 @@ import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEn
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { isExtDisabled, onGateApply } from "./gate";
-import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
+import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, mainSessionMcpServers, MCP_INHERIT, reapStaleShadowDirs, type McpPool, type McpServerDef } from "./mcp-pool";
 import { AUTO_DELIVER_MAX_ATTEMPTS, autoDeliverSkipReason, bgPruneReason, mergeBgTask, type BgTaskFile, type BgTaskNext } from "./bg-store";
 import { archiveResult, listArchivedResults, pruneArchivedResults, readArchivedResult, resultPathLine } from "./results";
 
@@ -144,8 +144,15 @@ interface Template {
 	/**
 	 * 要挂的 MCP 名字（逗号分隔）。**与 cwd 无关** —— 这是 v2 的核心改动。
 	 * 空数组 = 一个都不挂。
+	 *
+	 * ⚠️ 保留字 `inherit` **不在这里**：它在 `mcpInherit` 里。
 	 */
 	mcp: string[];
+	/**
+	 * `mcp: inherit` → 继承**主会话实际加载的** MCP（用户级 + 项目级）。
+	 * 可以和 `mcp` 里的候选池名字混写（同名时以显式写的为准）。
+	 */
+	mcpInherit: boolean;
 	/** 默认超时毫秒（frontmatter.timeout，如 10m / 90s）；调用参数仍可覆盖 */
 	timeoutMs?: number;
 	/** 继承的父模板 key（frontmatter.extends） */
@@ -306,13 +313,20 @@ function parseTemplate(file: string, key: string): Template | null {
 	// cwd 可以由 extends 继承、也可以省略（省略 = 跟随当前项目），所以只有「什么都没写」才算无效模板
 	if (!meta.cwd && !meta.extends && !meta.name && !meta.desc) return null;
 
+	// mcp：`inherit` 是保留字，挑出来单独一个布尔（不是候选池里的名字）
+	const mcpRaw = meta.mcp ? splitList(meta.mcp) : [];
+	const isInherit = (n: string): boolean => n.toLowerCase() === MCP_INHERIT;
+	const mcpInherit = mcpRaw.some(isInherit);
+	const mcpNames = mcpRaw.filter((n) => !isInherit(n));
+
 	return {
 		key,
 		name: meta.name || key,
 		desc: meta.desc || "(没有描述)",
 		cwd: meta.cwd ? expandHome(meta.cwd) : "",
 		model: meta.model || undefined,
-		mcp: meta.mcp ? splitList(meta.mcp) : [],
+		mcp: mcpNames,
+		mcpInherit,
 		timeoutMs: meta.timeout ? parseDuration(meta.timeout) : undefined,
 		extends: meta.extends || undefined,
 		base: meta.base ? parseBool(meta.base, false) : undefined,
@@ -336,9 +350,10 @@ function parseTemplate(file: string, key: string): Template | null {
  * 解开 extends 链：子写的覆盖父的，正文是「父 + 子」拼接。
  *
  * 继承规则（写进 README 的那份）：
- *   继承：cwd / model / mcp / timeout / mcp_exposure / env / body
+ *   继承：cwd / model / mcp / mcp_inherit / timeout / mcp_exposure / env / body
  *   不继承：base / demo / enabled / agents_md（用自己写的，没写就是默认值）
  *   mcp 是「覆盖」不是「合并」—— 避免「以为只挂了 1 个其实带了一堆」
+ *  （含 inherit：子模板只要写了 mcp 那一行，就连「要不要继承」一起接管）
  *
  * 最多 2 层（子 → 父 → 祖父），并检测循环。
  */
@@ -351,12 +366,16 @@ function resolveTemplate(t: Template, byKey: Map<string, Template>, seen: Set<st
 	const next = new Set(seen);
 	next.add(t.key);
 	const p = resolveTemplate(parent, byKey, next, depth + 1);
+	// 子模板写过 mcp 这一行吗（写了 `inherit` 也算写）—— mcp 与 mcpInherit 要一起决定，否则
+	// 「子写 inherit、父有 mcp 名单」会拼出一个谁都没写过的组合
+	const mcpDeclared = t.mcp.length > 0 || t.mcpInherit;
 
 	return {
 		...t,
 		cwd: t.cwd || p.cwd,
 		model: t.model ?? p.model,
-		mcp: t.mcp.length ? t.mcp : p.mcp,
+		mcp: mcpDeclared ? t.mcp : p.mcp,
+		mcpInherit: mcpDeclared ? t.mcpInherit : p.mcpInherit,
 		timeoutMs: t.timeoutMs ?? p.timeoutMs,
 		mcpExposure: t.mcpExposure ?? p.mcpExposure,
 		tools: t.tools?.length ? t.tools : p.tools,
@@ -2766,6 +2785,11 @@ interface RunOptions {
 	resumed: boolean;
 	/** 主会话当前模型（`provider/id`）。模板没写 `model` 时用它 —— 「默认继承主会话」 */
 	mainModel?: string;
+	/**
+	 * 模板写了 `mcp: inherit` → 实际继承到几个主会话 MCP。
+	 * `undefined` = 没继承（不提示）；`0` = 写了 inherit 但主会话一个都没有（也要提示）。
+	 */
+	mcpInherited?: number;
 	/** 影子 agentDir（只含本助理该有的 mcp.json） */
 	shadowDir: string;
 	/** 助理专属会话目录（不在 sessions/ 下，/resume 看不见） */
@@ -2774,6 +2798,13 @@ interface RunOptions {
 	onSettle?: (r: RunResult) => void;
 	/** 后台任务的记账 id（异步派活才有）：pane 分支的收尾靠它兜底写 `.bg` 终态 */
 	bgId?: string;
+}
+
+/** 派活卡片上的「继承主会话 MCP」提示（仅当模板写了 `mcp: inherit`） */
+function inheritMcpNote(n: number): string {
+	return n > 0
+		? `⚠ 已继承主会话 MCP（${n} 个，含可写库/SSH）`
+		: "⚠ 写了 mcp: inherit，但主会话当前一个 MCP 都没加载";
 }
 
 /** 给助理准备专属会话目录：不存在就建 */
@@ -2854,6 +2885,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		startedAt: started,
 		status: willQueue ? "queued" : "running",
 	});
+	job.note = opt.mcpInherited !== undefined ? inheritMcpNote(opt.mcpInherited) : undefined;
 	sink.live = job;
 	addJob(job);
 
@@ -3897,15 +3929,43 @@ function humanTimeout(ms: number): string {
 	return `${ms}ms`;
 }
 
-/** 候选池 → 多选项（池子里的 + 当前挂的，去重排序） */
-function mcpItems(pool: McpPool, current: string[]): PickItem[] {
-	const all = [...new Set([...Object.keys(pool.servers), ...current])].sort();
-	return all.map((n) => ({
-		value: n,
-		label: n,
-		hint: pool.servers[n] ? `(${pool.origin[n] ?? ""})` : "(候选池里没有，写了也连不上)",
-		checked: current.includes(n),
-	}));
+/** 多选列表里「继承主会话」那一项的名字（面板显示 + 提示文案共用） */
+const MCP_INHERIT_LABEL = "继承主会话 MCP";
+
+/**
+ * 候选池 → 多选项（池子里的 + 当前挂的，去重排序）。
+ *
+ * 最上面永远先放一项特殊的「继承主会话 MCP」（value = 保留字 inherit）：
+ * 它可以和候选池里的 server 同时勾，落盘就是 `mcp: inherit, center-pg`。
+ */
+function mcpItems(pool: McpPool, current: string[], inherit = false): PickItem[] {
+	// current 可能带着原样的 inherit（手写的模板），别把它当成一个候选池名字
+	const named = current.filter((n) => n.toLowerCase() !== MCP_INHERIT);
+	const all = [...new Set([...Object.keys(pool.servers), ...named])].sort();
+	const items: PickItem[] = [
+		{
+			value: MCP_INHERIT,
+			label: MCP_INHERIT_LABEL,
+			short: "继承主会话",
+			hint: "(⚠ 权限等同主会话：可能含可写库 / SSH)",
+			special: true,
+			checked: inherit,
+		},
+	];
+	return items.concat(
+		all.map((n) => ({
+			value: n,
+			label: n,
+			hint: pool.servers[n] ? `(${pool.origin[n] ?? ""})` : "(候选池里没有，写了也连不上)",
+			checked: named.includes(n),
+		})),
+	);
+}
+
+/** 模板的 mcp 声明 → 一行可读文本（inherit 排最前） */
+function mcpLabel(t: { mcp: string[]; mcpInherit: boolean }): string {
+	const parts = [t.mcpInherit ? MCP_INHERIT : "", ...t.mcp].filter(Boolean);
+	return parts.length ? parts.join(", ") : "(不连)";
 }
 
 /** 面板上的行 —— new 和 edit 共用同一套 */
@@ -4045,7 +4105,7 @@ function buildFields(o: {
 			kind: "bool",
 			hint: "(关掉每次省约 1500 token)",
 		},
-		{ key: "mcp", label: "MCP", value: "", kind: "mcp", hint: "(回车勾选能连什么 —— 跟工作目录无关)" },
+		{ key: "mcp", label: "MCP", value: "", kind: "mcp", hint: "(回车勾选能连什么 —— 跟工作目录无关；最上面那项 = 继承主会话)" },
 		{
 			key: "fs",
 			label: "文件权限",
@@ -4156,6 +4216,16 @@ async function commitForm(
 	// （不改时值就是原文，写回去等长 —— 顺便把首尾空白规整掉）
 	const body = typeof v.body === "string" ? v.body : undefined;
 
+	// mcp 这一行：`inherit` 是保留字，要排在最前面原样写回去，其余名字一个个拼在后面
+	// （面板上，「继承主会话」就是多选列表里的第一项，勾了 → value 就是 inherit）
+	const mcpRaw = (v.mcp ?? "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	const mcpInherit = mcpRaw.some((n) => n.toLowerCase() === MCP_INHERIT);
+	const wantMcp = mcpRaw.filter((n) => n.toLowerCase() !== MCP_INHERIT);
+	const mcpValue = [mcpInherit ? MCP_INHERIT : "", ...wantMcp].filter(Boolean).join(", ");
+
 	const updates: Record<string, string | undefined> = {
 		name: (v.name ?? "").trim() || key,
 		desc: (v.desc ?? "").trim(),
@@ -4163,7 +4233,7 @@ async function commitForm(
 		model: normModel(v.model),
 		timeout,
 		agents_md: (v.agents_md ?? "是") === "是" ? undefined : "false",
-		mcp: (v.mcp ?? "").trim(),
+		mcp: mcpValue,
 		demo: (v.dispatchable ?? "是") === "是" ? undefined : "true",
 		extends: (v.extends ?? "").trim() && (v.extends ?? "").trim() !== BASE_NONE ? (v.extends ?? "").trim() : undefined,
 		// 权限六项：面板里显示的是中文标签，落盘要转回真实值
@@ -4177,10 +4247,7 @@ async function commitForm(
 
 	// MCP 名字在三个来源里都找不到 → 问一声。
 	// 不硬拦：你可能就是先把模板写好、回头再补连接。但得让你知道派发时会被拒。
-	const wantMcp = (v.mcp ?? "")
-		.split(",")
-		.map((s) => s.trim())
-		.filter(Boolean);
+	// （inherit 不参与这个检查：它本来就不是候选池里的名字）
 	const poolNow = loadMcpPool(cwdIn);
 	const unknownMcp = wantMcp.filter((n) => !poolNow.servers[n]);
 	if (unknownMcp.length) {
@@ -4211,6 +4278,10 @@ async function commitForm(
 		notes.push(`原来的那份没动：${o.original.file}（本项目里新的这份优先）`);
 	}
 	if (body === undefined && !o.original) notes.push(`正文还是空的 —— 用 /assistants open ${key} 去写`);
+	if (mcpInherit) {
+		const n = Object.keys(mainSessionMcpServers(cwdIn)).length;
+		notes.push(`⚠ 已继承主会话 MCP（当前 ${n} 个）—— 派出去时权限等同主会话，可能含可写库 / SSH`);
+	}
 	ctx.ui.notify(`已保存\n${file}\n${notes.join("\n")}\n\n改模板不用 /reload，下次派发立即生效。`, "info");
 }
 function listAssistants(ctx: ExtensionContext, cwd: string): void {
@@ -4230,7 +4301,7 @@ function listAssistants(ctx: ExtensionContext, cwd: string): void {
 	const fmt = (t: Template): string =>
 		`• ${t.key} — ${t.name}\n` +
 		`    ${t.desc}\n` +
-		`    cwd: ${t.cwd}　mcp: ${t.mcp.length ? t.mcp.join(", ") : "—"}　timeout: ${t.timeoutMs ? `${Math.round(t.timeoutMs / 60000)}m` : "默认"}` +
+		`    cwd: ${t.cwd}　mcp: ${mcpLabel(t)}　timeout: ${t.timeoutMs ? `${Math.round(t.timeoutMs / 60000)}m` : "默认"}` +
 		(t.extends ? `\n    extends: ${t.extends}` : "");
 	const fmtBase = (t: Template): string =>
 		fmt(t) +
@@ -4254,7 +4325,7 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 		`文件    ${tpl.file}`,
 		`描述    ${tpl.desc}`,
 		`目录    ${tpl.cwd}`,
-		`MCP     ${tpl.mcp.length ? tpl.mcp.join(", ") : "(不连)"}${tpl.mcpExposure ? `　exposure: ${tpl.mcpExposure}` : ""}`,
+		`MCP     ${mcpLabel(tpl)}${tpl.mcpExposure ? `　exposure: ${tpl.mcpExposure}` : ""}`,
 		`模型    ${tpl.model ?? "(继承主会话)"}`,
 		`超时    ${tpl.timeoutMs ? `${tpl.timeoutMs} ms` : "(默认 5 分钟)"}`,
 		`AGENTS  ${tpl.agentsMd === false ? "不带全局 AGENTS.md" : "带"}`,
@@ -4280,7 +4351,12 @@ const ASSISTANT_FIELD_DOC: Record<string, string> = {
 		"模型：派它的时候用哪个模型（回车展开，列表就是 `/model` 里能选的那些）。\n\n选「（继承主会话）」= 跟主 pi 用同一个，主会话切模型它也跟着切；\n选具体某个 = 钉死，省钱的活就派给便宜模型。\n\n拿不到模型列表时这一行会退回手输（填 `provider/model`）。",
 	timeout: "超时：这个助理最长跑多久（`10m` / `90s` / `1.5h`，留空 = 5 分钟）。\n超时会被中止，结果标成 timeout。",
 	agents_md: "带 AGENTS.md：开 = 把全局/项目 AGENTS.md 塞进它的上下文（约 +1500 token/次）。\n关掉能省钱，但它就不知道项目规矩了。",
-	mcp: "MCP：这个助理能连哪些服务（回车勾选）。**跟工作目录无关**，是按需给的。\n不勾 = 一个都不连，只能用本地文件工具。",
+	mcp:
+		"MCP：这个助理能连哪些服务（回车勾选）。**跟工作目录无关**，是按需给的。\n不勾 = 一个都不连，只能用本地文件工具。\n\n" +
+		"最上面那项「继承主会话 MCP」= 直接用主会话实际加载的那套（用户级 + 项目级 mcp.json），" +
+		"可以再勾几个候选池里的补上（同名时以候选池那个为准）。\n" +
+		"⚠ 风险：继承 = 把主会话的权限原样交给它 —— 可能拿到**可写库 / SSH** 这类高权限工具，" +
+		"而且此时它跑在影子目录里，隔离不再覆盖这部分。只要读，就别继承，只挑只读的那个 server。",
 	fs: "**文件权限**：只读 = 一个文件都改不了（查数据、看服务器这类就用它）；可写 = 能改，但只限下面「可写目录」里。",
 	paths:
 		"**可写目录**：逗号分隔，相对工作目录（`${cwd}` = 工作目录本身）。留空 = 哪都能写，谨慎。\n" +
@@ -4331,7 +4407,7 @@ export function assistantFormParts(
 	});
 	return {
 		fields,
-		mcp: mcpItems(pool, tpl.mcp),
+		mcp: mcpItems(pool, tpl.mcp, tpl.mcpInherit),
 		commit: (r) => commitForm(ctx, { form: r, cwd, original: tpl }),
 	};
 }
@@ -4365,7 +4441,7 @@ function copyToProject(ctx: ExtensionContext, cwd: string, tpl: Template): void 
 				cwd,
 				model: tpl.model ?? "",
 				timeout: tpl.timeoutMs ? `${Math.round(tpl.timeoutMs / 60000)}m` : "",
-				mcp: tpl.mcp.length ? tpl.mcp.join(", ") : "",
+				mcp: [tpl.mcpInherit ? MCP_INHERIT : "", ...tpl.mcp].filter(Boolean).join(", "),
 				extends: tpl.extends ?? "",
 				agents_md: tpl.agentsMd === false ? "false" : "",
 				demo: tpl.demo === true ? "true" : "",
@@ -4511,7 +4587,7 @@ export function assistantNewPage(ctx: ExtensionContext, cwd: string, baseKey?: s
 	return {
 		title: extendsKey ? `新建（基于 ${extendsKey}）` : "新建助理",
 		fields,
-		mcp: mcpItems(pool, baseTpl?.mcp ?? []),
+		mcp: mcpItems(pool, baseTpl?.mcp ?? [], baseTpl?.mcpInherit === true),
 		footer: "回车 改 · ctrl+s 创建并回到列表 · esc 返回上一层",
 		detail: (f) => {
 			if (f.key === "nav.back") return "回到助理列表（也可以直接按 esc）。";
@@ -4574,7 +4650,7 @@ async function newAssistant(ctx: ExtensionContext, cwd: string, key: string, bas
 		ctx,
 		extendsKey ? `助理模板 · 新建（基于 ${extendsKey}）` : "助理模板 · 新建",
 		fields,
-		mcpItems(pool, baseTpl?.mcp ?? []),
+		mcpItems(pool, baseTpl?.mcp ?? [], baseTpl?.mcpInherit === true),
 		"key",
 	);
 	if (!r) {
@@ -5470,6 +5546,12 @@ export function setupDelegate(api: ExtensionAPI): void {
 				};
 			}
 
+			// 主会话实际加载的 MCP（用户级 + 项目级）：只有写了 `mcp: inherit` 的助理才用得上。
+			// 为什么要我们算：worker 带 `-na` 跑，项目级 `.pi/mcp.json` 在它那边是被掐掉的。
+			let inheritCache: Record<string, McpServerDef> | undefined;
+			const inheritedServers = (): Record<string, McpServerDef> =>
+				(inheritCache ??= mainSessionMcpServers(cwd));
+
 			// 每个助理一份模板 + 一份影子目录（同一助理派多件共用；跨助理各走各的 MCP 隔离）
 			const ready = new Map<string, { tpl: Template; shadow: ShadowResult }>();
 			for (const name of [...new Set(wants.map((w) => w.assistant))]) {
@@ -5534,6 +5616,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 				const shadow = buildShadow(tpl.key, tpl.mcp, pool, {
 					agentsMd: tpl.agentsMd !== false,
 					exposure: tpl.mcpExposure,
+					// `mcp: inherit` → 把主会话那套显式写进影子（不是靠它自己去读）
+					inheritServers: tpl.mcpInherit ? inheritedServers() : undefined,
 					// 每次派发一个独立影子目录：同一个助理并发派发不再互相覆盖 mcp.json
 					runSuffix: Math.random().toString(36).slice(2, 8),
 				});
@@ -5625,6 +5709,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 								mainModel,
 								shadowDir: shadowOf.dir,
 								sessionDir: ensureAssistantSessionDir(one.key),
+								mcpInherited: one.mcpInherit ? shadowOf.inherited.length : undefined,
 							});
 						}),
 					);
@@ -5678,6 +5763,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 								mainModel,
 								shadowDir: shadowOf.dir,
 								sessionDir: ensureAssistantSessionDir(one.key),
+								mcpInherited: one.mcpInherit ? shadowOf.inherited.length : undefined,
 								onSettle: (r) => noteBatchItem(batch, seqIdx, batchItemOf(r)),
 							})
 								.then((r) => {
@@ -5702,6 +5788,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 								mainModel,
 								shadowDir: shadowOf.dir,
 								sessionDir: ensureAssistantSessionDir(one.key),
+								mcpInherited: one.mcpInherit ? shadowOf.inherited.length : undefined,
 								// pane 分支的收尾靠它兜底写终态（onSettle 抛错 / 根本没调到也得有终态）
 								bgId,
 								onSettle: (r) => {

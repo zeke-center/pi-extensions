@@ -39,6 +39,13 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 /** 一个 MCP server 的原始定义（直接透传 pi 的格式） */
 export type McpServerDef = Record<string, unknown>;
 
+/**
+ * 助理 frontmatter 里 `mcp: inherit` 的**保留字**：
+ * 不是候选池里的 server 名，而是「把这个 worker 该连的东西 = 主会话实际加载的那套」。
+ * 允许和真名字混写：`mcp: inherit, center-pg`（同名时以显式写的为准）。
+ */
+export const MCP_INHERIT = "inherit";
+
 export interface McpPool {
 	/** 名字 → 定义 */
 	servers: Record<string, McpServerDef>;
@@ -181,6 +188,21 @@ function readMcpFile(file: string): Record<string, McpServerDef> {
 	}
 }
 
+/**
+ * 主会话会加载的 MCP（用户级 + 项目级，项目级覆盖同名）；**不含候选池**。
+ *
+ * 为什么单独一个函数：worker 是带 `-na` 跑的（忽略项目级资源），
+ * 所以「继承主会话」不能指望它自己去读 `<cwd>/.pi/mcp.json` ——
+ * 必须由我们把主会话会加载的那一份**显式写进影子目录**，否则项目级的一个都继承不到。
+ */
+export function mainSessionMcpServers(cwd: string): Record<string, McpServerDef> {
+	const out: Record<string, McpServerDef> = {};
+	for (const file of [join(getAgentDir(), "mcp.json"), join(cwd, ".pi", "mcp.json")]) {
+		for (const [name, def] of Object.entries(readMcpFile(file))) out[name] = def;
+	}
+	return out;
+}
+
 /** 合并三处来源（候选池 → 用户级 → 项目级，同名后者覆盖前者） */
 export function loadMcpPool(cwd: string): McpPool {
 	const servers: Record<string, McpServerDef> = {};
@@ -202,6 +224,8 @@ export interface ShadowResult {
 	dir: string;
 	/** 实际写进去的 server 名字 */
 	names: string[];
+	/** 其中来自「继承主会话」的那几个（被显式点名覆盖掉的不算）—— 卡片提示用 */
+	inherited: string[];
 	/** 模板要了、但池子里找不到的名字 */
 	missing: string[];
 	/** 关键配置写失败的原因（非空 = 应该拒绝启动，别拿半截配置去跑） */
@@ -243,7 +267,16 @@ export function buildShadow(
 	key: string,
 	want: string[],
 	pool: McpPool,
-	opts: { agentsMd?: boolean; exposure?: string; runSuffix?: string } = {},
+	opts: {
+		agentsMd?: boolean;
+		exposure?: string;
+		runSuffix?: string;
+		/**
+		 * 「继承主会话」时要带进来的 server（调用方用 mainSessionMcpServers() 拿）。
+		 * 只放这里传进来的这些 —— 候选池里没被点名的仍然一个都不带（隔离原则不变）。
+		 */
+		inheritServers?: Record<string, McpServerDef>;
+	} = {},
 ): ShadowResult {
 	const agentDir = getAgentDir();
 	const errors: string[] = [];
@@ -305,16 +338,23 @@ export function buildShadow(
 	}
 
 	// 生成影子 mcp.json（空也要写，否则会沿用上一轮的内容）
+	// 组装顺序：① 继承来的先放 → ② 显式点名的后放（同名覆盖 ①，即「显式写的为准」）
+	// 继承来的定义**原样透传**（exposure 之类是主会话那份配置的事，我们不替它改）。
+	const inherit = opts.inheritServers ?? {};
 	const chosen: Record<string, McpServerDef> = {};
+	for (const [name, def] of Object.entries(inherit)) chosen[name] = { ...def };
 	const missing: string[] = [];
 	for (const name of want) {
-		const def = pool.servers[name];
+		// 池子里没有、但主会话本来就连着 → 用继承那份（`mcp: inherit, X` 里 X 没进候选池也不至于被拒）
+		const def = pool.servers[name] ?? inherit[name];
 		if (!def) {
 			missing.push(name);
 			continue;
 		}
 		chosen[name] = opts.exposure ? { ...def, exposure: opts.exposure } : { ...def };
 	}
+	// 真正「继承来的」= 继承里有、且没被显式点名顶掉（卡片上要说 N 个）
+	const inherited = Object.keys(inherit).filter((n) => !want.includes(n));
 	try {
 		writeFileSync(join(dir, "mcp.json"), `${JSON.stringify({ mcpServers: chosen }, null, 2)}\n`, "utf8");
 	} catch (e) {
@@ -322,7 +362,7 @@ export function buildShadow(
 		errors.push(`mcp.json 写入失败：${e instanceof Error ? e.message : String(e)}`);
 	}
 
-	return { dir, names: Object.keys(chosen), missing, errors, warnings };
+	return { dir, names: Object.keys(chosen), inherited, missing, errors, warnings };
 }
 
 /**

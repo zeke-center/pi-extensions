@@ -213,6 +213,18 @@ writeFileSync(
 	["---", "name: 小子", "extends: role-ops", "---", "我是子模板。", ""].join("\n"),
 	"utf8",
 );
+// mcp: inherit（v2.5.8）—— `inherit` 是保留字，不是候选池名字
+const tplMd = (key, lines) =>
+	writeFileSync(join(asstDir, `${key}.md`), ["---", ...lines, "---", "正文", ""].join("\n"), "utf8");
+tplMd("mcp-inherit", ["name: 继承助理", "desc: x", "mcp: inherit"]);
+tplMd("mcp-mixed", ["name: 混写助理", "desc: x", "mcp: inherit, a, b"]);
+tplMd("mcp-upper", ["name: 大写助理", "desc: x", "mcp: INHERIT"]);
+tplMd("mcp-none", ["name: 不写助理", "desc: x"]);
+tplMd("mcp-plain", ["name: 点名助理", "desc: x", "mcp: a"]);
+// extends 场景：父写 inherit，子要么一起接管、要么写了自己那行就完全接管
+tplMd("mcp-parent", ["name: 父", "desc: x", "mcp: inherit"]);
+tplMd("mcp-kid", ["name: 子（不写 mcp）", "desc: x", "extends: mcp-parent"]);
+tplMd("mcp-kid2", ["name: 子（写 mcp: a）", "desc: x", "extends: mcp-parent", "mcp: a"]);
 
 let allOk = true;
 
@@ -377,6 +389,27 @@ allOk =
 			'ok("模板：解析 isolate_env", ch.isolateEnv === true);',
 			'ok("模板：解析 env_passthrough", JSON.stringify(ch.envPassthrough) === JSON.stringify(["ANTHROPIC_API_KEY"]));',
 			'ok("模板：没写 tools 的模板是 undefined", tpls.find((t) => t.key === "plain").tools === undefined);',
+			'// ---- v2.5.8：mcp: inherit（继承主会话 MCP）----',
+			'const __asst = (k) => join(process.env.TPROJ, ".pi", "assistants", k + ".md");',
+			'const tInh = parseTemplate(__asst("mcp-inherit"), "mcp-inherit");',
+			'ok("mcp: inherit → mcp 为空数组（inherit 不当候选池名字）", JSON.stringify(tInh.mcp) === "[]");',
+			'ok("mcp: inherit → mcpInherit === true", tInh.mcpInherit === true);',
+			'const tMix = parseTemplate(__asst("mcp-mixed"), "mcp-mixed");',
+			'ok("mcp: inherit, a, b → mcp === [a,b]", JSON.stringify(tMix.mcp) === JSON.stringify(["a", "b"]));',
+			'ok("mcp: inherit, a, b → mcpInherit === true", tMix.mcpInherit === true);',
+			'ok("mcp: INHERIT（大写）也识别", parseTemplate(__asst("mcp-upper"), "mcp-upper").mcpInherit === true);',
+			'const tNone = parseTemplate(__asst("mcp-none"), "mcp-none");',
+			'ok("不写 mcp → mcpInherit === false（默认最安全）", tNone.mcpInherit === false);',
+			'ok("不写 mcp → mcp === []", JSON.stringify(tNone.mcp) === "[]");',
+			'const tPlain = parseTemplate(__asst("mcp-plain"), "mcp-plain");',
+			'ok("mcp: a（无 inherit）→ mcpInherit === false", tPlain.mcpInherit === false);',
+			'ok("mcp: a（无 inherit）→ 名字照样进 mcp", JSON.stringify(tPlain.mcp) === JSON.stringify(["a"]));',
+			'const tKid = tpls.find((t) => t.key === "mcp-kid");',
+			'ok("extends：子不写 mcp → 接管父的 inherit", tKid.mcpInherit === true && tKid.mcp.length === 0);',
+			'const tKid2 = tpls.find((t) => t.key === "mcp-kid2");',
+			'ok("extends：子写了自己的 mcp → inherit 一起被接管（不会拼出没人写过的组合）", tKid2.mcpInherit === false && JSON.stringify(tKid2.mcp) === JSON.stringify(["a"]));',
+			'ok("提示：inherit 且 N>0 → 「已继承主会话 MCP」+ 个数", inheritMcpNote(3).includes("已继承主会话 MCP") && inheritMcpNote(3).includes("3 个"));',
+			'ok("提示：inherit 但一个都没加载 → 「一个 MCP 都没加载」（不报错）", inheritMcpNote(0).includes("一个 MCP 都没加载"));',
 			'// ---- 底座（base）：只读 + 不可派 + 能从它派生 ----',
 			'const __zb = tpls.find((t) => t.key === "role-ops");',
 			'ok("底座：base 标记为 true", __zb.base === true);',
@@ -1829,6 +1862,36 @@ allOk =
 		'const gw = ensureShadowBin(ghost, ghostAgent);',
 		'ok("影子：源 bin 不存在 → 只记 warning（含「缺」），不抛", gw.length > 0 && gw.some((w) => w.includes("缺")));',
 		'const s3 = buildShadow("测试助理2", [], pool, { runSuffix: "ccc" });',
+		'// ---- v2.5.8：mcp: inherit —— mainSessionMcpServers() 只读用户级 + 项目级，不碰候选池 ----',
+		'const inhCwd = join(dir, "proj-inherit");',
+		'mkdirSync(join(inhCwd, ".pi"), { recursive: true });',
+		'writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { "user-db": { command: "u" }, shared: { command: "user" } } }), "utf8");',
+		'writeFileSync(join(inhCwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { "proj-db": { command: "p" }, shared: { command: "proj" } } }), "utf8");',
+		'writeFileSync(join(dir, "mcp-catalog.json"), JSON.stringify({ mcpServers: { "pool-only": { command: "c" } } }), "utf8");',
+		'const mainMcp = mainSessionMcpServers(inhCwd);',
+		'ok("继承：读到用户级 mcp.json", mainMcp["user-db"] !== undefined);',
+		'ok("继承：读到项目级 .pi/mcp.json", mainMcp["proj-db"] !== undefined);',
+		'ok("继承：项目级同名覆盖用户级", mainMcp.shared.command === "proj");',
+		'ok("继承：不碰候选池（mcp-catalog.json 里的不出现）", mainMcp["pool-only"] === undefined);',
+		'ok("继承：总数 = 3（user-db / proj-db / shared）", Object.keys(mainMcp).length === 3);',
+		'// 影子：继承的先进、显式同名覆盖、names 含两者',
+		'const sInh = buildShadow("继承助理", [], pool, { inheritServers: mainMcp, runSuffix: "inh" });',
+		'const mInh = JSON.parse(readFileSync(join(sInh.dir, "mcp.json"), "utf8"));',
+		'ok("影子·继承：主会话的 MCP 全写进影子", ["user-db", "proj-db", "shared"].every((n) => !!mInh.mcpServers[n]));',
+		'ok("影子·继承：inherited 记下这几个（卡片提示用）+ errors 为空", sInh.inherited.length === 3 && sInh.errors.length === 0);',
+		'ok("影子·继承：候选池里没点名的 test-db 不出现（隔离不变）", mInh.mcpServers["test-db"] === undefined && !sInh.names.includes("test-db"));',
+		'const sMix = buildShadow("混写助理", ["test-db", "user-db"], pool, { inheritServers: mainMcp, exposure: "read", runSuffix: "mix" });',
+		'const mMix = JSON.parse(readFileSync(join(sMix.dir, "mcp.json"), "utf8"));',
+		'ok("影子·混写：names 含继承的与显式点名的", ["proj-db", "shared", "test-db", "user-db"].every((n) => sMix.names.includes(n)));',
+		'ok("影子·混写：显式同名以显式为准（带上 exposure）", mMix.mcpServers["user-db"].exposure === "read");',
+		'ok("影子·混写：被显式顶掉的那个不算进 inherited", sMix.inherited.length === 2 && !sMix.inherited.includes("user-db"));',
+		'const sReg = buildShadow("回归助理", ["test-db"], pool, { runSuffix: "reg" });',
+		'ok("影子·回归：不传 inheritServers → 只写点名的（与原来一致）", Object.keys(JSON.parse(readFileSync(join(sReg.dir, "mcp.json"), "utf8")).mcpServers).join(",") === "test-db" && sReg.inherited.length === 0);',
+		'const sInh0 = buildShadow("空继承助理", [], pool, { inheritServers: {}, runSuffix: "inh0" });',
+		'const mInh0 = JSON.parse(readFileSync(join(sInh0.dir, "mcp.json"), "utf8"));',
+		'ok("影子·空继承：mcpServers 为空且不报错", (!mInh0.mcpServers || Object.keys(mInh0.mcpServers).length === 0) && sInh0.errors.length === 0 && sInh0.inherited.length === 0);',
+		'const sFb = buildShadow("兜底助理", ["proj-db"], pool, { inheritServers: mainMcp, runSuffix: "fb" });',
+		'ok("影子·兜底：点名但池里没有、主会话有 → 不报 missing", sFb.missing.length === 0 && sFb.names.includes("proj-db"));',
 		'ok("影子：cutoff 极大时不误删", reapStaleShadowDirs(365 * 24 * 60 * 60 * 1000) === 0 && existsSync(s3.dir));',
 		"const removed = reapStaleShadowDirs(-1);",
 		'ok("影子：cutoff 为负时全部回收", removed >= 3 && !existsSync(s1.dir) && !existsSync(s2.dir));',

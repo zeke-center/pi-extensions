@@ -23,6 +23,10 @@ export interface PickItem {
 	value: string;
 	label: string;
 	hint?: string;
+	/** 值摘要里想写别的字（默认直接用 value）—— 比如 "inherit" 显示成「继承主会话」 */
+	short?: string;
+	/** 不是真候选（比如「继承主会话」）：判「候选池是不是空的」时不算它 */
+	special?: boolean;
 	checked: boolean;
 }
 
@@ -847,7 +851,7 @@ export class FormPane implements Focusable {
 			const label = padRight(indent + f.label, labelW);
 			let val: string;
 			if (f.kind === "mcp") {
-				const names = this.mcpPool().filter((x) => x.checked).map((x) => x.value);
+				const names = this.mcpPool().filter((x) => x.checked).map((x) => x.short ?? x.value);
 				val = names.length ? `${names.length} 个：${names.join(", ")}` : "(不连)";
 			} else if (f.kind === "long") {
 				val = longSummary(f.value, Math.max(12, leftW - labelW - 6));
@@ -967,7 +971,9 @@ export class FormPane implements Focusable {
 		if (this.mode === "mcp") {
 			out.push(b(`├${"─".repeat(inner)}┤`));
 			const pool = this.mcpPool();
-			if (!pool.length) out.push(full(` ${t.fg("dim", "（候选池是空的 —— 先 /ai 拉连接，或写 mcp-catalog.json）")}`));
+			// 「继承主会话」这类特殊项不算候选池内容 —— 池子真的空时仍然要让人知道怎么补
+			if (!pool.some((i) => !i.special))
+				out.push(full(` ${t.fg("dim", "（候选池是空的 —— 先 /ai 拉连接，或写 mcp-catalog.json）")}`));
 			pool.forEach((it, i) => {
 				const isSel = i === this.mcpSel;
 				const box = it.checked ? t.fg("success", "[✓]") : t.fg("dim", "[ ]");
