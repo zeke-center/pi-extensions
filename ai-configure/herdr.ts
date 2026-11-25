@@ -554,6 +554,16 @@ export function tabLabel(n: number): string {
 	return `sa:extra#${n}`;
 }
 
+/**
+ * **tab 模式**（显式 ui=tab：每个子助理一个标签）的标题：`sa:tab#<n>`。
+ * 故意跟溢出用的 `sa:extra#<n>` 分开前缀 —— 共用前缀会让「4 并发开了 4 个标签」
+ * 看起来像溢出规划器（planSlot）坏了。两边都以 `sa:` 开头，/panes、pane-close、
+ * 自动回收的前缀过滤照样认。
+ */
+export function tabLabelMode(n: number): string {
+	return `sa:tab#${n}`;
+}
+
 // ======================= 配置（纯函数 + 读文件）=======================
 
 export type UiMode = "panel" | "split" | "tab";
@@ -621,7 +631,7 @@ export function readUiConfig(): UiConfig {
 
 /**
  * 这一刻该用哪种 UI。
- *   auto（默认）        → 没有 Herdr → panel；≤ mainSlots 个 → split；更多 → tab（溢出到 tab）
+ *   auto（默认）        → 有 Herdr 就 split，没有就降级 panel（溢出交给 planSlot + overflow tab）
  *   panel               → 永远只画卡片
  *   split / tab         → 要 Herdr；没有就**降级 panel**（不报错、不崩）
  *
@@ -629,6 +639,7 @@ export function readUiConfig(): UiConfig {
  */
 export function resolveUiMode(
 	cfg: Partial<UiConfig> | undefined,
+	/** 目前仅 tab 相关判断保留，不要用它决定 auto（见下面 auto 分支的注释） */
 	runningCount: number,
 	herdrOk: boolean,
 ): UiMode {
@@ -637,9 +648,11 @@ export function resolveUiMode(
 	if (ui === "split" || ui === "tab") return herdrOk ? ui : "panel";
 	// 只有显式写了 auto 才走自动判定；缺省 / 拼错 / 旧配置残留一律 panel（安全默认）
 	if (ui !== "auto") return "panel";
-	if (!herdrOk) return "panel";
-	const mainSlots = intIn(cfg?.mainSlots, UI_DEFAULTS.mainSlots, 0, 2);
-	return runningCount <= mainSlots ? "split" : "tab";
+	void runningCount;
+	// auto = 「有 Herdr 就分屏」：溢出交给 planSlot + overflow tab 去排，
+	// **不要**用全局 runningCount 判 split/tab —— 那会把"溢出"错误升级成
+	// "每个任务一个标签"（实测 4 并发 → 4 个 extra tab）。
+	return herdrOk ? "split" : "panel";
 }
 
 // ======================= 槽位规划（纯函数）=======================

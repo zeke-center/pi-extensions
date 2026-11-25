@@ -95,6 +95,7 @@ import {
 	tabClose,
 	tabCreate,
 	tabLabel,
+	tabLabelMode,
 	workspaceId,
 	type UiConfig,
 	type UiMode,
@@ -1333,6 +1334,7 @@ function summarizeTools(tools: string[]): string {
 // 布局规则（用户定的）：
 //   主窗口：左边主会话不动，右侧竖切两格 → 最多 2 个子助理
 //   超过 2 个：另开一个 tab（叫 sa:extra#n）放子助理，2×2 四宫格 → 最多 4 个
+//   （显式 ui=tab 是另一条路：每个子助理一个 `sa:tab#n` 标签，不经过这里的规划）
 //   再多：溢出 tab 也满了 → 再开一个 `sa:extra#2`、`#3`…（每个 tab 最多 overflowSlots 个 pane）
 //   还拿不到格（例如主窗口满 + tab 建不出来 / 全是别人留着没关的失败 pane）→ 等槽位，
 //   最多等 HERDR_SLOT_WAIT_MS，超时才降级成 rpc 无头模式
@@ -1540,7 +1542,7 @@ function allocHerdrSlotOnce(cwd: string, cfg: UiConfig, mode: UiMode): SlotAttem
 	// tab 模式：每个子助理一个标签（自带一格）
 	if (mode === "tab") {
 		herdrTabModeSeq += 1;
-		const t = herdrSlotOps.tabCreate(ws, tabLabel(herdrTabModeSeq), cwd);
+		const t = herdrSlotOps.tabCreate(ws, tabLabelMode(herdrTabModeSeq), cwd);
 		if (!t) return { full: false };
 		return { slot: recordHerdrSlot({ index: herdrTabModeSeq, paneId: t.paneId, tabId: t.tabId, where: "overflow" }), full: false };
 	}
