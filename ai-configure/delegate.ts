@@ -983,6 +983,17 @@ function clampTail(s: string, limit: number): string {
 const PANE_DEGRADED_NOTE = "pane 派发失败已降级";
 /** 卡死看门狗降级的卡片备注 */
 const PANE_STALLED_NOTE = "pane 卡死 90s（无输出）已降级 rpc";
+
+/**
+ * `note` 有两类，收尾判定必须分开：
+ *   - **降级/卡死**（`pane …` 开头）：活没在 pane 里干成，算没成功
+ *   - **纯提示**（`⚠` 开头，如「已继承主会话 MCP」）：任务本身成功了，别把 ⚠ 当 ❌
+ * 以前一律 `!note` 就算没成功 —— 于是开了 `mcp: inherit` 的助理，**成功也显示 ❌**。
+ */
+export function isDegradedNote(note: string | undefined): boolean {
+	const n = (note ?? "").trim();
+	return Boolean(n) && !n.startsWith("⚠");
+}
 /** 槽位等不到（60s 超时）降级的卡片备注 */
 const SLOT_WAIT_NOTE = "pane 槽位等待 60s 超时已降级 rpc";
 
@@ -4141,11 +4152,11 @@ export const BATCH_CARD_MAX = 1600;
  */
 export function buildBatchCard(items: BatchItem[], batchId?: string): string {
 	const list = Array.isArray(items) ? items : [];
-	const doneOk = list.filter((i) => i.outcome === "done" && !i.note).length;
-	const degraded = list.filter((i) => Boolean(i.note)).length;
-	const failed = list.filter((i) => !i.note && (i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty")).length;
-	const timedOut = list.filter((i) => !i.note && i.outcome === "timeout").length;
-	const partialN = list.filter((i) => !i.note && i.outcome === "partial").length;
+	const doneOk = list.filter((i) => i.outcome === "done" && !isDegradedNote(i.note)).length;
+	const degraded = list.filter((i) => isDegradedNote(i.note)).length;
+	const failed = list.filter((i) => !isDegradedNote(i.note) && (i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty")).length;
+	const timedOut = list.filter((i) => !isDegradedNote(i.note) && i.outcome === "timeout").length;
+	const partialN = list.filter((i) => !isDegradedNote(i.note) && i.outcome === "partial").length;
 	const totalMs = list.reduce((m, i) => Math.max(m, Number(i.elapsedMs) || 0), 0);
 	const segs: string[] = [];
 	if (doneOk) segs.push(`${doneOk} 成功`);
@@ -4158,8 +4169,13 @@ export function buildBatchCard(items: BatchItem[], batchId?: string): string {
 	const rows = list.map((it, i) => {
 		const who = `${it.name || "worker"}#${i + 1}`;
 		const secs = Math.round((Number(it.elapsedMs) || 0) / 1000);
-		if (it.note) return `⚠️ ${who}  ${oneLine(it.note, BATCH_CONCLUSION_MAX)}`;
-		if (it.outcome === "done") return `✅ ${who}  ${batchConclusion(it.text, it.report)}（${secs}s）`;
+		if (isDegradedNote(it.note)) return `⚠️ ${who}  ${oneLine(it.note!, BATCH_CONCLUSION_MAX)}`;
+		if (it.outcome === "done") {
+			// 提示类 note（继承 MCP 之类）**不改判定**，只在行尾带一句
+			const adv = it.note ? ` · ${oneLine(it.note, 24)}` : "";
+			const line = `✅ ${who}  ${batchConclusion(it.text, it.report)}（${secs}s）${adv}`;
+			return line.length > BATCH_CARD_MAX ? line.slice(0, BATCH_CARD_MAX) : line;
+		}
 		if (it.outcome === "timeout") return `⏱ ${who}  超时（${secs}s）`;
 		if (it.outcome === "partial") return `⚠️ ${who}  到轮数上限被停下（partial，${secs}s）`;
 		if (it.outcome === "empty") return `❌ ${who}  跑完没输出（${secs}s）`;
@@ -4279,7 +4295,7 @@ function batchLiveHeadline(item: BatchItem): string {
  * 序号**统一 1 基**（和汇总卡的 `worker#1` / `worker#2` 对齐）：`seq` 内部仍是 0 基，显示时 +1。
  */
 export function batchLiveLiveText(seq: number, item: BatchItem): string {
-	const ok = item.outcome === "done" && !item.note;
+	const ok = item.outcome === "done" && !isDegradedNote(item.note);
 	const secs = Math.round((Number(item.elapsedMs) || 0) / 1000);
 	const head = `${ok ? "✅" : "❌"} #${seq + 1} ${item.name || "worker"} ${secs}s`;
 	const budget = BATCH_LIVE_MAX_CHARS - head.length - 3; // 3 = " · "
