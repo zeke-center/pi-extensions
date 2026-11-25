@@ -251,8 +251,7 @@ const ROUTER_PROTOCOL = `【你是 Router】
 - 派活前先看助理的权限摘要（卡片『权限』那行）：不够就换人，或明确说出『缺哪一条权限』。
 - 派活前**先按各助理 desc 挑专才**：数据库 → db，服务器 → server，前端 → frontend，后端 → backend。\`general\` 只用于没有专才对口的杂活。
 - **不要把数据库/服务器/前端/后端这类明确领域的活派给 general。**
-- 预计超过 30 秒的活（查服务器 / 跑测试 / 大批改动 / 多任务）用 \`wait: false\` 异步派：先回一句话说明“已派出什么”，结果完成后会自动回投；**不要用同步等待把主会话卡住**。
-- 只有“下一步必须依赖这个结果才能接着做”（比如要先看 diff 才能决定改不改）时才用同步。
+- 派活**默认 \`wait: false\` 异步派**：派完回一句话说明“已派出什么”，结果完成后会自动回投；**不要用同步等待把主会话卡住**（细则见下方【派活一律异步】）。
 
 【先做依赖分析，再声明计划】
 - 声明 progress(plan) 之前，先逐个问：这一步的输入是不是依赖上一步的输出？
@@ -265,9 +264,12 @@ const ROUTER_PROTOCOL = `【你是 Router】
 - 每批最多 4 个（并发上限 4），超出的排下一批。
 - 只有依赖链上的步骤才逐个派：前一步结果出来再派下一步。
 
-【预计超过 30 秒用异步】
-- wait:false 派完立刻回一句「已派出什么」，结果完成自动回投，不要把主会话卡住。
-- 只有下一步必须用这个结果才能继续时，才 wait:true。`;
+【派活一律异步，默认 wait:false】
+- 派活**默认异步**（wait:false）：派完立刻回一句「已派出什么」就结束本轮，主会话必须保持可交互。
+- **不要自己用同步**（wait:true）：同步会把主会话锁住几十秒，用户在这期间没法说话。
+- 只有用户**明确要求**「等它跑完再继续」「跑完告诉我结果我再决定」时，才用 wait:true。
+- 结果会自动回投（结论 + 证据）；正文已归档，要正文用 read_result <会话ID>（可带 offset/limit）按需取 —— **不要** resume 重跑，也不要同步 wait。
+- 回投卡里已经有结论和证据就先照着说；只有需要原文细节（完整报错、长日志）时才 read_result。`;
 
 // ======================= Router 提示词外部化（A1） =======================
 
@@ -484,11 +486,13 @@ const BLOCKED_READONLY = ["bash", "write", "edit", "apply_patch", "multiedit", "
  */
 const MCP_DANGER = /(ssh|exec|shell|bash|run_?cmd|write|delete|drop|update|insert|create|patch|apply)/i;
 /**
- * 盲派档（默认）：Router 只许这三件事 —— 派活、报进度、验收 diff。
+ * 盲派档（默认）：Router 只许这四件事 —— 派活、报进度、验收 diff、按需读回投正文。
  *
  * `git_read` 留着的理由：验收 Worker 的改动要能看 diff，而它只读、改不了任何东西。
+ * `read_result` 留着的理由：回投卡只带结论 + 证据，正文在归档里 —— 要看全文就按需取，
+ * 不能为了看正文去 `resume` 重跑助理（贵、慢、还可能改坏东西），也不能同步 wait 卡住主会话。
  */
-const ROUTER_ALLOW: string[] = ["delegate", "progress", "git_read"];
+const ROUTER_ALLOW: string[] = ["delegate", "progress", "git_read", "read_result"];
 /** 保留旧名（导出：别处还在用 / 单测要断言它没跑偏） */
 export const KEEP_BLIND = ROUTER_ALLOW;
 /** 只读档明确要保留的（其余按黑名单摘）—— git_read 让我们能验收 Worker 的改动 */
@@ -497,7 +501,7 @@ const KEEP_READONLY = ["delegate", "progress", "read", "grep", "git_read"];
 /** 盲派档的拒绝文案：一次到位，顺便明令别重试（模型很爱换个工具绕） */
 export const ROUTER_DENY_TEXT = [
 	"⛔ 主会话是 Router，不亲自执行。",
-	"现在是「只派活」档：只能用 delegate / progress / git_read。",
+	"现在是「只派活」档：只能用 delegate / progress / git_read / read_result。",
 	"要做事请用 delegate 派 Worker（把「要什么 + 验收标准」写清）。",
 	"⛔ 不要重试这个工具，也不要找替代工具绕过 —— 都会被拦。",
 ].join("\n");
@@ -840,7 +844,7 @@ function registerSuperAgentSettings(): void {
 			label: "Router 能力",
 			desc:
 				"**主会话（Router）能用哪些工具** —— 模式开着时生效：\n\n" +
-				"- **只派活（推荐，默认）**：只留 `delegate` `progress` `git_read`（派活、报进度、验收 diff）。" +
+				"- **只派活（推荐，默认）**：只留 `delegate` `progress` `git_read` `read_result`（派活、报进度、验收 diff、读回投正文）。" +
 				"`read` `grep` `bash` `write` `edit` `apply_patch` `codemode` 以及所有 `mcp__*` 全摘；" +
 				"就算有晚注册 / 被重新激活的漏网工具，`tool_call` 钩子也会当场拦下。\n" +
 				"  → 主会话只做决策，真正干活必须派 Worker\n" +

@@ -1,57 +1,34 @@
 /**
- * AI configure · 配置中心模块
+ * AI configure · 会话级 / 项目级 MCP 管理
  *
- * 从"AI 配置中心"（你的 Center 后端）拉取连接台账，选完之后**在会话内生效**。
- * 台账只存"账面信息"，把它翻译成 pi 能用的 MCP 配置这件事由本模块负责。
+ * 历史：以前这里还有一条「从 AI 配置中心拉取连接台账 → 多选 → 应用到会话级/项目级」的入口
+ * （CENTER_API + fetchConnectors + withRetry 那一套），用户明确说没用，**已整段删掉**。
+ * 现在只剩管理动作：撤销 / 看状态 / 设密钥 / 自检 / 帮助。
  *
  * 用法:
- *   /ai                拉取台账 → 多选 → 选应用方式 → 生效
- *   /ai token          手动输入 Master 密钥（只存内存，不落盘）
+ *   /ai token          手动输入 Master 密钥（只存内存，不落盘；拉取功能删了，现在只有 /ai status 会看）
  *   /ai off            撤销本次会话级注册
  *   /ai project off    从当前项目的 .pi/mcp.json 移除本扩展写入的条目
  *   /ai status         看当前状态
+ *   /ai doctor         自检（= /aidoctor）
  *   /ai help           打印全部功能（= /aihelp）
  *
  * 环境变量:
- *   CENTER_API         **必填**：你的配置中心地址（例：https://api.example.com）
- *   CENTER_TOKEN       Master 密钥；不设的话 /ai 时会弹框让你输
- *
- * 刻意没有默认地址 —— 这是一个通用插件，不该把别人导向某个人的服务器。
+ *   CENTER_TOKEN       Master 密钥初始值（也可用 /ai token 设置）
  */
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { type Focusable, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { showHelp } from "./help";
-import { pickFromList } from "./form";
 import { showDoctor } from "./doctor";
 import { isExtDisabled, onGateApply } from "./gate";
 
-// 没有默认值：没设就报错提示，而不是偷偷指向某个人的服务器
-const API = (process.env.CENTER_API ?? "").replace(/\/+$/, "");
-/** Master 密钥：优先环境变量 CENTER_TOKEN；没有的话 /ai 时会弹框让你输（只存在内存） */
+/** Master 密钥：优先环境变量 CENTER_TOKEN；也可用 /ai token 设置（只存在内存） */
 let token = process.env.CENTER_TOKEN ?? "";
 const STATUS_KEY = "ai-config";
 const PROJECT_FILE = ".pi/mcp.json";
 
 // ======================= 类型 =======================
-interface Connector {
-	id: number;
-	name: string;
-	/** db=数据库 · server=服务器 */
-	type: string;
-	/** 连接串：postgresql://user:pw@host:5432/db 或 ssh://user:pw@host:22 */
-	conn: string;
-	/** 后端从 scheme 推导的类型（postgres / mysql / ssh…） */
-	kind: string;
-	description: string;
-	/** read=只读 · readwrite=可修改 */
-	access: string;
-	enabled: boolean;
-	tags: string[];
-}
-
 interface McpEntry {
 	command?: string;
 	args?: string[];
@@ -70,271 +47,6 @@ let lastCtx: ExtensionContext | undefined;
 let sessionNames: string[] = [];
 /** 本扩展写进项目 .pi/mcp.json 的名字 */
 let projectNames: string[] = [];
-
-// ======================= 台账 → MCP 配置 =======================
-const WRITE_PATTERNS: Record<string, string> = {
-	"*_write": "hidden",
-	"write_*": "hidden",
-	"insert_*": "hidden",
-	"update_*": "hidden",
-	"delete_*": "hidden",
-	"drop_*": "hidden",
-	"create_*": "hidden",
-	"alter_*": "hidden",
-	"truncate*": "hidden",
-	upload: "hidden",
-	"upload_*": "hidden",
-	execute: "hidden",
-};
-
-/**
- * SSH「只读」命令白名单（正则，逗号拼接传给 --whitelist）。
- *
- * ⚠️ ssh-mcp-server 的白名单是**整串匹配**（要求 match[0] === 整条命令），
- *    所以每条末尾都要 `( .*)?$` 才能带参数。
- * ⚠️ 它内建已拒绝 `; & | ` < > $(` 与换行 —— 重定向/管道/串联天然被挡。
- * ⚠️ 但「命令名对了」不等于安全：参数仍可能有副作用。所以这里刻意收窄：
- *    git 去掉 branch/remote（`git branch -D` 删分支、`git remote set-url` 改远端）；
- *    去掉裸 `ip`（`ip addr add` / `ip link set` 改网络）；去掉 `mount`（可 remount,rw）。
- *    真正的权限边界还是在服务器侧用**受限账号**。
- */
-const SSH_ALLOW: string[] = [
-	"^(ls|ll|cat|head|tail|less|more|wc|grep|rg|stat|file|du|df|tree|readlink|realpath|basename|dirname)( .*)?$",
-	"^find(?! .*(-exec|-delete|-ok|-fprint|-fls))( .*)?$",
-	"^(pwd|whoami|id|groups|hostname|uname|date|uptime|free|ps|printenv|which|type)( .*)?$",
-	"^(ss|netstat|ping|dig|nslookup|traceroute)( .*)?$",
-	"^ip (addr|a|route|r) show( .*)?$",
-	"^ip link show( .*)?$",
-	"^(systemctl (status|list-units|list-unit-files|show|is-active|is-enabled)|journalctl)( .*)?$",
-	"^(docker (ps|images|logs|inspect|stats|version|info))( .*)?$",
-	"^git (status|log|diff|show)( .*)?$",
-	"^(lsblk|lsof|blkid|nvidia-smi)( .*)?$",
-];
-
-/**
- * 连接串 → pi 的 mcpServers 条目。
- * key 是后端从 scheme 推导出的 kind；想支持新类型，在这里加一行即可。
- */
-const MCP_BY_KIND: Record<string, (conn: string, c: Connector) => McpEntry> = {
-	// 用 mcp-postgres-server 而非官方的 server-postgres：
-	// 官方那个**只有只读查询**，无法体现台账里的「可修改」。
-	// PG_ALLOW_WRITE 正对应这个开关。
-	postgres: (conn, c) => ({
-		command: "npx",
-		args: ["-y", "mcp-postgres-server"],
-		env: {
-			DATABASE_URL: conn,
-			PG_ALLOW_WRITE: c.access === "readwrite" ? "true" : "false",
-		},
-		exposure: "codemode",
-	}),
-	sqlite: (conn) => ({
-		command: "npx",
-		args: ["-y", "@modelcontextprotocol/server-sqlite", conn.replace(/^(sqlite|file):(\/\/)?/, "")],
-		exposure: "codemode",
-	}),
-	// 服务器：@fangjunjie/ssh-mcp-server（支持 --whitelist / --privateKey）
-	ssh: (conn, c) => {
-		const u = new URL(conn);
-		const args = ["-y", "@fangjunjie/ssh-mcp-server", "--host", u.hostname];
-		if (u.port) args.push("--port", u.port);
-		if (u.username) args.push("--username", decodeURIComponent(u.username));
-		if (u.password) args.push("--password", decodeURIComponent(u.password));
-		// ?key=~/.ssh/id_ed25519 （或绝对路径）—— ~ 要自己展开
-		const key = u.searchParams.get("key");
-		if (key) args.push("--privateKey", key.replace(/^~(?=[/\\]|$)/, homedir()));
-		const passphrase = u.searchParams.get("passphrase");
-		if (passphrase) args.push("--passphrase", passphrase);
-		// 不要 pty：否则 systemctl status / journalctl 会起分页器卡住
-		args.push("--pty", "false");
-		if (c.access === "read") args.push("--whitelist", SSH_ALLOW.join(","));
-		return { command: "npx", args, exposure: "codemode" };
-	},
-};
-
-/** 把一条台账翻译成 pi 的 mcpServers 条目。返回 null 表示这个类型还没有映射。 */
-function toMcpEntry(c: Connector): McpEntry | null {
-	const maker = MCP_BY_KIND[c.kind];
-	if (!maker || !c.conn.trim()) return null;
-	let entry: McpEntry;
-	try {
-		entry = maker(c.conn.trim(), c);
-	} catch {
-		return null; // 连接串解析失败
-	}
-	entry.description = c.description || `${c.name} (${c.kind})`;
-	// 「只读」→ 屏蔽名字像写操作的 MCP 工具
-	if (c.access === "read") entry.toolExposure = { ...WRITE_PATTERNS };
-	return entry;
-}
-
-function labelOf(c: Connector): string {
-	const bits = [c.name, `· ${c.kind}`];
-	if (c.tags.length) bits.push(`· ${c.tags.join("/")}`);
-	bits.push(c.access === "read" ? "· 只读" : "· 可修改");
-	return bits.join(" ");
-}
-
-// ======================= 多选组件 =======================
-interface Item {
-	value: string;
-	label: string;
-	hint: string;
-	checked: boolean;
-}
-
-class MultiSelect implements Focusable {
-	focused = false;
-	private sel = 0;
-
-	constructor(
-		private theme: Theme,
-		private title: string,
-		private items: Item[],
-		private done: (values: string[] | null) => void,
-	) {}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.done(null);
-			return;
-		}
-		if (matchesKey(data, "up")) {
-			this.sel = (this.sel - 1 + this.items.length) % this.items.length;
-			return;
-		}
-		if (matchesKey(data, "down")) {
-			this.sel = (this.sel + 1) % this.items.length;
-			return;
-		}
-		if (matchesKey(data, "space")) {
-			const it = this.items[this.sel];
-			if (it) it.checked = !it.checked;
-			return;
-		}
-		if (matchesKey(data, "return")) {
-			this.done(this.items.filter((i) => i.checked).map((i) => i.value));
-		}
-	}
-
-	render(width: number): string[] {
-		const t = this.theme;
-		const w = Math.min(78, width);
-		const inner = w - 2;
-		const out: string[] = [];
-		const border = (s: string) => t.fg("border", s);
-
-		out.push(border(`╭${"─".repeat(inner)}╮`));
-		out.push(border("│") + padTo(" " + t.fg("accent", t.bold(this.title)), inner) + border("│"));
-		out.push(border(`├${"─".repeat(inner)}┤`));
-
-		this.items.forEach((it, i) => {
-			const isSel = i === this.sel;
-			const box = it.checked ? t.fg("success", "[✓]") : t.fg("dim", "[ ]");
-			const text = isSel ? t.fg("accent", it.label) : t.fg("text", it.label);
-			const prefix = isSel ? t.fg("accent", "▶ ") : "  ";
-			let line = ` ${prefix}${box} ${text}`;
-			if (it.hint) line += "  " + t.fg("dim", it.hint);
-			out.push(border("│") + padTo(truncateToWidth(line, inner), inner) + border("│"));
-		});
-
-		out.push(border(`├${"─".repeat(inner)}┤`));
-		const checked = this.items.filter((i) => i.checked).length;
-		out.push(
-			border("│") +
-				padTo(" " + t.fg("dim", `↑↓ 移动 · 空格 勾选 · 回车 确定 · esc 取消`), inner) +
-				border("│"),
-		);
-		out.push(border("│") + padTo(" " + t.fg("muted", `已选 ${checked} 项`), inner) + border("│"));
-		out.push(border(`╰${"─".repeat(inner)}╯`));
-		return out;
-	}
-
-	invalidate(): void {}
-	dispose(): void {}
-}
-
-function padTo(s: string, w: number): string {
-	const p = w - visibleWidth(s);
-	return p > 0 ? s + " ".repeat(p) : s;
-}
-
-// ======================= 网络 =======================
-/** 超时/网络类错误才重试；鉴权/HTTP 4xx 之类立刻抛（重试没用） */
-export function isRetriableFetchError(e: unknown): boolean {
-	// 注意：AbortSignal.timeout() 抛的是 DOMException（不是 Error 子类），
-	// 但带 name="TimeoutError"；所以不能只看 instanceof Error，要退回去看 name/message。
-	let msg: string;
-	if (e instanceof Error) {
-		msg = `${e.name} ${e.message}`;
-	} else if (e && typeof e === "object") {
-		const o = e as { name?: unknown; message?: unknown };
-		const s = `${typeof o.name === "string" ? o.name : ""} ${typeof o.message === "string" ? o.message : ""}`.trim();
-		msg = s || String(e);
-	} else {
-		msg = String(e);
-	}
-	return /timeout|abort|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up/i.test(msg);
-}
-
-/** 重试编排：attempts 次，间隔按 delays 依次等。fn 抛不可重试的错立刻上抛。 */
-export async function withRetry<T>(
-	fn: (attempt: number) => Promise<T>,
-	attempts = 3,
-	delays: number[] = [800, 2000],
-	sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-	onRetry?: (info: { attempt: number; attempts: number; error: unknown; waitMs: number }) => void,
-): Promise<T> {
-	let lastErr: unknown;
-	for (let i = 0; i < attempts; i++) {
-		try {
-			return await fn(i);
-		} catch (e) {
-			lastErr = e;
-			if (!isRetriableFetchError(e) || i === attempts - 1) throw e;
-			const waitMs = delays[Math.min(i, delays.length - 1)] ?? 1000;
-			try {
-				onRetry?.({ attempt: i + 1, attempts, error: e, waitMs });
-			} catch {
-				/* 回调自身抛错不能影响重试 */
-			}
-			await sleep(waitMs);
-		}
-	}
-	throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-}
-
-async function fetchConnectors(
-	tok: string,
-	onRetry?: (info: { attempt: number; attempts: number; error: unknown; waitMs: number }) => void,
-): Promise<Connector[]> {
-	if (!API) {
-		throw new Error("没设配置中心地址。请先设环境变量 CENTER_API（例：CENTER_API=https://api.example.com）");
-	}
-	// 后端冷启动第一次常超时（实测 ~10s），所以单次给 20s，再整体重试 3 次。
-	// 只有超时/网络类才重试；401 / 非 ok / 没给明文 立刻抛。
-	return withRetry(async () => {
-		const r = await fetch(`${API}/api/ai/connectors`, {
-			headers: { "X-Brain-Token": tok },
-			signal: AbortSignal.timeout(20000),
-		});
-		if (r.status === 401) throw new Error("密钥不对（401）");
-		if (!r.ok) throw new Error(`中心返回 HTTP ${r.status}`);
-		const j = (await r.json()) as { connectors?: Connector[]; reveal?: boolean };
-		if (!j.reveal) throw new Error("中心没给明文（Token 不对？）");
-		return j.connectors ?? [];
-	}, 3, [800, 2000], undefined, onRetry);
-}
-
-/** 没密钥时弹框让用户输（只存在内存，不写任何文件）。返回 null 表示放弃。 */
-async function ensureToken(ctx: ExtensionContext): Promise<string | null> {
-	if (token) return token;
-	const t = await ctx.ui.input("Center Master 密钥", "用于访问 AI 配置中心（本次会话有效，不落盘）");
-	const v = (t ?? "").trim();
-	if (!v) return null;
-	token = v;
-	return token;
-}
 
 // ======================= 项目级文件 =======================
 function projectFilePath(cwd: string): string {
@@ -375,7 +87,7 @@ export function setupConfig(api: ExtensionAPI): void {
 	pi = api;
 
 	api.registerCommand("ai", {
-		description: "从 AI 配置中心拉取连接（/ai help 看全部功能）",
+		description: "AI 配置：状态 / 撤销 / 密钥 / 自检（/ai help 看全部功能）",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			lastCtx = ctx;
 			if (isExtDisabled()) {
@@ -457,109 +169,8 @@ export function setupConfig(api: ExtensionAPI): void {
 				return;
 			}
 
-			// ---------- /ai ----------
-			if (ctx.mode !== "tui") {
-				ctx.ui.notify("/ai 需要交互式 TUI", "warning");
-				return;
-			}
-
-			// 没有密钥就弹框让用户输
-			const tok = await ensureToken(ctx);
-			if (!tok) {
-				ctx.ui.notify("没有密钥，已取消", "warning");
-				return;
-			}
-
-			let connectors: Connector[];
-			ctx.ui.notify("正在从配置中心拉取…（最多约 60 秒，超时会自动重试）", "info");
-			let retries = 0;
-			const onRetry = (info: { attempt: number; attempts: number; waitMs: number }) => {
-				retries = info.attempt;
-				ctx.ui.notify(
-					`拉取超时，正在重试 ${info.attempt}/${info.attempts - 1}（${Math.round(info.waitMs / 1000)} 秒后）…`,
-					"warning",
-				);
-			};
-			try {
-				connectors = (await fetchConnectors(tok, onRetry)).filter((c) => c.enabled);
-			} catch (e) {
-				const msg = e instanceof Error ? e.message : String(e);
-				const hint = /timeout|abort|fetch failed/i.test(msg)
-					? "（后端可能刚冷启动）已重试 3 次仍失败 —— 等 10 秒再点一次，别连续重试"
-					: "";
-				ctx.ui.notify(`拉取失败：${msg}${hint}`, "error");
-				return;
-			}
-			if (retries > 0) ctx.ui.notify(`拉取成功（重试 ${retries} 次后）`, "info");
-			if (connectors.length === 0) {
-				ctx.ui.notify("台账里没有启用的连接（去 AI 配置中心加一条）", "warning");
-				return;
-			}
-
-			// 1) 多选
-			const items: Item[] = connectors.map((c) => {
-				const entry = toMcpEntry(c);
-				return {
-					value: c.name,
-					label: labelOf(c),
-					hint: entry ? "" : `（${c.kind} 暂未支持）`,
-					checked: false,
-				};
-			});
-			const picked = await ctx.ui.custom<string[] | null>(
-				(_tui, theme, _kb, done) => new MultiSelect(theme, "AI 配置中心 · 选择连接", items, done),
-				{ overlay: true },
-			);
-			if (!picked || picked.length === 0) return;
-
-			// 2) 选应用方式（用弹窗版，别用 ctx.ui.select —— 那个会掉到输入框下面）
-			const mode = await pickFromList(ctx, "应用到哪里？", [
-				"会话级（立即生效，退出 pi 即消失）",
-				"项目级（写入 " + PROJECT_FILE + "，下次启动生效）",
-			]);
-			if (!mode) return;
-
-			const chosen = connectors.filter((c) => picked.includes(c.name));
-			const entries: { name: string; entry: McpEntry }[] = [];
-			const skipped: string[] = [];
-			for (const c of chosen) {
-				const e = toMcpEntry(c);
-				if (e) entries.push({ name: c.name, entry: e });
-				else skipped.push(c.name);
-			}
-			if (entries.length === 0) {
-				ctx.ui.notify("选中的类型都还不支持", "warning");
-				return;
-			}
-
-			// 3) 应用
-			if (mode.startsWith("会话级")) {
-				for (const { name, entry } of entries) {
-					try {
-						pi.registerMcpServer(name, entry as never);
-						if (!sessionNames.includes(name)) sessionNames.push(name);
-					} catch (err) {
-						skipped.push(`${name}(${err instanceof Error ? err.message : err})`);
-					}
-				}
-				refreshStatus();
-				ctx.ui.notify(
-					`已应用 ${entries.length} 个会话级连接（立即生效）` + (skipped.length ? `\n跳过：${skipped.join(", ")}` : ""),
-					"info",
-				);
-			} else {
-				const data = readProjectMcp(ctx.cwd);
-				for (const { name, entry } of entries) {
-					data.mcpServers[name] = entry;
-					if (!projectNames.includes(name)) projectNames.push(name);
-				}
-				const f = writeProjectMcp(ctx.cwd, data);
-				ctx.ui.notify(
-					`已写入 ${f}（${entries.length} 条）\n项目级需要 /reload 或重开 pi 才生效` +
-						(skipped.length ? `\n跳过：${skipped.join(", ")}` : ""),
-					"info",
-				);
-			}
+			// 其它 / 无参数：原来这里是「从配置中心拉取连接」（已删）—— 现在打印说明书
+			showHelp(ctx);
 		},
 	});
 

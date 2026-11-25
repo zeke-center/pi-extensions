@@ -1,8 +1,8 @@
 /**
  * /ai doctor —— AI configure 自检。
  *
- * 为什么要有：以前出错只能靠猜（"MCP 绿点不对"「台账连不上」）。
- * 这里把所有真实状态一次摊开：模块健康度 / 配置中心 / MCP 连接 / 助理 / 看板。
+ * 为什么要有：以前出错只能靠猜（"MCP 绿点不对"「连接连不上」）。
+ * 这里把所有真实状态一次摊开：模块健康度 / 密钥 / MCP 连接 / 助理 / 看板。
  *
  * 用法：/ai doctor   或   /aidoctor
  */
@@ -25,13 +25,12 @@ export function showDoctor(ctx: ExtensionContext): void {
 	L.push(...healthReport());
 	L.push("");
 
-	// ---------- 2. 配置中心 ----------
-	L.push("## 配置中心");
-	const api = (process.env.CENTER_API ?? "").replace(/\/+$/, "");
-	L.push(`- CENTER_API: ${api || "（未设置 → /ai 拉连接会报错）"}`);
+	// ---------- 2. 密钥 ----------
+	// 「从配置中心拉取连接」整段已删（CENTER_API / fetchConnectors），只剩密钥这一项。
+	L.push("## 密钥");
 	L.push(
 		`- CENTER_TOKEN: ${
-			process.env.CENTER_TOKEN ? "已设（环境变量）" : "未设环境变量（可在 /ai 时弹框输入，仅本次会话）"
+			process.env.CENTER_TOKEN ? "已设（环境变量）" : "未设环境变量（可用 /ai token 设置，仅本次会话）"
 		}`,
 	);
 	L.push("");
@@ -45,7 +44,7 @@ export function showDoctor(ctx: ExtensionContext): void {
 	}
 	L.push(`## MCP（共 ${mcp.length}）`);
 	if (mcp.length === 0) {
-		L.push("- （无）—— /ai 拉台账、或手写 .pi/mcp.json 后 /reload");
+		L.push("- （无）—— 手写 .pi/mcp.json 后 /reload");
 	}
 	for (const m of mcp) {
 		L.push(`${m.connected ? "●" : "○"} ${m.name} [${m.level}] ${m.connected ? "已连接" : "未连 / 未验证"}`);
@@ -150,7 +149,7 @@ export function herdrDiagnosticLines(cwd: string): string[] {
 
 export function setupDoctor(api: ExtensionAPI): void {
 	api.registerCommand("aidoctor", {
-		description: "AI configure 自检：MCP 连接 / 台账 / 助理 / 看板 / 模块健康度",
+		description: "AI configure 自检：模块健康度 / MCP 连接 / 助理 / 看板",
 		handler: async (_args: string, ctx: ExtensionContext) => {
 			showDoctor(ctx);
 		},

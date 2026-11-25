@@ -10,11 +10,11 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 export const HELP_TEXT = `AI configure · 全部功能
 
 ▍命令
-/ai                       从 AI 配置中心拉连接（打开选择器）
+/ai                       AI 配置命令总入口（无参数 = 打印这份说明）
   /ai status              看状态：密钥 / 会话级 / 项目级
-  /ai doctor              自检：模块健康度 / 台账 / MCP 连接 / 助理 / 看板（= /aidoctor）
+  /ai doctor              自检：模块健康度 / MCP 连接 / 助理 / 看板（= /aidoctor）
   /ai token               设置 API 密钥
-  /ai off                 关掉本会话拉进来的连接
+  /ai off                 关掉本会话注册的 MCP
   /ai project off         关掉项目级连接
   /ai project clear       清空项目级连接
   /ai help                就是你现在看的这个（文本版说明书）
@@ -60,9 +60,6 @@ export const HELP_TEXT = `AI configure · 全部功能
 /resume-agent             翻看助理的历次会话（它们不在 /resume 里），选中切过去看
   /resume-agent <key>     只看某个助理的
 /agent-resume-back        从助理会话一键返回主会话（/resume 在助理会话里看不到主会话）
-/delegate-mode            看 delegate 默认是同步还是异步
-  /delegate-mode async    默认异步：派完就走，后台跑，完成自动回投主会话（不打断）
-  /delegate-mode sync     默认同步：派完等结果才继续（老行为）
 
   （面板显示：状态 · 已跑多久 · 当前在跑哪个工具及参数 · 结果 · token；
     超过 25 秒没有新事件会提示「⚠ Ns无动静」—— 用来判断它是卡住还是在等；
@@ -84,7 +81,7 @@ delegate(assistant, ...)  派活给临时助理（另起独立 pi 进程），�
   tasks        字符串数组 多件互不依赖的事，并行跑（总耗时≈最慢那件）
   resume       字符串    续跑上次的会话 ID（卡片里那个）
   timeoutMs    数字      超时毫秒，默认 300000，上限 1800000
-  wait         布尔      默认 false（异步）派完就走；true = 同步等结果。不传用 /delegate-mode 的默认
+  wait         布尔      默认异步（不传=异步）；true = 同步等结果（会阻塞主会话，只在用户明确要求时用）
 
 ▍顺带一提：这几个内置命令你会用到
 /reload    改完扩展代码必须执行（改助理模板不用）

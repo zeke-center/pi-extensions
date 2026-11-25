@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.8**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.9**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -12,9 +12,9 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 |---|---|---|
 | `ai-configure/pi-extensions.ts` | 入口：装配下面六个模块 + 注册 `/aihelp`；各模块各自 try/catch（坏一块不带下水） | — |
 | `ai-configure/gate.ts` | **会话级停用总闸**（面板收起、`progress`/`delegate` 从工具表撤下、后台回投暂停） | `/ai-ext` |
-| `ai-configure/config.ts` | **AI 配置中心** | `/ai` |
+| `ai-configure/config.ts` | **MCP 配置管理命令**（撤销 / 状态 / 密钥；拉取功能已于 v2.5.9 删除） | `/ai` |
 | `ai-configure/board.ts` | **任务进度看板**（含中栏运行状态 + 全局用量） | `/board` · `/usage` + `progress` 工具 |
-| `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` · `/resume-agent` · `/agent-resume-back` · `/delegate-mode` + `delegate` 工具 |
+| `ai-configure/delegate.ts` | **派活给临时助理** | `/assistants` · `/resume-agent` · `/agent-resume-back` + `delegate` / `read_result` 工具 |
 | `ai-configure/live.ts` | 子代理实时状态机（把 JSON 事件流翻成可画的行） | — |
 | `ai-configure/panel.ts` | 子代理实时面板（看板正上方整宽，默认） | `/agents` |
 | `ai-configure/mcp-pool.ts` | MCP 候选池 + 影子目录（`mcp` 隔离的底层） | — |
@@ -23,14 +23,14 @@ pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是
 | `ai-configure/actions.ts` | 把**命令和助理**挂成面板里的动作行（助理一人一行、命令走二级选单） | `/aihelp` |
 | `ai-configure/help.ts` | 说明书文案（`/aihelp` 与 `/ai help` 共用一份）| — |
 | `ai-configure/health.ts` | 模块健康度登记（入口失败上报，doctor/状态栏读它） | — |
-| `ai-configure/doctor.ts` | **自检报告**（健康度 / 配置中心 / MCP 连接判定 / 助理 / 看板） | `/ai doctor` = `/aidoctor` |
+| `ai-configure/doctor.ts` | **自检报告**（健康度 / 密钥 / MCP 连接判定 / 助理 / 看板） | `/ai doctor` = `/aidoctor` |
 
 ```text
 pi-extensions/
 ├── ai-configure/        # 一个插件，入口装配 6 个模块
 │   ├── package.json     # 内层清单：显式声明入口（显示名 = pi-extensions，不叫 index）
 │   ├── pi-extensions.ts # 入口：装配下面六个 + 注册 /aihelp；各模块独立 try/catch
-│   ├── config.ts        # 连接台账 → MCP（/ai）
+│   ├── config.ts        # MCP 配置管理命令（/ai 撤销 / 状态 / 密钥）
 │   ├── board.ts         # 进度看板（/board + progress 工具）
 │   ├── delegate.ts      # 派活给临时助理（/assistants + delegate 工具）
 │   ├── live.ts          # 子代理实时状态机（JSON 事件流 → 可画的行）
@@ -93,11 +93,11 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | 命令 | 子命令 | 干什么 |
 |---|---|---|
 | **`/aihelp`** | — | **★ 总控制台（改配置、改助理都在这儿）**：4 组 `助理`（每人一行）/ `委派` / `看板` / `会话级`。`↑↓` 移动 · `回车` 进组/编辑 · `esc` 逐层返回 · `ctrl+s` 保存。文本版说明 = `/ai help` |
-| **`/ai`** | （无参数） | 从 AI 配置中心**拉连接台账**，选完在本会话注册成 MCP server |
+| **`/ai`** | （无参数） | 打印说明书（原来的「拉取连接」入口已于 v2.5.9 删除，MCP 现在写在助理的 `mcp:` 行 / 手写 `.pi/mcp.json`） |
 | | `status` | 看状态：密钥 / 会话级连接 / 项目级连接 |
-| | `doctor` | 自检：模块健康度 / 台账 / MCP 连接 / 助理 / 看板（等价 `/aidoctor`） |
+| | `doctor` | 自检：模块健康度 / MCP 连接 / 助理 / 看板（等价 `/aidoctor`） |
 | | `token` | 设置 API 密钥（内存态，不落盘） |
-| | `off` | 关掉本会话拉进来的连接 |
+| | `off` | 关掉本会话注册的 MCP |
 | | `project off` \| `project clear` | 关掉 / 清空**项目级**连接（写进项目 `.pi/mcp.json`） |
 | | `help`（`?` / `h`） | 打印全部功能与参数（文本版说明书） |
 | **`/aidoctor`** | — | 和 `/ai doctor` 同一个自检报告 |
@@ -128,9 +128,7 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | **`/resume-agent`** | — | 翻看助理的**历次会话**（它们**不在 `/resume` 里**），选中直接切过去看 |
 | | `<key>` | 只看某个助理的（例 `/resume-agent db`） |
 | **`/agent-resume-back`** | — | 从助理会话**一键回主会话**（在助理会话里 `/resume` 扫不到主会话，用这个回来） |
-| **`/delegate-mode`** | （无参数） | 看 delegate 默认同步还是异步 |
-| | `async` | 默认**异步**：派完就走，后台跑，完成自动回投（不打断） |
-| | `sync` | **同步**：派完等结果才继续（老行为） |
+> **派活默认异步**（`/delegate-mode` 命令已于 v2.5.9 删除）：派完就走，后台跑，完成自动回投，主会话始终可交互；要同步只能在派活时显式传 `wait: true`（**会阻塞主会话**）。
 | **`/router`** | `[blind\|readonly\|off]` | 看 / 切 **Router 档位**（Super Agent 主会话的管束强度）。本会话有效、**重启复位**；默认 `blind`（只派活，不许主会话自己动手）。无参数 = 只看当前档 |
 | **`/panes`** | — | 列出本会话的子助理 pane（编号 / 助理 / 状态），标出「自己」和主 pane |
 | **`/pane-close`** | `[all\|编号]` | 关闭卡住的子助理 pane；无参只关「已停 / 失败保留」的；**永远跳过自己和主 pane** |
@@ -138,12 +136,13 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | | `<id>` | 打印该次任务的**完整正文** |
 | | `<id> --raw` | 只输出正文（便于复制） |
 
-**两个工具** —— 不是命令，你**不用打**，模型按需自己调：
+**三个工具** —— 不是命令，你**不用打**，模型按需自己调：
 
 | 工具 | 参数 | 干什么 |
 |---|---|---|
 | `progress` | `action`（必填：`plan`/`step`/`block`/`clear`）、`title`、`steps`、`index`、`status`、`text`、`skipConfirm` | 更新输入框上方那个面板 |
-| `delegate` | `assistant`（必填）、`task` \| `tasks`、`resume`、`timeoutMs`、`wait` | 派活给临时助理（另起独立 pi 进程）；`wait` 默认 false=异步派完就走、完成自动回投，true=同步等结果 |
+| `delegate` | `assistant`（必填）、`task` \| `tasks`、`resume`、`timeoutMs`、`wait` | 派活给临时助理（另起独立 pi 进程）；`wait` 默认 false=异步派完就走、完成自动回投，true=同步等结果（会阻塞主会话） |
+| `read_result` | `id`（必填）、`raw`、`offset`、`limit` | 按需读取某次任务的**归档正文**（默认 120 行、上限 400 行，带行号 + 摘要；`raw: true` 只出正文）—— 不用 `/batch`、不用 resume |
 
 > 带完整参数说明的版本敲 **`/aihelp`**。
 
@@ -182,7 +181,7 @@ pi 会 clone 到自己的包目录，按 `package.json` 里的 `pi.extensions` �
 | `/aihelp`（pi 里） | 全部命令的说明书 |
 
 > **一个 MCP 都不配也能用。** `general` 不挂任何 MCP，靠读文件 / 跑命令 / 改代码干活；
-> 只有 `/ai`（从你自己的台账批量生成 MCP）才需要额外配 `CENTER_API` 和密钥。
+> 要用 MCP 就在助理的 `mcp:` 行里勾（候选池 `mcp-catalog.json` + 用户级/项目级 `mcp.json`）。
 
 | 命令 | 作用 |
 |---|---|
@@ -360,57 +359,27 @@ cp pi-extensions/assistants/*.md ~/.pi/agent/assistants/
 > ⚠️ 别拿它当灯按：切换工具集会被 pi 记进 transcript（下次请求前追加），
 > provider 不支持过渡时会收到完整 checkpoint，**缓存前缀会作废**。
 
-## 模块 1 · config.ts（AI 配置中心）
+## 模块 1 · config.ts（MCP 配置管理命令）
 
-把「连接台账」翻译成 pi 能用的 MCP 配置。台账里只存**账面信息**（类型、连接串、只读/可写），翻译成本扩展负责。
-
-### 命令
+> **v2.5.9 起「从配置中心拉取连接台账」整段删掉了**（用户明确说没用）：不再请求
+> 配置中心的 `api/ai/connectors`，也不再有多选 → 会话级/项目级应用那条流程。
+> 这个模块现在只剩管理命令。
 
 | 命令 | 作用 |
 |---|---|
-| `/ai` | 拉取台账 → 多选连接 → 选应用方式 → 生效 |
-| `/ai token` | 手动输入 Master 密钥（**只存内存，不落盘**） |
+| `/ai` | 无参数 = 打印说明书（原来这里是拉取入口） |
+| `/ai token` | 手动输入 Master 密钥（**只存内存，不落盘**；目前只有 `/ai status` 会看） |
 | `/ai off` | 撤销本次会话级注册 |
 | `/ai project off` | 从当前项目的 `.pi/mcp.json` 移除本扩展写入的条目 |
 | `/ai status` | 查看当前状态 |
+| `/ai doctor` | 自检（= `/aidoctor`） |
+| `/ai help` | 打印全部功能（= `/aihelp` 的文本版） |
 
 ### 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CENTER_TOKEN` | 无 | Master 密钥。不设的话 `/ai` 时会弹框让你输 |
-| `CENTER_API` | **必填** | 你的配置中心地址，例 `https://api.example.com`（末尾斜杠自动去掉）。**没设 → `/ai` 直接报错，不会连任何服务器** |
-
-流程：`GET {CENTER_API}/api/ai/connectors`（带密钥）→ 过滤 `enabled` → 按 `kind` 翻译。
-
-### 两种「应用方式」
-
-| 方式 | 写入位置 | 何时生效 |
-|---|---|---|
-| **会话级** | 不落盘，走 `pi.registerMcpServer()` | **立即生效**，退出 pi 即消失 |
-| **项目级** | 当前项目的 `.pi/mcp.json` | 需要 `/reload` 或重开 pi |
-
-### 支持的连接类型
-
-| `kind` | 生成的 MCP server |
-|---|---|
-| `postgres` | `npx -y mcp-postgres-server`，env 里给 `DATABASE_URL` 和 `PG_ALLOW_WRITE` |
-| `sqlite` | `npx -y @modelcontextprotocol/server-sqlite <db 路径>` |
-| `ssh` | `npx -y @fangjunjie/ssh-mcp-server`，带 `--host/--port/--username/--password`，可选 `--privateKey`、`--passphrase` |
-
-其他 `kind` 会在多选列表里标注「暂未支持」并被跳过。
-
-### 关键行为（权限控制）
-
-- **所有生成的 server 都是 `exposure: "codemode"`** —— 工具默认**不声明给模型**，要由 `codemode` 脚本用 `searchTools()` / `describeTool()` 去找。这样几十个 MCP 工具不会撑爆上下文。
-- **台账 `access: "read"`（只读）时会额外收紧**：
-  - `postgres` → `PG_ALLOW_WRITE=false`
-  - `ssh` → 追加 `--whitelist`，只放行读类命令（`ls/cat/grep/find/ps/systemctl status/journalctl/docker ps/git status…`）
-  - 任何类型 → 名字像写操作的 MCP 工具被设成 `hidden`（`write_*`、`insert_*`、`update_*`、`delete_*`、`drop_*`、`create_*`、`alter_*`、`truncate*`、`upload*`、`execute` 等）
-- `ssh` 一律加 `--pty false`：否则 `systemctl status` / `journalctl` 会起分页器卡住。
-- 用 `postgres` 时选的是 `mcp-postgres-server` 而**不是**官方 `server-postgres`——后者只有只读查询，体现不了台账里的「可修改」。
-- **密钥只管「能不能看到连接串」**：`GET /api/ai/connectors` 不带密钥也返回 `200`（前端的只读模式要用它），但 **`conn` 一律给空字符串** —— 主机 / 端口 / 库名一个都不下发；带了正确密钥才给明文。插件侧反过来更严：拿不到明文（`reveal: false`）就**直接拒绝**，不会拿半截台账去连。
-
+| `CENTER_TOKEN` | 无 | Master 密钥初始值，也可以 `/ai token` 设置 |
 ---
 
 ## 模块 2 · board.ts（任务进度看板）
@@ -801,14 +770,17 @@ pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 
 真的没投成功（发不出去 / 超时）时会标 `undelivered`，面板上显示 `⚠ N 条没回投`，
 可 `/agents bg redeliver` 手动救 —— 不会静默丢。
 
-### 结果去哪儿了（v2.5.6 起）
+### 结果去哪儿了（v2.5.9 起）
 
-子助理跑完后，**正文不再塞进主会话上下文**（避免上下文膨胀），只回投三样：
+子助理跑完后，**正文不再塞进主会话上下文**（避免上下文膨胀）。回投卡带的是：
 - 状态（done / failed / timeout）
-- 摘要（结论首行，≤120 字）
+- **结论 + 证据**（取结构化回执：结论 ≤3 行、证据 ≤5 行；没有回执才退化成摘要首行）
 - 归档路径（`~/.pi/agent/results/<YYYY-MM-DD>/task-<id>.md`）
 
-要看完整正文：`/batch <id>`，或直接打开那个文件。
+> v2.5.9 之前连结论都被归档掉了，用户和 Router 都看不到重点；现在重点直接进回投卡。
+> 卡片摘要也不再抓错行（以前会把正文里的编号列表当成结论）。
+
+要看完整正文，三条路任选：`read_result <id>`（工具，可带 `raw` / `offset` / `limit`）、`/batch <id>`、直接打开那个文件。
 小任务（正文 ≤300 字）仍然直接贴全文，省一步。
 归档保留 30 天（`superagent.resultsKeepDays`，0 = 不清理）。
 
@@ -1074,7 +1046,7 @@ mcp: my-db
 |---|---|---|
 | **候选池** | `~/.pi/agent/mcp-catalog.json` | 自己手写的候选清单。**不会被任何会话自动加载**，只当助理能勾选的候选（名字原来叫「本地目录」，容易和项目级混，已改） |
 | 用户级 | `~/.pi/agent/mcp.json` | 所有会话都加载的那种 |
-| 项目级 | `<cwd>/.pi/mcp.json` | `/ai` 从配置中心拉的线上连接会落到这里 |
+| 项目级 | `<cwd>/.pi/mcp.json` | 你自己（或别的工具）写进去的线上连接；助理勾选时会看到 |
 
 `/assistants edit <key>` 里那个多选框列的就是这三处合起来的候选池，并标注每个是从哪来的。文件不存在会自动建空壳。
 

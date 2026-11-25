@@ -9,7 +9,7 @@
  *   这样 pi 的显示名是 `pi-extensions`，不会和别的插件的 `index` 撞。
  *
  * 模块分工：
- *   config.ts    从 Center 后端拉连接台账 → 注册成 MCP server（命令 /ai）
+ *   config.ts    MCP 配置管理命令（/ai 撤销 / 状态 / 密钥；拉取功能已删）
  *   board.ts     输入框上方的任务进度看板（命令 /board，工具 progress）
  *   delegate.ts  派活给临时助理（命令 /assistants，工具 delegate）
  *   live.ts      子代理实时状态机（消费子进程的 JSON 事件流）

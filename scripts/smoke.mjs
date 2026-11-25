@@ -50,7 +50,6 @@ const EXPECT = [
 	"agents",
 	"resume-agent",
 	"agent-resume-back",
-	"delegate-mode",
 	"panes",
 	"pane-close",
 	"batch",

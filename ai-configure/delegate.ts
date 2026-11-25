@@ -2914,7 +2914,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// ⚠️ pi 1.0.4 起 `-t/--tools` 的语义：**MCP 工具默认保留**，只有白名单里出现
 	//    `mcp__` 开头的条目时才按它过滤 MCP。所以「列了 tools 就必须逐个列出 MCP 工具」
 	//    已经是旧说法（老版本会把 MCP 一起挡掉）。
-	const denyTools = ["delegate", "progress", "git_read", ...(tpl.denyTools ?? [])];
+	const denyTools = ["delegate", "progress", "git_read", "read_result", ...(tpl.denyTools ?? [])];
 	// RPC 模式：stdin 保持打开，才能在到点前发 steering 催它收尾（这是本次改造的全部理由）。
 	// 旧模式 `-p --mode json` 是单向的，写完 prompt 就只能等它自己跑完或被杀。
 	const useRpc = await rpcSupported(cli);
@@ -3414,8 +3414,10 @@ export interface BatchItem {
 	outcome: Outcome;
 	/** 耗时（ms） */
 	elapsedMs: number;
-	/** 该任务的回执正文（取「结论:」那一行） */
+	/** 该任务的回执正文（结论行由 `pickConclusionLine` 从里面挑） */
 	text?: string;
+	/** 结构化回执（有它就先认 `report.conclusion`，比正文第一行准） */
+	report?: WorkerReport;
 	/** 失败原因（failed / busy） */
 	error?: string;
 	/** 降级备注（有它 = 这条算「降级」，标 ⚠️） */
@@ -3426,15 +3428,81 @@ export interface BatchItem {
 	resultPath?: string;
 }
 
-/** 从一段回执正文里取「结论:」那一行（没有就取第一行），压成一行并截断到 90 字 */
-function batchConclusion(text: string | undefined): string {
-	const lines = String(text ?? "")
+/** 「算结论」的标签行（取冒号后面的内容） */
+const CONCLUSION_LABEL_RE = /^\s*(结论|摘要|总结)\s*[:：]\s*(.*)$/;
+/** 全部标签行（状态 / 证据 只是说明，取冒号后内容；空的跳过） */
+const ANY_LABEL_RE = /^\s*(状态|结论|证据|摘要|总结)\s*[:：]\s*(.*)$/;
+/** 列表标记：`1.` `2)` `3、` `- ` `* ` `+ ` */
+const CONCLUSION_LIST_RE = /^\s*(\d+[.)、]|[-*+]\s)/;
+/** 标题 / 装饰行：`【…】`、`### 标题` */
+const CONCLUSION_HEAD_RE = /^\s*(【.*】|#{1,6}\s)/;
+/** 只有符号的分隔行 */
+const CONCLUSION_RULE_RE = /^\s*[-=_*━─]+\s*$/;
+/** 代码块围栏 */
+const CONCLUSION_FENCE_RE = /^\s*```/;
+/** UI 噪声行（折叠面板的「展开 / 收起」、details 标签） */
+const CONCLUSION_NOISE_RE = /^\s*(?:[▸▾▶▼]\s*)?(?:展开|收起)\s*$|^\s*<\/?(?:details|summary)\b/i;
+
+/**
+ * 从一条结果里挑「最能代表结论」的一行；挑不出返回 ""。
+ *
+ * 为什么不能只取正文第一行：Worker 的正文经常以上面的「编号列表 / 任务说明 / 标题」开头，
+ * 取第一行 = 卡片上写的是任务描述，不是结果。优先级：
+ *   1. 结构化回执 `report.conclusion` 的第一行非空行（最准）
+ *   2. 正文里的「结论 / 摘要 / 总结:」标签行（取冒号后内容；多条取最后一条）
+ *   3. 正文第一个有效行（跳过列表标记 / 标题 / 分隔线 / 围栏 / UI 噪声；标签行取冒号后内容，空的跳过）
+ *   4. 都没有 → ""
+ */
+export function pickConclusionLine(text: string, report?: WorkerReport): string {
+	const fromReport = String(report?.conclusion ?? "")
 		.split(/\r?\n/)
 		.map((l) => l.trim())
-		.filter(Boolean);
-	const hit = [...lines].reverse().find((l) => /^结论\s*[:：]/.test(l));
-	const src = (hit ?? lines[0] ?? "").replace(/^结论\s*[:：]\s*/, "");
-	const one = src.replace(/\s+/g, " ").trim() || "（没有结论）";
+		.find(Boolean);
+	if (fromReport) return fromReport.replace(/\s+/g, " ").trim();
+
+	const lines: string[] = [];
+	let inFence = false;
+	for (const raw of String(text ?? "").split(/\r?\n/)) {
+		if (CONCLUSION_FENCE_RE.test(raw.trim())) {
+			inFence = !inFence; // 围栏行本身也不算正文，围栏内的代码整段丢
+			continue;
+		}
+		if (!inFence) lines.push(raw);
+	}
+	// 2) 结论标签行：老行为是多条取最后一条（Worker 常在中间先写一句、末尾给终稿）
+	let label: string | undefined;
+	for (const raw of lines) {
+		const m = raw.match(CONCLUSION_LABEL_RE);
+		const body = m ? m[2].replace(/\s+/g, " ").trim() : "";
+		if (body) label = body;
+	}
+	if (label) return label;
+
+	// 3) 第一个有效行
+	for (const raw of lines) {
+		const line = raw.trim();
+		if (!line) continue;
+		if (
+			CONCLUSION_LIST_RE.test(line) ||
+			CONCLUSION_HEAD_RE.test(line) ||
+			CONCLUSION_RULE_RE.test(line) ||
+			CONCLUSION_NOISE_RE.test(line)
+		)
+			continue;
+		const m = line.match(ANY_LABEL_RE);
+		if (m) {
+			const body = m[2].replace(/\s+/g, " ").trim();
+			if (body) return body;
+			continue; // 冒号后面是空的 → 这行不算正文
+		}
+		return line.replace(/\s+/g, " ").trim();
+	}
+	return "";
+}
+
+/** 从一段回执正文里挑结论行，压成一行并截断到 90 字（挑不出 →「（没有结论）」） */
+function batchConclusion(text: string | undefined, report?: WorkerReport): string {
+	const one = pickConclusionLine(String(text ?? ""), report) || "（没有结论）";
 	return one.length > BATCH_CONCLUSION_MAX ? `${one.slice(0, BATCH_CONCLUSION_MAX)}…` : one;
 }
 
@@ -3473,7 +3541,7 @@ export function buildBatchCard(items: BatchItem[], batchId?: string): string {
 		const who = `${it.name || "worker"}#${i + 1}`;
 		const secs = Math.round((Number(it.elapsedMs) || 0) / 1000);
 		if (it.note) return `⚠️ ${who}  ${oneLine(it.note, BATCH_CONCLUSION_MAX)}`;
-		if (it.outcome === "done") return `✅ ${who}  ${batchConclusion(it.text)}（${secs}s）`;
+		if (it.outcome === "done") return `✅ ${who}  ${batchConclusion(it.text, it.report)}（${secs}s）`;
 		if (it.outcome === "timeout") return `⏱ ${who}  超时（${secs}s）`;
 		if (it.outcome === "empty") return `❌ ${who}  跑完没输出（${secs}s）`;
 		const why = it.error ? oneLine(it.error, BATCH_CONCLUSION_MAX) : it.outcome === "busy" ? "会话正忙，没启动" : "失败";
@@ -3546,6 +3614,7 @@ function batchItemOf(r: RunResult): BatchItem {
 		outcome: r.outcome,
 		elapsedMs: r.elapsedMs,
 		text: r.text || r.partial,
+		report: r.report,
 		error: r.stderrTail || (typeof r.exitCode === "number" ? `退出码 ${r.exitCode}` : ""),
 		note: r.degradeNote,
 		sessionId: r.names.id,
@@ -3564,10 +3633,14 @@ export const BATCH_LIVE_MAX = 4;
 /** 单条实时短卡的硬上限（字符数；一条消息一屏看得完） */
 export const BATCH_LIVE_MAX_CHARS = 60;
 
-/** 短卡里那半句「干了什么」：成功取回执的「结论:」行，失败取原因 */
+/** 短卡里那半句「干了什么」：成功取结论行（挑不出 →「（无结论）」），失败取原因 */
 function batchLiveHeadline(item: BatchItem): string {
 	if (item.note) return oneLine(item.note, BATCH_LIVE_MAX_CHARS);
-	if (item.outcome === "done") return batchConclusion(item.text);
+	if (item.outcome === "done") {
+		// 取不到结论时不能只给前缀（`✅ #3 助理 7s` 等于没说干了什么）→ 明写「（无结论）」
+		const line = pickConclusionLine(String(item.text ?? ""), item.report);
+		return line ? oneLine(line, BATCH_LIVE_MAX_CHARS) : "（无结论）";
+	}
 	if (item.outcome === "timeout") return "超时";
 	if (item.outcome === "empty") return "跑完没输出";
 	if (item.outcome === "busy") return "会话正忙，没启动";
@@ -3742,30 +3815,9 @@ function makeDelegateParams(hint: string) {
 			Type.Number({ description: `超时毫秒（模板可用 timeout 字段给默认值；上限 ${MAX_TIMEOUT_MS}）。` }),
 		),
 		wait: Type.Optional(
-			Type.Boolean({ description: "默认 false（异步）：派完立即返回「已派发」，子进程后台跑，完成后自动把结果回投到主会话（不打断，排队到当前轮后面）。true = 同步等结果（阻塞，派多路时等全部回来）才返回。" }),
+			Type.Boolean({ description: "默认异步（不传=异步）：派完立即返回「已派发」，子进程后台跑，完成后自动回投主会话（不打断）。true = 同步等结果（会阻塞主会话，只有用户明确要求时才用）。" }),
 		),
 	});
-}
-
-// ======================= 默认同步/异步模式 =======================
-/** 模式持久化文件：~/.pi/agent/delegate-mode，内容 sync|async */
-function delegateModeFile(): string {
-	return join(getAgentDir(), "delegate-mode");
-}
-function readDelegateMode(): "sync" | "async" {
-	try {
-		const v = readFileSync(delegateModeFile(), "utf8").trim();
-		return v === "sync" ? "sync" : "async";
-	} catch {
-		return "async"; // 默认异步（派完就走 + 自动回投）
-	}
-}
-function writeDelegateMode(mode: "sync" | "async"): void {
-	try {
-		writeFileSync(delegateModeFile(), mode, "utf8");
-	} catch {
-		/* 写不进去就只生效本次 */
-	}
 }
 
 // ======================= 后台任务（异步派活）=======================
@@ -3904,6 +3956,58 @@ function writeTemplate(file: string, updates: Record<string, string | undefined>
 	}
 	mkdirSync(dirname(file), { recursive: true });
 	writeFileSync(file, `---\n${lines.join("\n")}\n---\n${(body ?? oldBody).trim()}\n`, "utf8");
+}
+
+/** 从助理文件正文里抠出 frontmatter 的 `mcp:` 行（没有这行 → ""）。回读自检用。（导出：单元测试直接用） */
+export function mcpLineInText(text: string): string {
+	const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+	for (const line of (fm?.[1] ?? "").split(/\r?\n/)) {
+		const i = line.indexOf(":");
+		if (i > 0 && line.slice(0, i).trim().toLowerCase() === "mcp") return line.slice(i + 1).trim();
+	}
+	return "";
+}
+
+/**
+ * 写盘后自检：回读刚写的那份文件，把 `mcp:` 行和「期望值」比一下。
+ *
+ * 为什么要这么干：收集勾选的 `mcpValue()` 曾经读错了池（读 root 而不是当前页），
+ * 结果勾选被收集成空串 → `mcp:` 行被整行删掉，而界面照样提示「已保存」——
+ * 这种静默失败只有回读能抓住。
+ *
+ * 返回 true = 一致（或校验本身跑不了）；不一致会 notify 报错。**绝不抛异常**：
+ * 自检只是最后一道防线，不能反过来把保存流程搞挂。
+ */
+export function verifySavedMcp(
+	ctx: Pick<ExtensionContext, "ui">,
+	file: string,
+	expected: string,
+	readText: (f: string) => string = (f) => readFileSync(f, "utf8"),
+): boolean {
+	// `inherit, a` 与 `inherit,a` 视作同一个值
+	const norm = (s: string) =>
+		s
+			.split(",")
+			.map((x) => x.trim())
+			.filter(Boolean)
+			.join(", ");
+	try {
+		let actual = "";
+		try {
+			actual = mcpLineInText(readText(file));
+		} catch {
+			actual = ""; // 读不回来就当没这行 → 走下面的不一致分支，别装没事
+		}
+		const want = norm(expected);
+		if (norm(actual) === want) return true;
+		ctx.ui.notify(
+			`⚠ 保存后校验不一致：期望「mcp: ${want}」实际「${norm(actual)}」，请检查助理文件权限或同名的项目级文件`,
+			"error",
+		);
+		return false;
+	} catch {
+		return true; // 自检自己炸了也不能影响主流程
+	}
 }
 
 const SCOPE_GLOBAL = "全局（所有项目都能用）";
@@ -4259,7 +4363,7 @@ async function commitForm(
 		);
 		if (!go) {
 			ctx.ui.notify(
-				`没保存。\n补连接：把定义放进候选池 ${localCatalogPath()}\n或者 /ai 从配置中心拉（会写到项目级）`,
+				`没保存。\n补连接：把定义放进候选池 ${localCatalogPath()}\n（或手写项目级 .pi/mcp.json）`,
 				"info",
 			);
 			return;
@@ -4274,6 +4378,8 @@ async function commitForm(
 	}
 
 	const notes: string[] = [];
+	// 写盘后自检：勾选的值到底有没有进文件（见 verifySavedMcp）
+	const mcpOk = verifySavedMcp(ctx, file, mcpValue);
 	if (o.original && o.original.file !== file && existsSync(o.original.file)) {
 		notes.push(`原来的那份没动：${o.original.file}（本项目里新的这份优先）`);
 	}
@@ -4282,6 +4388,7 @@ async function commitForm(
 		const n = Object.keys(mainSessionMcpServers(cwdIn)).length;
 		notes.push(`⚠ 已继承主会话 MCP（当前 ${n} 个）—— 派出去时权限等同主会话，可能含可写库 / SSH`);
 	}
+	if (!mcpOk) return; // 不一致已经在 verifySavedMcp 里报错了，不再报「已保存」
 	ctx.ui.notify(`已保存\n${file}\n${notes.join("\n")}\n\n改模板不用 /reload，下次派发立即生效。`, "info");
 }
 function listAssistants(ctx: ExtensionContext, cwd: string): void {
@@ -4930,6 +5037,60 @@ function claimIsStale(f: string): boolean {
 export const DELIVERY_MAX = 800;
 /** 正文短于这个就直给全文（小任务不值得再让人去开文件） */
 export const DELIVERY_SHORT_BODY = 300;
+
+/** 回投里「结论」最多几行（再多就没人看了，而且会把上下文撑胖） */
+export const DELIVERY_CONCLUSION_LINES = 3;
+/** 回投里「证据」最多几行（每条一行） */
+export const DELIVERY_EVIDENCE_LINES = 5;
+
+/** 回投卡里那两段（= 主会话能看到的实质内容） */
+export interface DeliveryDigest {
+	conclusion: string;
+	evidence: string;
+}
+
+/** 取前 `max` 行，**每行压成一行**（回投只留能行动的那几行，别把长日志带进上下文） */
+export function takeLines(s: unknown, max: number): string {
+	const parts = String(s ?? "")
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.filter(Boolean);
+	return parts.slice(0, Math.max(1, Math.floor(Number(max) || 1))).join("\n");
+}
+
+/**
+ * 回执 → 「结论 / 证据」两段（纯函数，便于单测）。
+ *
+ * 字段优先级：回执里**显式**给了 `conclusion` / `evidence` 就用它；
+ * 否则退回回执契约里本来就有的 `notes`（结论）和 `ran` + `changed` + `blocked`（证据）。
+ * 两段都空 → `undefined`，由调用方退化成「正文首行 +（无回执）」。
+ */
+export function reportDigest(report: unknown): DeliveryDigest | undefined {
+	if (!report || typeof report !== "object") return undefined;
+	const o = report as Record<string, unknown>;
+	const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+	const arr = (v: unknown): string[] =>
+		Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").map((x) => x.trim()).filter(Boolean) : [];
+
+	const rawConclusion = str(o.conclusion) || str(o.notes);
+	const evLines: string[] = [];
+	const explicit = str(o.evidence);
+	if (explicit) {
+		evLines.push(...explicit.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
+	} else {
+		evLines.push(...arr(o.ran));
+		const changed = arr(o.changed);
+		if (changed.length)
+			evLines.push(`改了：${changed.slice(0, 5).join(", ")}${changed.length > 5 ? ` …(+${changed.length - 5})` : ""}`);
+		const blocked = arr(o.blocked);
+		if (blocked.length) evLines.push(`被挡：${blocked.slice(0, 3).join(", ")}`);
+	}
+	const conclusion = takeLines(rawConclusion, DELIVERY_CONCLUSION_LINES);
+	const evidence = takeLines(evLines.join("\n"), DELIVERY_EVIDENCE_LINES);
+	if (!conclusion && !evidence) return undefined;
+	return { conclusion, evidence };
+}
+
 /** 投完多久看 isIdle 自证（pi 的 sendUserMessage 是异步起轮的） */
 export const DELIVER_PROOF_MS = 300;
 /** 退避上限：每次失败后隔多久再试（2^n 秒，封顶 60s） */
@@ -4993,12 +5154,36 @@ export function planDeliverFailure(a: {
 	};
 }
 
+/** 大任务回投正文：结论 + 证据 + 归档路径（正文本身留在归档文件里） */
+function bgDeliveryBigText(t: BgTaskFile, head: string, body: string, path: string): string {
+	// 退化成「正文首行」时先把 `<result>` 块去掉：回执里是逐条证据，不是结论
+	const plain = body.replace(/<result>[\s\S]*?<\/result>/gi, "").trim();
+	const digest = reportDigest(parseReport(body));
+	const conclusion = digest?.conclusion || firstLine(plain) || "（回执没写结论）";
+	const evidence = digest?.evidence || "（无回执）";
+	return clampDelivery(
+		[
+			head,
+			`结论: ${conclusion}`,
+			`证据: ${evidence}`,
+			`正文 ${body.length} 字已归档（过程日志/长输出都在里面）`,
+			path ? resultPathLine(path) : "结果：（归档失败）",
+			`会话ID：${t.sessionId}（/batch 可看归档，或 /batch ${t.sessionId} --raw）`,
+		].join("\n"),
+		DELIVERY_MAX,
+	);
+}
+
 /**
- * 要投给主会话的文本：**状态 + 摘要 + 路径**，正文不进上下文。
+ * 要投给主会话的文本：**状态 + 结论 + 证据 + 路径**，正文不进上下文。
  *
  * - 批次汇总卡：本身已经是摘要（每件一行 + 归档路径）→ 原样投
  * - 小任务（正文 ≤ 300 字）：直接给全文
- * - 大任务：只给首行摘要 + 归档路径（正文写进 `.md`，要看就 `/batch <id>`）
+ * - 大任务：结论（≤3 行）+ 证据（≤5 行）+ 归档路径 —— 正文写进 `.md`，
+ *   要看原文用 `read_result <id>` / `/batch <id>`
+ *
+ * ⚠️ 「大任务只给状态 + 路径」踩过坑：连 1352 字、正文就是 4 行结论的任务也被归档，
+ *    主会话和用户都看不到结论 —— 回投的意义（让人知道结果）就没了。
  */
 function bgDeliveryText(t: BgTaskFile): string {
 	// 批次汇总卡：卡里已经带了每个任务的一行结论 + 找回/归档方式 → 原样投（不套壳）
@@ -5017,18 +5202,79 @@ function bgDeliveryText(t: BgTaskFile): string {
 		const text = [head, body, "", `会话ID：${t.sessionId}`, path ? resultPathLine(path) : ""].join("\n").trim();
 		return clampDelivery(text, DELIVERY_MAX);
 	}
-	return clampDelivery(
-		[
-			head,
-			firstLine(body) || "（没有正文）",
-			"",
-			`正文 ${body.length} 字已归档，不在上下文里`,
-			path ? resultPathLine(path) : "（归档失败，可 /resume-agent 续跑查看）",
-			`会话ID：${t.sessionId}（/batch 可看归档）`,
-		].join("\n"),
-		DELIVERY_MAX,
-	);
+	const elapsedMs = Math.max(0, (Number(t.finishedAt) || Date.now()) - (Number(t.startedAt) || Date.now()));
+	const bigHead = `子Agent「${t.name}」回来了（${t.status} · ${Math.round(elapsedMs / 1000)}s）`;
+	return bgDeliveryBigText(t, bigHead, body, path);
 }
+
+// ======================= read_result（按需读回正文） =======================
+/** `read_result` 默认一次给几行（够看结论，又不把上下文撞爆） */
+export const READ_RESULT_LIMIT = 120;
+/** `read_result` 一次最多给几行（夹取；Router 想看更多就分几次 offset 取） */
+export const READ_RESULT_LIMIT_MAX = 400;
+
+/** limit 夹取：不给 / 给烂了 → 默认 120；超过上限 → 折到 400 */
+export function clampReadLimit(limit?: number): number {
+	const n = Number(limit);
+	if (!Number.isFinite(n) || n <= 0) return READ_RESULT_LIMIT;
+	return Math.min(Math.floor(n), READ_RESULT_LIMIT_MAX);
+}
+
+/**
+ * `read_result` 的正文（纯函数，便于单测）。
+ *
+ * - 找不到归档：一句话点明「没找到」+ 去哪看列表
+ * - `raw: true`：只给正文那几行（不带头、不带行号，方便直接引用）
+ * - 默认：头（名字/状态/摘要/行范围）+ 行号，好接 `offset` 继续往后取
+ */
+export function renderReadResult(
+	id: string,
+	r: { name?: string; id?: string; status?: string; summary?: string; body?: string } | undefined,
+	opts: { raw?: boolean; offset?: number; limit?: number } = {},
+): string {
+	if (!r) return `没找到归档：${String(id ?? "").trim()}（用 /batch 看列表）`;
+	const lines = String(r.body ?? "").split(/\r?\n/);
+	const limit = clampReadLimit(opts.limit);
+	const from = Math.max(1, Math.floor(Number(opts.offset) || 1));
+	const to = Math.min(lines.length, from - 1 + limit);
+	const slice = from - 1 >= lines.length ? [] : lines.slice(from - 1, Math.max(from - 1, to));
+	if (opts.raw) return slice.join("\n");
+	return [
+		`# ${r.name || "助理"} · ${r.id}（${r.status || "unknown"}）`,
+		`摘要：${r.summary || "（无）"}`,
+		`正文 ${lines.length} 行，下面是第 ${from}–${Math.max(from, to)} 行（limit ${limit}，上限 ${READ_RESULT_LIMIT_MAX}）`,
+		"",
+		...slice.map((l, i) => `${from + i}\t${l}`),
+	].join("\n");
+}
+
+/** `read_result` 工具：回投卡只给结论 + 证据，正文按需自取（不 resume、不重跑） */
+const READ_RESULT_TOOL = {
+	name: "read_result",
+	label: "读结果正文",
+	description:
+		"按需读回子助理的**归档正文**（回投卡只带结论 + 证据，全文在 <agentDir>/results/<日期>/ 下）。" +
+		"参数 id = 会话ID 或归档文件名；可带 offset/limit 分段读。不要为了看正文去 resume 重跑助理。",
+	promptSnippet: "读子助理回投结果的完整正文（已归档，按需取）",
+	promptGuidelines: [
+		"回投卡里已有结论和证据；要看原文细节（完整报错 / 长日志）才 read_result <会话ID>。",
+		"不要用 read_result 拿全文再去 resume 重跑，也不要同步 wait 卡住主会话。",
+	],
+	parameters: Type.Object({
+		id: Type.String({ description: "会话ID（回投卡里那串）或归档文件名（如 task-a6tffv-xxx.md）" }),
+		raw: Type.Optional(Type.Boolean({ description: "true = 只回正文（不带头部和行号）" })),
+		offset: Type.Optional(Type.Number({ description: "从第几行开始（1 起，默认 1）" })),
+		limit: Type.Optional(Type.Number({ description: `最多给几行（默认 ${READ_RESULT_LIMIT}，上限 ${READ_RESULT_LIMIT_MAX}）` })),
+	}),
+	async execute(
+		_toolCallId: string,
+		params: { id: string; raw?: boolean; offset?: number; limit?: number },
+	): Promise<{ content: { type: "text"; text: string }[] }> {
+		const id = String(params.id ?? "").trim();
+		const r = id ? readArchivedResult(id) : undefined;
+		return { content: [{ type: "text", text: renderReadResult(id, r, params) }] };
+	},
+};
 
 /** 投完等一小会儿再看 self-proof。
  *  ⚠️ 不能用文件里的 `sleep()`：它的计时器 `unref()` 了 —— 进程没别的事时
@@ -5507,8 +5753,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 					details: { ok: false, reason: "ext_off" },
 				};
 			}
-			// wait 参数优先；没传才用 /delegate-mode 的默认（默认异步）
-			const wait = params.wait ?? (readDelegateMode() === "sync");
+			// wait 默认恒异步（不读任何配置文件）：只有用户明确要同步时才传 true
+			const wait = params.wait === true;
 			const cwd = ctx.cwd ?? process.cwd();
 			const templates = loadTemplates(cwd);
 			const resumeId = params.resume?.trim() || undefined;
@@ -5827,8 +6073,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 							type: "text" as const,
 							text:
 								`已派发 ${plan.length} 个任务给「${label}」（后台跑，完成后自动回投主会话${batch ? "，整批合成一张汇总卡" : ""}）：\n` +
-								ids.map((id) => `  · 会话ID ${id}`).join("\n") +
-								`\n\n中途想切同步/异步：/delegate-mode async | sync`,
+								ids.map((id) => `  · 会话ID ${id}`).join("\n"),
 						},
 					],
 					details: { ok: true, async: true, sessions: ids, batchId: batch?.id },
@@ -5851,11 +6096,13 @@ export function setupDelegate(api: ExtensionAPI): void {
 		},
 	};
 	api.registerTool(DELEGATE_TOOL);
+	api.registerTool(READ_RESULT_TOOL);
 
 	// ---------- 停用闸门：delegate 工具撤下 + 后台回投暂停 ----------
 	function applyDelegateGate(off: boolean): void {
 		try {
 			apiRef?.registerTool({ ...DELEGATE_TOOL, exposure: off ? "hidden" : "direct" });
+			apiRef?.registerTool({ ...READ_RESULT_TOOL, exposure: off ? "hidden" : "direct" });
 		} catch (e) {
 			console.error("[ai-configure] delegate: 切换 delegate 工具失败：", e);
 		}
@@ -5933,24 +6180,6 @@ export function setupDelegate(api: ExtensionAPI): void {
 	api.registerCommand("agent-resume-back", {
 		description: "从助理会话一键返回主会话（/resume 在助理会话里看不到主会话，用这个）",
 		handler: async (_args: string, ctx) => backToMain(ctx),
-	});
-
-	api.registerCommand("delegate-mode", {
-		description: "切 delegate 默认模式：async=派完就走+自动回投（默认），sync=派完等结果",
-		handler: async (args: string, ctx) => {
-			const sub = (args ?? "").trim().toLowerCase();
-			const cur = readDelegateMode();
-			if (!sub) {
-				ctx.ui.notify(`delegate 默认模式：${cur}\n用法：/delegate-mode async | sync`, "info");
-				return;
-			}
-			if (sub === "async" || sub === "sync") {
-				writeDelegateMode(sub);
-				ctx.ui.notify(`delegate 默认模式已切成：${sub}\n（delegate 工具没传 wait 时按这个来；传了 wait 以 wait 为准）`, "info");
-				return;
-			}
-			ctx.ui.notify(`不认识「${sub}」。用法：/delegate-mode [async|sync]`, "info");
-		},
 	});
 
 	// ---------- /router：Router 档位（默认只派活） ----------

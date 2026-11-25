@@ -369,7 +369,12 @@ export class FormPane implements Focusable {
 	}
 
 	private mcpValue(): string {
-		return this.mcp.filter((i) => i.checked).map((i) => i.value).join(", ");
+		// 必须用「当前页」的池：/ai 的助理页是压栈页，root 的 this.mcp 是空数组，
+		// 读 this.mcp 会把勾选结果收集成空串（实测：保存后 mcp 行被整行删掉）
+		return this.mcpPool()
+			.filter((i) => i.checked)
+			.map((i) => i.value)
+			.join(", ");
 	}
 
 	/** 把画面补到历史最高高度（少几行就在底边框前插几行空白），防止宿主留残影 */
@@ -973,7 +978,7 @@ export class FormPane implements Focusable {
 			const pool = this.mcpPool();
 			// 「继承主会话」这类特殊项不算候选池内容 —— 池子真的空时仍然要让人知道怎么补
 			if (!pool.some((i) => !i.special))
-				out.push(full(` ${t.fg("dim", "（候选池是空的 —— 先 /ai 拉连接，或写 mcp-catalog.json）")}`));
+				out.push(full(` ${t.fg("dim", "（候选池是空的 —— 写 mcp-catalog.json，或手写 .pi/mcp.json）")}`));
 			pool.forEach((it, i) => {
 				const isSel = i === this.mcpSel;
 				const box = it.checked ? t.fg("success", "[✓]") : t.fg("dim", "[ ]");
