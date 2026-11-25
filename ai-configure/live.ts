@@ -13,6 +13,9 @@
  *   去更新「已跑多久 / 最后事件距今多少秒」，否则用户会以为死机了。
  */
 
+// 命名规则复用 herdr.ts 那一份（pane 标题 / tab 标题 / 面板这一行必须是同一套文案）
+import { paneSummary } from "./herdr";
+
 // ======================= 类型 =======================
 
 /** 语义色调。live.ts 不碰具体颜色，由 panel.ts 映射到主题。 */
@@ -638,7 +641,10 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const tone: Tone = job.status === "done" ? "ok" : job.status === "failed" || job.status === "timeout" ? "err" : icon.tone;
 	const elapsed = fmtDur((isActiveStatus(job.status) ? now : (job.endedAt ?? job.lastEventAt)) - job.startedAt);
 	const target = job.paneId ? `  → pane ${job.paneId}` : job.tabId ? `  → tab ${job.tabId}` : "";
-	const lead = `  sa:${job.name}#${idx}`;
+	// 见名知意：`数据库助理#1 · 查订单表结构`（不再写 `sa:` 前缀 —— 对用户是噪音）
+	const who = `${job.name}#${idx}`;
+	const sum = paneSummary(job.taskBrief);
+	const lead = `  ${who}`;
 	const tail = `  ${elapsed}${target}`;
 	// 最近一个工具名（分屏时用户在真 pane 里能看全，但面板这一行是「一眼看它在干什么」的唯一入口）
 	// 取 tools 的最后一条；MCP 工具剥掉 `mcp__<server>__` 前缀，否则一行放不下
@@ -647,10 +653,10 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	// 宽度先扣掉「标记 + 名字 + 时间 + 去向 + 工具名」，剩下的才给任务摘要。
 	// 宽度不够时**先砍摘要、绝不砍工具名**（任务摘要在 panel 卡片里另有显示，工具名这里没有第二个地方）。
 	const room = width - widthOf(`${mark} ${lead}`) - widthOf(tail) - widthOf(toolSeg);
-	const brief = job.taskBrief && room >= 8 ? `  ${oneLine(job.taskBrief, room)}` : "";
+	const brief = sum && room >= 8 ? ` · ${oneLine(sum, Math.max(4, room - 3))}` : "";
 	const segs: Seg[] = [
 		{ text: `${mark} `, tone },
-		{ text: `sa:${job.name}#${idx}`, tone: "bold" },
+		{ text: who, tone: "bold" },
 		{ text: brief, tone: "muted" },
 		{ text: `  ${elapsed}`, tone: "muted" },
 		{ text: toolSeg, tone: "default" },

@@ -15,7 +15,7 @@
  *   - 环境标识：TERM_PROGRAM=herdr、HERDR_WORKSPACE_ID、HERDR_PANE_ID（本会话自己的 pane）
  *
  * 本文件里还放了三个**纯函数**（不碰命令行，可单测）：
- *   paneLabel / tabLabel —— 命名规则
+ *   paneLabel / tabLabel / tabLabelWithNames —— 命名规则
  *   resolveUiMode       —— auto 到底走 split 还是 tab
  *   planSlot            —— 第 N 个子助理放哪一格
  */
@@ -530,28 +530,111 @@ export function tabClose(tabId: string): boolean {
 
 export type PaneKind = "run" | "ok" | "err" | "stalled" | "stopped";
 
+/** pane 标题的总长度上限（Herdr 的标签栏很窄，太长会被截成看不懂的样子） */
+export const PANE_LABEL_MAX = 40;
+/** 任务摘要最多几个字（中文按 1 个字算） */
+export const PANE_SUMMARY_MAX = 12;
+/** tab 标题的总长度上限 */
+export const TAB_LABEL_MAX = 24;
+
+/** 按字符（不是 UTF-16 码元）截断；超了补一个 `…`，结果长度 ≤ max */
+function truncChars(s: string, max: number): string {
+	const chars = [...s];
+	if (chars.length <= max) return s;
+	if (max <= 1) return chars.slice(0, Math.max(0, max)).join("");
+	return `${chars.slice(0, max - 1).join("")}…`;
+}
+
 /**
- * pane 标题。三个状态各打一个记号 —— 用户在 tab 栏扫一眼就知道哪个跑完了、哪个挂了。
- *   run → `▶ sa:<name>#<idx>`
- *   ok  → `✅ sa:<name>#<idx>`
- *   err → `❌ sa:<name>#<idx>（失败·保留）` —— 失败也把 pane 留着，方便回头看输出
- *   stopped → `⏹ sa:<name>#<idx>（已停·保留）` —— 失败的 pane 被保留了，但里面的 pi 已经 Ctrl+C 停掉
- *   stalled → `❌ sa:<name>#<idx>（卡死已降级）` —— 看门狗收掉的 pane（马上要关，所以不写「保留」）
+ * 任务文本 → 一句话摘要：取第一行、去换行/多余空格、**截到 12 个字**，超了再加 `…`。
+ * 空任务返回空串（调用方据此省掉 ` · 摘要` 那一段）。
+ */
+export function paneSummary(task: string | undefined, max: number = PANE_SUMMARY_MAX): string {
+	const first = String(task ?? "").split(/\r?\n/)[0] ?? "";
+	const s = first.replace(/\s+/g, " ").trim();
+	if (!s) return "";
+	const chars = [...s];
+	const n = Math.max(1, Math.round(max));
+	if (chars.length <= n) return s;
+	return `${chars.slice(0, n).join("")}…`;
+}
+
+/**
+ * `助理名#序号 · 任务摘要`（**不带状态记号**）—— pane 标题、`/panes` 行、面板卡片行共用这一份。
+ * 摘要为空时只输出 `助理名#序号`（不硬塞一个空的 ` · `）。
+ */
+export function paneWho(name: string, idx: number, summary?: string): string {
+	const base = String(name ?? "").trim() || "worker";
+	const sum = paneSummary(summary);
+	return `${base}#${idx}${sum ? ` · ${sum}` : ""}`;
+}
+
+/**
+ * pane 标题：**见名知意** —— `<状态> <助理名>#<序号> · <任务摘要>`。
+ *   run     → `▶ 数据库助理#1 · 查订单表结构`
+ *   ok      → `✅ 通用助理#2 · 改 README 版式`
+ *   stopped → `⏹ 服务器助理#1 · 部署契约（已停）` —— 保留的 pane 里 pi 已经 Ctrl+C 停掉
+ *   err     → `❌ 前端助理#1 · 修菜单高亮（失败）`   —— 失败也把 pane 留着，方便回头看输出
+ *   stalled → `❌ 前端助理#1 · 修菜单高亮（卡死已降级）` —— 看门狗收掉的 pane（马上要关）
+ *
+ * 为什么不再写 `sa:<name>#<idx>`：`sa:` 对用户是噪音，名字+摘要才是「这是谁在干什么」。
+ * 总长上限 40 字符：超了**先砍摘要，再砍名字**（永远是先牺牲次要信息）。
  *
  * 为什么不再写「按回车关闭」：回车关闭从没实现过，写出来就是骗人 —— 文案只说事实。
  */
-export function paneLabel(kind: PaneKind, name: string, idx: number): string {
-	const who = `sa:${name || "worker"}#${idx}`;
-	if (kind === "ok") return `✅ ${who}`;
-	if (kind === "err") return `❌ ${who}（失败·保留）`;
-	if (kind === "stopped") return `⏹ ${who}（已停·保留）`;
-	if (kind === "stalled") return `❌ ${who}（卡死已降级）`;
-	return `▶ ${who}`;
+export function paneLabel(kind: PaneKind, name: string, idx: number, summary?: string): string {
+	const mark = kind === "ok" ? "✅" : kind === "err" || kind === "stalled" ? "❌" : kind === "stopped" ? "⏹" : "▶";
+	const tail = kind === "err" ? "（失败）" : kind === "stopped" ? "（已停）" : kind === "stalled" ? "（卡死已降级）" : "";
+	const base = String(name ?? "").trim() || "worker";
+	const pad = `#${idx}`;
+	let sum = paneSummary(summary);
+	let who = paneWho(base, idx, sum);
+	const build = (): string => `${mark} ${who}${tail}`;
+
+	if ([...build()].length > PANE_LABEL_MAX) {
+		// ① 先砍摘要：算一下去掉摘要后还剩几个字给它
+		const room = PANE_LABEL_MAX - ([...`${mark} ${base}${pad}${tail}`].length + 3);
+		sum = room >= 2 ? truncChars(sum, room) : "";
+		who = paneWho(base, idx, sum);
+	}
+	if ([...build()].length > PANE_LABEL_MAX) {
+		// ② 再砍名字：`#<序号>` 必须留着（和 /panes、/pane-close 的编号对得上）
+		const room = PANE_LABEL_MAX - ([...`${mark} ${pad}${sum ? ` · ${sum}` : ""}${tail}`].length);
+		const kept = room >= 1 ? truncChars(base, room) : "";
+		who = kept ? paneWho(kept, idx, sum) : `${pad}${sum ? ` · ${sum}` : ""}`;
+	}
+	return build();
 }
 
-/** 溢出 tab 的标题：`sa:extra#<n>` */
+/** 溢出 tab 的兜底标题：`sa:<n>`（分配时还不知道会有哪些助理，记账后由 tabLabelWithNames 改名） */
 export function tabLabel(n: number): string {
-	return `sa:extra#${n}`;
+	return `sa:${n}`;
+}
+
+/**
+ * 溢出 tab 的标题（见名知意）：`sa:<n> · <助理名去重列表>`，例如 `sa:1 · 数据库助理,通用助理`。
+ * 规则：去重 → 最多显示 3 个名字 → 还有更多就加 `…` → 总长 ≤ 24 字符（超了先砍名字个数，再截名字）。
+ * 没有名字时退回 `sa:<n>`（刚建 tab、还没记账的那个瞬间）。
+ */
+export function tabLabelWithNames(n: number, names: string[]): string {
+	const uniq: string[] = [];
+	for (const raw of names ?? []) {
+		const s = String(raw ?? "").trim();
+		if (s && !uniq.includes(s)) uniq.push(s);
+	}
+	const num = Math.max(1, Math.round(Number(n) || 1));
+	if (!uniq.length) return `sa:${num}`;
+	const head = `sa:${num} · `;
+	let shown = uniq.slice(0, 3);
+	const more = (): string => (uniq.length > shown.length ? "…" : "");
+	const build = (): string => `${head}${shown.join(",")}${more()}`;
+	while (shown.length > 1 && [...build()].length > TAB_LABEL_MAX) shown = shown.slice(0, -1);
+	if ([...build()].length > TAB_LABEL_MAX) {
+		// 只剩一个名字还超 → 截名字（`…` 的位置留给「还有更多」）
+		const room = TAB_LABEL_MAX - [...head].length - [...more()].length;
+		shown = [truncChars(shown[0] ?? uniq[0] ?? "", Math.max(1, room))];
+	}
+	return build();
 }
 
 /**
@@ -572,6 +655,9 @@ export interface UiConfig {
 	/** "panel" | "split" | "tab" | "auto" */
 	ui: string;
 	/** 主窗口右侧最多放几个 */
+	/**
+	 * 主窗口右侧放几个子助理（0 = 不占主窗口，全进独立 tab；1~2 = 右侧竖切，旧行为）
+	 */
 	mainSlots: number;
 	/** 溢出 tab 里最多放几个（2×2 四宫格 = 4） */
 	overflowSlots: number;
@@ -586,7 +672,8 @@ export const UI_DEFAULTS: UiConfig = {
 	// 没有 herdr / 分屏链路失败 → 自动降级回 panel。用户明确要求默认 auto。
 	// 注意 auto 也依赖 herdr 探测，所以 resolveUiMode 里 herdrOk=false 必须回 panel。
 	ui: "auto",
-	mainSlots: 2,
+	// 0 = 不占主窗口，子助理全进独立 tab（默认，推荐）；1~2 = 主窗口右侧竖切，旧行为
+	mainSlots: 0,
 	overflowSlots: 4,
 	splitRatio: 0.6,
 	paneKeepOnError: true,

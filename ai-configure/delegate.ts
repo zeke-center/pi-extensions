@@ -47,6 +47,7 @@ import {
 	batchLiveEnabled,
 	parseReport,
 	readSuperAgent,
+	readMaxConcurrent,
 	reportHeadline,
 	reportRule,
 	setRouterSession,
@@ -81,6 +82,7 @@ import {
 	markHerdrBroken,
 	paneClose,
 	paneLabel,
+	paneSummary,
 	paneList,
 	paneReadEx,
 	paneRename,
@@ -96,6 +98,8 @@ import {
 	tabCreate,
 	tabLabel,
 	tabLabelMode,
+	tabLabelWithNames,
+	tabRename,
 	workspaceId,
 	type UiConfig,
 	type UiMode,
@@ -1420,6 +1424,8 @@ interface HerdrSlot {
 	paneId: string;
 	tabId?: string;
 	where: "main" | "overflow";
+	/** 这个格子里跑的是哪个助理（显示名）—— 只用来算 tab 标题，账里不参与分配 */
+	name?: string;
 }
 
 /** 进程内槽位表（split / tab 两种模式共用）：key = 全局第几格（planSlot 的 index） */
@@ -1431,7 +1437,7 @@ const herdrSlots = new Map<number, HerdrSlot>();
  */
 const keptPaneAt = new Map<string, number>();
 /**
- * 溢出 tab：key = tab 编号 n（1-based，标签就是 `sa:extra#<n>`），value = herdr 的 tabId。
+ * 溢出 tab：key = tab 编号 n（1-based，标题是 `sa:<n> · <助理名列表>`），value = herdr 的 tabId。
  * 「tab n 的第 m 格」= tabBaseIndex(n, cfg) + m - 1（和 planSlot 共用同一个公式）。
  */
 const herdrExtraTabs = new Map<number, { tabId: string }>();
@@ -1464,11 +1470,13 @@ interface HerdrSlotOps {
 	paneSplit(target: string, dir: "right" | "down", ratio: number, cwd: string): string | undefined;
 	tabCreate(workspace: string, label: string, cwd: string): { tabId: string; paneId: string } | undefined;
 	tabClose(tabId: string): boolean;
+	/** 可选：改 tab 标题（单测注入用；不传就走真的 tabRename） */
+	tabRename?(tabId: string, label: string): boolean;
 	/** 可选：归还槽位时关 pane（单测注入用；不传就走真的 paneClose） */
 	paneClose?(paneId: string): boolean;
 }
 
-const realHerdrSlotOps: HerdrSlotOps = { mainPaneId, workspaceId, paneList, paneSplit, tabCreate, tabClose, paneClose };
+const realHerdrSlotOps: HerdrSlotOps = { mainPaneId, workspaceId, paneList, paneSplit, tabCreate, tabClose, tabRename, paneClose };
 let herdrSlotOps: HerdrSlotOps = realHerdrSlotOps;
 
 /** 单测用：注入假 herdr 桩 / 传 undefined 复位 */
@@ -1600,6 +1608,26 @@ function closeTabIfEmpty(tabId: string | undefined): void {
 	close(tabId);
 }
 
+/**
+ * 溢出 tab 的标题跟着「现有助理」走：`sa:<n> · 数据库助理,通用助理`。
+ * 分配 / 回收槽位后调一次（tab 模式 `sa:tab#n` 不在这套命名里，直接跳过）。
+ * 改不动标签不影响派活 —— 一律吃掉异常。
+ */
+function syncTabLabel(tabId: string | undefined): void {
+	if (!tabId) return;
+	const hit = [...herdrExtraTabs].find(([, t]) => t.tabId === tabId);
+	if (!hit) return;
+	const names = slotsInTab(tabId)
+		.map((s) => String(s.name ?? "").trim())
+		.filter(Boolean);
+	const rename = herdrSlotOps.tabRename ?? tabRename;
+	try {
+		rename(tabId, tabLabelWithNames(hit[0], names));
+	} catch {
+		/* 标签改不动不影响结果 */
+	}
+}
+
 /** 一次分配的结果：`full` = 「格子真的满了，等会儿可能就空出来」（其它失败都是 herdr 抽风） */
 type SlotAttempt = { slot?: HerdrSlot; full: boolean };
 
@@ -1667,8 +1695,8 @@ function allocHerdrSlotOnce(cwd: string, cfg: UiConfig, mode: UiMode): SlotAttem
 		return { slot, full: false };
 	}
 
-	// ---- 3) 现有 tab 都满了 → 新开一个 `sa:extra#n`（n 取最小的、格子全空的编号）----
-	for (let n = 1; n <= 64; n++) {
+	// ---- 3) 现有 tab 都满了 → 新开一个 `sa:<n>`（n 取最小的、格子全空的编号；tab 数不设上限）----
+	for (let n = 1; ; n++) {
 		if (herdrExtraTabs.has(n)) continue;
 		const base = tabBaseIndex(n, cfg);
 		let free = true;
@@ -1754,6 +1782,7 @@ function releaseHerdrSlot(slot: HerdrSlot | undefined, closePane: boolean): void
 	close(slot.paneId);
 	herdrSlots.delete(slot.index);
 	closeTabIfEmpty(slot.tabId);
+	syncTabLabel(slot.tabId); // tab 还在 → 把走了的助理从标题里去掉
 }
 
 /**
@@ -1898,8 +1927,10 @@ export async function stopKeptPane(
 	name: string,
 	idx: number,
 	deps: StopKeptPaneDeps = {},
+	/** 任务摘要（可选）：保留的 pane 也带上一句话，用户切过去不用猜它是干什么的 */
+	summary?: string,
 ): Promise<{ label: string; stopped: boolean; keys: string[]; escalated: boolean }> {
-	const label = paneLabel("stopped", name, idx);
+	const label = paneLabel("stopped", name, idx, summary);
 	const send = deps.sendKeys ?? paneSendKeys;
 	const nap = deps.sleep ?? sleep;
 	const log = deps.log ?? herdrLog;
@@ -2002,6 +2033,17 @@ export function paneIsKept(label: string | undefined): boolean {
 	return l.includes("⏹") || l.includes("❌");
 }
 
+/**
+ * 这个 pane 标题是不是子助理的。
+ * 新命名是 `<状态> <助理名>#<序号> · <摘要>`（没有 `sa:` 前缀了）→ 靠「状态记号 + #编号」认；
+ * 旧命名 `sa:…` / tab 模式的 `sa:tab#n` 照样认（/reload 之前留下的 pane 也能列、能关）。
+ */
+export function isSubagentPaneLabel(label: string | undefined): boolean {
+	const l = String(label ?? "");
+	if (l.includes("sa:")) return true;
+	return /^[▶✅❌⏹]\s/.test(l) && /#\d+/.test(l);
+}
+
 /** /panes 里一行 */
 export interface PaneRow {
 	index: number;
@@ -2030,7 +2072,7 @@ export function buildPaneRows(
 	let next = rows.reduce((m, r) => Math.max(m, r.index), 0);
 	for (const p of panes) {
 		if (!p || !p.paneId || used.has(p.paneId)) continue;
-		if (!String(p.label ?? "").includes("sa:")) continue; // 只管子助理的 pane
+		if (!isSubagentPaneLabel(p.label)) continue; // 只管子助理的 pane
 		used.add(p.paneId);
 		next += 1;
 		rows.push({ index: next, paneId: p.paneId, label: String(p.label ?? "") });
@@ -2054,7 +2096,9 @@ export function formatPaneReport(rows: PaneRow[], selfId?: string, mainId?: stri
 	if (rows.length === 0) return ["当前没有子助理 pane"];
 	const out = ["子助理 pane（本会话）："];
 	for (const r of rows) {
-		const name = r.label || `（herdr 里没标签）${r.paneId}`;
+		// 标题去掉状态记号，剩下的就是 `<助理名>#<序号> · <任务摘要>`（和 pane 标题、面板卡片同一份文案）
+		const who = String(r.label ?? "").replace(/^[▶✅❌⏹]\s*/, "");
+		const name = who || `（herdr 里没标签）${r.paneId}`;
 		out.push(`  #${r.index} ${name}  ${r.paneId}  ${paneStateText(r.label)}`);
 	}
 	out.push(`  （自己：${selfId ?? "未知"} —— 不会被关）`);
@@ -2376,6 +2420,8 @@ async function tryRunInHerdr(
 	sink: Sink,
 	makeResult: (outcome: Outcome, exitCode: number | null) => RunResult,
 ): Promise<RunResult | undefined> {
+	/** pane / tab 标题共用的任务摘要（12 字）—— 先在函数头算好，后面四处重命名都用它 */
+	const summary = paneSummary(task);
 	let slot: HerdrSlot | undefined;
 	let script: string | undefined;
 	/** pane 里的活真的开跑了（这之后**必须有终态**，绝不带着 running 离开） */
@@ -2501,8 +2547,10 @@ async function tryRunInHerdr(
 			return undefined;
 		}
 
-		const label = paneLabel("run", tpl.key, slot.index);
+		const label = paneLabel("run", tpl.name, slot.index, summary);
 		paneRename(slot.paneId, label);
+		slot.name = tpl.name; // 记账：tab 标题要用「这个 tab 里有谁」
+		syncTabLabel(slot.tabId);
 		job.paneId = slot.paneId;
 		job.tabId = slot.tabId;
 		job.uiMode = mode;
@@ -2603,7 +2651,7 @@ async function tryRunInHerdr(
 		// 为什么可以安全的重跑：pane 里的活一个字都没吐（90s 屏幕没变），会话文件里也没有可用的正文，
 		// 所以不存在「跑了两次、结果冲突」；而且这里是**回收后再降级**，不会两个进程同时写会话。
 		if (res.outcome === "stalled") {
-			paneRename(slot.paneId, paneLabel("stalled", tpl.key, slot.index));
+			paneRename(slot.paneId, paneLabel("stalled", tpl.name, slot.index, summary));
 			releaseHerdrSlot(slot, true); // closePane=true：关 pane + 销槽位（溢出 tab 没人了就关 tab）
 			dropLauncher(script);
 			job.paneId = undefined;
@@ -2637,7 +2685,7 @@ async function tryRunInHerdr(
 			const plan = planPaneFinish({ outcome: res.outcome, aborted, keepOnError: cfg.paneKeepOnError });
 			if (plan === "close") {
 				if (res.outcome === "done") {
-					paneRename(slot.paneId, paneLabel("ok", tpl.key, slot.index));
+					paneRename(slot.paneId, paneLabel("ok", tpl.name, slot.index, summary));
 					setTimeout(() => releaseHerdrSlot(slot, true), 2000).unref?.();
 				} else {
 					releaseHerdrSlot(slot, true);
@@ -2647,7 +2695,7 @@ async function tryRunInHerdr(
 				// 交互式 pi 答完/报错都不退出，留着就是活进程白占 pane（切过去像「卡住」）。
 				// 这里对**超时 / 失败 / ESC 中止**一视同仁 —— ESC 以前只让 waitPaneDone 返回 failed，
 				// 却把活着的 pi 留在 pane 里，用户看到的是「停了但没停」。
-				await stopKeptPane(slot.paneId, tpl.key, slot.index);
+				await stopKeptPane(slot.paneId, tpl.name, slot.index, {}, summary);
 				markKept(slot.paneId); // TTL / 回收靠这笔账
 				releaseHerdrSlot(slot, false);
 			}
@@ -2796,7 +2844,8 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// 旧顺序是先 await 槽位再建小票 —— 排队的任务在面板上完全看不见，用户以为派出去的活丢了。
 	// 现在排队期间小票就挂在面板上（status=queued → 渲染成「⏳ 排队中」）。
 	// 注意：槽位已满的判断只是「预判」（用于决定小票初始状态），真正的计量在 acquireRunSlot() 里。
-	const willQueue = activeRuns >= MAX_CONCURRENT_RUNS;
+	const limit = readMaxConcurrent() || MAX_CONCURRENT_RUNS;
+	const willQueue = activeRuns >= limit;
 	const job = newJob({
 		key: tpl.key,
 		name: tpl.name,
@@ -5211,8 +5260,12 @@ function reapStaleLocks(): void {
 }
 
 // ======================= 并发上限（信号量）=======================
-/** 同时最多跑几个助理（超出的排队）。防一次 tasks 派太多把机器/额度打爆。 */
-const MAX_CONCURRENT_RUNS = 4;
+/**
+ * 并发上限的**默认/兜底值**（以前是硬编码上限，现在真正的上限读配置）。
+ * 真上限 = `readMaxConcurrent()`（`ai-extensions.json` → `superagent.maxConcurrent`，默认 8，夹取 1~16）。
+ * 常量保留：算默认值 / 单测断言用，请勿当唯一真相。
+ */
+const MAX_CONCURRENT_RUNS = 8;
 /** kill 发出后等不到 close 的兕底时长：宁可报失败，也绝不泄漏槽位 */
 const ESCAPE_RELEASE_MS = 8_000;
 let activeRuns = 0;
@@ -5220,7 +5273,8 @@ const runSlotWaiters: Array<() => void> = [];
 
 /** 排队拿一个运行名额。拿到后必须调 releaseRunSlot()。 */
 async function acquireRunSlot(): Promise<void> {
-	if (activeRuns < MAX_CONCURRENT_RUNS) {
+	const limit = readMaxConcurrent() || MAX_CONCURRENT_RUNS;
+	if (activeRuns < limit) {
 		activeRuns++;
 		return;
 	}

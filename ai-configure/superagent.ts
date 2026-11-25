@@ -159,6 +159,26 @@ export function readSuperAgent(): SuperAgentState {
 	};
 }
 
+/** 并发上限默认值（同时最多跑几个子助理） */
+export const MAX_CONCURRENT_DEFAULT = 8;
+/** 并发上限的硬上限：再大就不是「并发」而是把机器/额度打爆 */
+export const MAX_CONCURRENT_LIMIT = 16;
+
+/**
+ * 同时最多跑几个子助理（`ai-extensions.json` → `superagent.maxConcurrent`）。
+ * 默认 8，夹取 1~16；读不到 / 坏值 → 默认值。
+ *
+ * delegate.ts 的并发信号量就吃这个值（超过就排队）：
+ * 每个 tab 最多 4 格，满了自动开下一个 tab，**到本上限才排队**。
+ */
+export function readMaxConcurrent(): number {
+	const raw = readExtCfg().superagent;
+	const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	const n = Number(obj.maxConcurrent);
+	if (!Number.isFinite(n)) return MAX_CONCURRENT_DEFAULT;
+	return Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(n)));
+}
+
 /** 模式开了没 —— 别的模块统一从这里读 */
 export function superagentEnabled(): boolean {
 	return readSuperAgent().enabled;
@@ -852,7 +872,8 @@ function registerSuperAgentSettings(): void {
 				"- **auto**：≤2 个用 split，更多溢出到一个「sa:extra」标签里（2×2 四宫格），非 Herdr 自动降级 panel\n\n" +
 				"默认 auto：有 Herdr 就分屏，没有就退回面板卡片。\n" +
 				"Super Agent 全局关掉时也会强制回到 panel。\n\n" +
-				"全部 pane/tab 都用 `sa:<助理>#<序号>` 命名；跑成功自动收起，失败保留（用 /pane-close 关闭，或等 10 分钟自动回收）。",
+				"全部 pane/tab 都**见名知意**：pane = `<状态> <助理名>#<序号> · <任务摘要>`，tab = `sa:<n> · <助理名列表>`。" +
+				"跑成功自动收起，失败保留（用 /pane-close 关闭，或等 10 分钟自动回收）。",
 			kind: "enum",
 			options: UI_OPTIONS,
 			values: UI_VALUES,
@@ -869,8 +890,13 @@ function registerSuperAgentSettings(): void {
 		{
 			key: "superagent.mainSlots",
 			group: SUPERAGENT_GROUP,
-			label: "主窗口格数",
-			desc: "主窗口右侧最多放几个子助理（默认 2，上限 2）。超出就溢出到 `sa:extra` 标签里。",
+			label: "主窗口格数（0 = 不占主窗口，推荐）",
+			desc:
+				"主窗口右侧竖切几格给子助理：\n\n" +
+				"- **0（默认，推荐）**：**不占主窗口** —— 子助理全进独立 tab（每个 tab 最多 4 格 2×2，满了自动开下一个）\n" +
+				"- **1**：主窗口右侧竖切 1 格，多出来的进 tab（旧行为）\n" +
+				"- **2**：主窗口右侧竖切 2 格，多出来的进 tab（旧行为）\n\n" +
+				"0 的好处：对话区一点不被挤小；子助理在 tab 里一样能看全过程。",
 			kind: "number",
 			min: 0,
 			max: 2,
@@ -879,10 +905,27 @@ function registerSuperAgentSettings(): void {
 			set: (v) => patchSuperAgent({ mainSlots: Math.max(0, Math.min(2, Math.round(Number(v) || 0))) }),
 		},
 		{
+			key: "superagent.maxConcurrent",
+			group: SUPERAGENT_GROUP,
+			label: "最大并发",
+			desc:
+				"同时最多跑几个子助理（默认 8）。每个 tab 最多 4 格（2×2），超过就自动开下一个 tab；" +
+				"到达本上限才排队。",
+			kind: "number",
+			min: 1,
+			max: 16,
+			def: MAX_CONCURRENT_DEFAULT,
+			get: () => readMaxConcurrent(),
+			set: (v) =>
+				patchSuperAgent({
+					maxConcurrent: Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(Number(v) || MAX_CONCURRENT_DEFAULT))),
+				}),
+		},
+		{
 			key: "superagent.overflowSlots",
 			group: SUPERAGENT_GROUP,
 			label: "溢出标签格数",
-			desc: "`sa:extra` 标签里最多放几个子助理（默认 4 = 2×2 四宫格，上限 4）。再多的排队等槽位。",
+			desc: "`sa:extra` 标签里最多放几个子助理（默认 4 = 2×2 四宫格，上限 4）。满了会自动再开下一个 tab。",
 			kind: "number",
 			min: 0,
 			max: 4,
