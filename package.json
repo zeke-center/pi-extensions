@@ -1,6 +1,6 @@
 {
   "name": "@zeke-center/pi-extensions",
-  "version": "2.6.3",
+  "version": "2.6.4",
   "description": "Pi 扩展合集：任务面板 + 助理 / MCP 配置管理 + delegate 临时助理 + /resume-agent",
   "keywords": [
     "pi-package"

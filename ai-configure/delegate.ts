@@ -4327,7 +4327,8 @@ function writeBatchLiveItem(batch: BatchState, seq: number, item: BatchItem): vo
 		task: batch.task,
 		sessionId: item.sessionId ?? "",
 		startedAt: Math.max(batch.startedAt, Date.now() - elapsedMs),
-		status: item.outcome === "done" && !item.note ? "done" : "failed",
+		// 提示类 note（继承 MCP）不算失败：只影响"要不要提醒"，不影响"成不成功"
+		status: item.outcome === "done" && !isDegradedNote(item.note) ? "done" : "failed",
 		resultText: batchLiveLiveText(seq, item),
 		finishedAt: Date.now(),
 		delivered: false,
