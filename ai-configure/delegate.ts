@@ -114,7 +114,7 @@ import { addJob, beginRun, consume, getLingerMs, liveJobs as liveJobList, markEn
 import { RpcChannel, rejectDialog } from "./rpc";
 import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, panelMode, setPreferOverlay, snapshotLines, toggleDetail } from "./panel";
 import { isExtDisabled, onGateApply } from "./gate";
-import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, mainSessionMcpServers, MCP_INHERIT, reapStaleShadowDirs, type McpPool, type McpServerDef } from "./mcp-pool";
+import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, mainSessionMcpServers, MCP_INHERIT, reapStaleShadowDirs, type McpPool, type McpServerDef, type ShadowResult } from "./mcp-pool";
 import { AUTO_DELIVER_MAX_ATTEMPTS, autoDeliverSkipReason, bgPruneReason, mergeBgTask, type BgTaskFile, type BgTaskNext } from "./bg-store";
 import { archiveResult, listArchivedResults, pruneArchivedResults, readArchivedResult, resultPathLine } from "./results";
 
@@ -3179,6 +3179,10 @@ async function tryRunInHerdr(
 		slot.startedAt = Date.now();
 
 		stage = "wait";
+		// 轮数上限（模板 frontmatter 覆盖全局配置）。**必须在这个作用域里定义**：
+		// v2.6.0 只在 rpc 分支定义过 maxTurns，pane 分支引用它 → ReferenceError，
+		// 结果派活 1 秒就崩（v2.6.0/2.6.1 事故）。
+		const maxTurns = resolveMaxTurns(tpl.maxTurns, readMaxTurns());
 		let res: Awaited<ReturnType<typeof waitPaneDone>>;
 		try {
 			res = await waitPaneDone(slot, opt.sessionDir, opt.names.id, opt.timeoutMs, opt.signal, delivered, {
@@ -5306,8 +5310,8 @@ export function assistantFormPage(ctx: ExtensionContext, cwd: string, key: strin
 			if (f.key === "dup.project")
 				return (
 					"把**当前这个全局助理**复制一份到本项目的 `.pi/assistants/`，并把工作目录改成当前项目。\n\n" +
-					"为什么：助理分全局/项目两级，**项目级同名覆盖全局**。直接改全局那份 → 所有项目一起变；"+L+
-					"派生一份本项目副本之后，改它只影响这个项目，全局那份原样不动。"+L+L+
+					"为什么：助理分全局/项目两级，**项目级同名覆盖全局**。直接改全局那份 → 所有项目一起变；"+"\n"+
+					"派生一份本项目副本之后，改它只影响这个项目，全局那份原样不动。"+"\n"+L+
 					"复制完重新打开面板就能看到（列表里标「项目」）。"
 				);
 
@@ -7096,7 +7100,7 @@ export function setupDelegate(api: ExtensionAPI): void {
 							: t.status === "running"
 								? "跑着"
 								: "待投";
-						const err = t.lastError ? `  失败:${shortText(t.lastError, 36)}` : "";
+						const err = t.lastError ? `  失败:${oneLine(t.lastError, 36)}` : "";
 						return `${fmtClock(t.startedAt)} ${t.key} · ${st} · 试${t.attempts ?? 0}次${mine}${err}`;
 				});
 				ctx.ui.notify(
