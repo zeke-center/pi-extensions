@@ -4924,7 +4924,7 @@ function buildFields(o: {
 			label: "工作目录",
 			value: o.cwd,
 			kind: "text",
-			hint: "(在哪儿干活：文件读写 / 项目 AGENTS.md)",
+			hint: "(在哪儿干活；**留空 = 跟随当前项目 / 继承底座**)",
 		},
 		modelField(o.model, o.modelOptions ?? []),
 		{ key: "timeout", label: "超时", value: o.timeout, kind: "text", hint: "(10m / 90s / 1.5h，留空 = 5 分钟)" },
@@ -5007,6 +5007,20 @@ function buildFields(o: {
 	];
 }
 
+/**
+ * 工作目录更新计划（纯函数）：**留空 = 继承**（不落 `cwd` 行，跟随底座/当前项目）。
+ *
+ * 踩过的坑：以前写的是 `raw || ctxCwd` 且照样落盘，于是你把它删空、ctrl+s，
+ * 文件里又被填回当前项目目录 —— 想改回“跟随当前项目”永远改不回去。
+ */
+export function planCwdUpdate(
+	raw: string | undefined,
+	ctxCwd: string,
+): { cwdRaw: string; cwdIn: string; inherit: boolean } {
+	const cwdRaw = (raw ?? "").trim();
+	return { cwdRaw, cwdIn: cwdRaw || ctxCwd, inherit: !cwdRaw };
+}
+
 /** 面板交回来的值 → 真正写盘 */
 async function commitForm(
 	ctx: ExtensionContext,
@@ -5031,9 +5045,10 @@ async function commitForm(
 		ctx.ui.notify(`看不懂的超时「${timeout}」（写成 10m / 90s / 1.5h），什么都没存。`, "warning");
 		return;
 	}
-	const cwdIn = (v.cwd ?? "").trim() || o.cwd;
-	if (!existsSync(cwdIn)) {
-		ctx.ui.notify(`工作目录不存在：${cwdIn}\n什么都没存。`, "warning");
+	// 工作目录：**留空 = 继承**（写回时不落 cwd 行，跟随底座/当前项目）
+	const { cwdRaw, cwdIn } = planCwdUpdate(v.cwd, o.cwd);
+	if (cwdRaw && !existsSync(cwdRaw)) {
+		ctx.ui.notify(`工作目录不存在：${cwdRaw}\n什么都没存。`, "warning");
 		return;
 	}
 
@@ -5061,7 +5076,7 @@ async function commitForm(
 		name: nameOut,
 		// 统一写 `description:`（Claude 写法，也是 Router 真正读的那个）；老文件的 `desc:` 由 writeTemplate 就地升级
 		description: (v.desc ?? "").trim(),
-		cwd: cwdIn,
+		cwd: cwdRaw || undefined, // 空 = 不落 cwd 行（继承）
 		model: normModel(v.model),
 		timeout,
 		agents_md: (v.agents_md ?? "是") === "是" ? undefined : "false",
@@ -5183,7 +5198,7 @@ const ASSISTANT_FIELD_DOC: Record<string, string> = {
 	desc:
 		"**什么时候该派它** —— 这句话会写进主会话的 delegate 工具描述，模型靠它决定派谁。\n写清「什么活找它、什么活别找它」，含糊了模型就会乱派。\n\n回车在同一面板里切到编辑视图：能看全文、能分多段写；ctrl+s 保存、esc 取消。",
 	extends: "底座：继承它的正文、工作目录等默认值，再叠上你自己写的部分。\n底座只读（改它会连累所有继承它的助理），要定制就派生一个。",
-	cwd: "工作目录：文件读写、相对路径、项目 AGENTS.md 都按它算。\n留空则继承底座；都没有就用当前项目目录。",
+	cwd: "工作目录：文件读写、相对路径、项目 AGENTS.md 都按它算。\n**留空 = 继承**（有底座就用底座的，没有就跟随当前项目目录）。\n想改回跟随当前项目：把它删干净再 ctrl+s。",
 	model:
 		"模型：派它的时候用哪个模型（回车展开，列表就是 `/model` 里能选的那些）。\n\n选「（继承主会话）」= 跟主 pi 用同一个，主会话切模型它也跟着切；\n选具体某个 = 钉死，省钱的活就派给便宜模型。\n\n拿不到模型列表时这一行会退回手输（填 `provider/model`）。",
 	timeout: "超时：这个助理最长跑多久（`10m` / `90s` / `1.5h`，留空 = 5 分钟）。\n超时会被中止，结果标成 timeout。",
