@@ -16,7 +16,7 @@
  * 用法：node scripts/concurrency-regress.mjs
  */
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -88,7 +88,21 @@ if (!esbuild) {
 }
 
 const tmp = mkdtempSync(join(tmpdir(), "pi-conf-regress-"));
+const agentDir = join(tmp, "agent");
 const stubs = join(root, "scripts", "stubs");
+
+// 压测**自己定并发上限**，不依赖默认值（默认值会演进：v2.5.7 起了 4 → 8）。
+// 配置写进**临时 agentDir** 的 ai-extensions.json（PI_CODING_AGENT_DIR 指向它），
+// 绝不碰真实 ~/.pi/agent；断言里还会再改成 8 验「放得开」。
+function writeAgentCfg(maxConcurrent) {
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(
+		join(agentDir, "ai-extensions.json"),
+		`${JSON.stringify({ superagent: { enabled: true, ui: "panel", maxConcurrent } }, null, 2)}\n`,
+		"utf8",
+	);
+}
+writeAgentCfg(2);
 
 const bundleOut = join(tmp, "delegate-bundle.mjs");
 try {
@@ -213,20 +227,34 @@ markEnd = (job, st, note) => {
 	return origMarkEnd(job, st, note);
 };
 const origAddJob = addJob;
-const seenQueued = new Set();
+let queuedCount = 0; // 小票挂出来时就是 queued ⇒ 说明真的排过队
 addJob = (job) => {
-	if (job.status === "queued") seenQueued.add(job.sessionId);
+	if (job.status === "queued") queuedCount++;
 	return origAddJob(job);
 };
 
-// ---- 路径 A：6 个并发（上限 4）→ 必定排队，全部 done，最后槽位全归还 ----
+// 并发上限由本脚本显式控制（别依赖默认值 —— 默认值改一次压测就假绿/假红）
+const agentCfgFile = __path.join(process.env.PI_CODING_AGENT_DIR, "ai-extensions.json");
+const setLimit = (n) => {
+	__fs.mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+	__fs.writeFileSync(
+		agentCfgFile,
+		JSON.stringify({ superagent: { enabled: true, ui: "panel", maxConcurrent: n } }, null, 2) + "\\n",
+		"utf8",
+	);
+};
+
+// ---- 路径 A：上限 2，派 6 个 → 峰值 2，其中 4 个必须排过队 ----
+setLimit(2);
 process.env.FAKE_MODE = "ok";
+maxActive = 0;
+const queuedBeforeA = queuedCount;
 const many = await Promise.all(
 	Array.from({ length: 6 }, (_, i) => runAssistant(tpl(), "任务 " + i, opt(i + 1))),
 );
-check("A 正常路径：6 个全部 done", many.every((r) => r.outcome === "done"));
-check("A 并发峰值 = 4（上限生效）", maxActive === 4);
-check("A 有任务被排过队（面板能显示「⏳ 排队中」）", seenQueued.size === 2);
+check("A 上限 2：6 个全部 done", many.every((r) => r.outcome === "done"));
+check("A 并发峰值 = 2（上限真的生效，不是默认值凑巧）", maxActive === 2);
+check("A 派 6 个 → 4 个排过队（面板能显示「⏳ 排队中」）", queuedCount - queuedBeforeA === 4);
 check("A 全部结束后 activeRuns = 0（没泄漏）", activeRuns === 0);
 check("A 等待队列清空", runSlotWaiters.length === 0);
 check("A 释放次数 = 拿槽位次数（单次释放，没重复放）", releaseCount === acquireCount);
@@ -253,7 +281,32 @@ check("C 中断路径：activeRuns 回到 0", activeRuns === 0 && runSlotWaiters
 process.env.FAKE_MODE = "ok";
 for (let i = 0; i < 8; i++) await runAssistant(tpl(), "轮次 " + i, opt(20 + i));
 check("D 串行 8 轮后 activeRuns 仍 = 0（不累积漂移）", activeRuns === 0);
-check("D 槽位仍能全开 4 个（上限没缩水）", (await Promise.all(Array.from({ length: 4 }, (_, i) => runAssistant(tpl(), "复查 " + i, opt(40 + i))))).every((r) => r.outcome === "done") && activeRuns === 0);
+setLimit(8);
+maxActive = 0;
+const queuedBeforeD = queuedCount;
+const d4 = await Promise.all(
+	Array.from({ length: 4 }, (_, i) => runAssistant(tpl(), "复查 " + i, opt(40 + i))),
+);
+check(
+	"D 上限 8：4 个能同时跑（峰值 4，没排队，上限没缩水）",
+	d4.every((r) => r.outcome === "done") && maxActive === 4 && queuedCount === queuedBeforeD && activeRuns === 0,
+);
+
+// ---- 路径 E：上限 8，派 6 个 → 峰值 6、queue 次数 = 0（8 格真的放得开）----
+setLimit(8);
+process.env.FAKE_MODE = "ok";
+maxActive = 0;
+const queuedBeforeE = queuedCount;
+const e6 = await Promise.all(
+	Array.from({ length: 6 }, (_, i) => runAssistant(tpl(), "放开 " + i, opt(50 + i))),
+);
+check("E 上限 8：6 个全部 done", e6.every((r) => r.outcome === "done"));
+check("E 上限 8：派 6 个 → 峰值 = 6（没有被上限掐住）", maxActive === 6);
+check("E 上限 8：queue 次数 = 0（8 格放得开）", queuedCount - queuedBeforeE === 0);
+check("E 全部结束后 activeRuns = 0（没泄漏）", activeRuns === 0 && runSlotWaiters.length === 0);
+
+// 收尾：配置还原成起始值（临时目录随后整包删掉，这里只是别留下半吊子状态）
+setLimit(2);
 
 console.log("\\n" + ok + " 通过 / " + bad + " 失败");
 process.exit(bad ? 1 : 0);
@@ -264,7 +317,9 @@ mkdirSync(join(tmp, "work"), { recursive: true });
 mkdirSync(join(tmp, "work", "sessions"), { recursive: true });
 
 console.log(`假 CLI: ${fakeCli}`);
-console.log(`临时目录: ${tmp}\n`);
+console.log(`临时目录: ${tmp}`);
+console.log(`临时 agentDir（并发上限 2）: ${agentDir}\n`);
+let failed = false;
 try {
 	execFileSync(process.execPath, [join(tmp, "regress.mjs")], {
 		stdio: "inherit",
@@ -280,6 +335,17 @@ try {
 		timeout: 180_000,
 	});
 } catch {
-	console.error("\n❌ 并发回归失败");
+	failed = true;
+}
+
+// 清理临时目录（含临时 agentDir）；失败时留着方便看现场
+if (failed) {
+	console.error("\n❌ 并发回归失败（临时目录留着排查）：" + tmp);
 	process.exit(1);
+}
+try {
+	rmSync(tmp, { recursive: true, force: true });
+	console.log("\n🧹 已清理临时目录（不残留 pane / tmp 配置）");
+} catch {
+	/* 删不掉就算了，别因此判失败 */
 }
