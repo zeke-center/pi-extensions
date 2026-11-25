@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.5**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.5.6**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -134,6 +134,9 @@ pi 原生支持两种扩展形态，**两种都会加载**：
 | **`/router`** | `[blind\|readonly\|off]` | 看 / 切 **Router 档位**（Super Agent 主会话的管束强度）。本会话有效、**重启复位**；默认 `blind`（只派活，不许主会话自己动手）。无参数 = 只看当前档 |
 | **`/panes`** | — | 列出本会话的子助理 pane（编号 / 助理 / 状态），标出「自己」和主 pane |
 | **`/pane-close`** | `[all\|编号]` | 关闭卡住的子助理 pane；无参只关「已停 / 失败保留」的；**永远跳过自己和主 pane** |
+| **`/batch`** | — | 列出最近归档的子助理结果（7 天，最多 20 条） |
+| | `<id>` | 打印该次任务的**完整正文** |
+| | `<id> --raw` | 只输出正文（便于复制） |
 
 **两个工具** —— 不是命令，你**不用打**，模型按需自己调：
 
@@ -798,6 +801,17 @@ pi 的规矩（`docs/extensions.md`）：`newSession/fork/switchSession/reload` 
 真的没投成功（发不出去 / 超时）时会标 `undelivered`，面板上显示 `⚠ N 条没回投`，
 可 `/agents bg redeliver` 手动救 —— 不会静默丢。
 
+### 结果去哪儿了（v2.5.6 起）
+
+子助理跑完后，**正文不再塞进主会话上下文**（避免上下文膨胀），只回投三样：
+- 状态（done / failed / timeout）
+- 摘要（结论首行，≤120 字）
+- 归档路径（`~/.pi/agent/results/<YYYY-MM-DD>/task-<id>.md`）
+
+要看完整正文：`/batch <id>`，或直接打开那个文件。
+小任务（正文 ≤300 字）仍然直接贴全文，省一步。
+归档保留 30 天（`superagent.resultsKeepDays`，0 = 不清理）。
+
 ### 命名规则
 
 每次派发都会开一个**会话**，名字分两种：
@@ -1210,6 +1224,8 @@ mcp: my-db
 |---|---|---|
 | `paneKeepOnError` | `true` | 失败 / 超时 / ESC 中止后**保留 pane**（先停掉里面的 pi，标签写「已停」），方便回看现场；`false` 则直接关 |
 | `paneKeepMinutes` | `10` | 保留的 pane 多少分钟后自动回收；**`0` = 永不自动关**（只留给人手动 `/pane-close`） |
+| `batchLive` | `false` | 批量任务每完成一件就回投一条 **≤60 字**短进度卡（一批最多 4 条） |
+| `resultsKeepDays` | `30` | 结果归档保留多少天；**`0` = 不清理** |
 
 - **降级**：`split` / `tab` / `auto` 都需要 Herdr；非 Herdr 环境（没装 CLI / 不是交互式 TUI）**自动降级回 `panel`**，不会派成空任务。Super Agent 全局关掉时也强制 `panel`。
 - **布局**：主窗口右侧竖切两格（`mainSlots = 2`，比例 `splitRatio`）；放不下的进溢出 tab **`sa:extra#n`**，每个 tab **2×2 四宫格**，可多个（`sa:extra#2`、`#3`…）。pane/tab 一律命名 `sa:<助理>#<序号>`，跑成功自动收起，失败保留（按回车关）。
@@ -1231,6 +1247,8 @@ mcp: my-db
 | 更新后一直降级 | 不在 Herdr 终端 / `herdr` 不在 PATH | 卡片上会写原因（**v2.5.4 起不再静默降级**）；装好 herdr 并确保在 `PATH` 里，或干脆改用 `panel` |
 | 子助理失败后 pane 一直留着 | 失败默认保留（`paneKeepOnError`） | `/pane-close` 一键关；或等 10 分钟自动回收（`paneKeepMinutes`） |
 | 按 ESC 停不下来 | 以前只跳出等待 | 现在 ESC 也会停掉 pane 里的进程 |
+| 收到「投递未生效」提示 | 流式竞态或主会话忙 | 会自动重试 6 次、退避封顶 60 秒；仍失败看 `/agents bg`，正文用 `/batch <id>` 取 |
+| 卡片只有摘要没有正文 | v2.5.6 设计如此 | 正文在 `~/.pi/agent/results/`，用 `/batch <id>` 看 |
 
 ---
 

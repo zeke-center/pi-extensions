@@ -42,6 +42,12 @@ export interface BgTaskFile {
 	 */
 	batch?: boolean;
 	/**
+	 * 归档后的**结果文件路径**（`<agentDir>/results/<日期>/task-<id>.md`）。
+	 * 有它就不用 `/resume-agent` 重载上下文：直接看文件（或 `/batch <id>`）就是完整正文。
+	 * 归档失败时没有这个字段 —— 回投卡照旧，只是没有「结果：」那行。
+	 */
+	resultPath?: string;
+	/**
 	 * 这个任务最晚该什么时候有动静（= startedAt + timeoutMs + 余量）。
 	 * `reapStaleBgTasks()` 按它判“是不是真孤儿”，**不能写死 10 分钟** ——
 	 * timeoutMs 最大能到 30 分钟，写死就会把还在正常跑的活在第 10 分钟误判失败

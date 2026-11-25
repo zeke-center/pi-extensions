@@ -107,6 +107,7 @@ import { autoClosePanel, closeAgentPanel, ensureAgentPanel, openAgentPanel, pane
 import { isExtDisabled, onGateApply } from "./gate";
 import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, reapStaleShadowDirs, type McpPool } from "./mcp-pool";
 import { AUTO_DELIVER_MAX_ATTEMPTS, autoDeliverSkipReason, bgPruneReason, mergeBgTask, type BgTaskFile, type BgTaskNext } from "./bg-store";
+import { archiveResult, listArchivedResults, pruneArchivedResults, readArchivedResult, resultPathLine } from "./results";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -1106,6 +1107,76 @@ export function writeHerdrBgTerminal(bgId: string | undefined, fields: HerdrFina
 			finishedAt: prev.finishedAt ?? fields.finishedAt,
 			...(fields.lastError ? { lastError: fields.lastError } : {}),
 		});
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * 收尾归档的一句话摘要（纯函数）：优先 Worker 回报的 `notes`，否则正文开头。
+ * 正文可能很长（几千行），摘要只取一句 —— 要全文看归档文件。
+ */
+function archiveSummary(r: RunResult | undefined, body: string): string {
+	const notes = String(r?.report?.notes ?? "").replace(/\s+/g, " ").trim();
+	if (notes) return oneLine(notes, 120);
+	const flat = String(body ?? "").replace(/\s+/g, " ").trim();
+	if (flat) return oneLine(flat, 120);
+	const err = String(r?.stderrTail ?? "").replace(/\s+/g, " ").trim();
+	return err ? oneLine(err, 120) : "（没有正文）";
+}
+
+/**
+ * 会话 ID → 归档路径（只活在内存）。
+ *
+ * 为什么需要：批次汇总卡要逐件给「结果：<path>」，但 `BatchItem` 里没有路径；
+ * 而批次**不写** per-task 的 `.bg`（写了就每件单独回投一张卡），路径无处可取。
+ * 归档就发生在收尾的那条链上，顺手记一份 —— 没记到（跨 `/reload` 了）就写「未归档」。
+ */
+const archivePathOf = new Map<string, string>();
+
+/**
+ * 单任务收尾：**把完整正文归档到文件**，并顺手把路径回写进 `.bg`（`resultPath`）。
+ *
+ * 为什么要做：回投卡里只有 90 字摘要，正文从来没落盘 —— 想细看只能 `/resume-agent`
+ * 重载整个会话上下文。归档后回投只给「状态 + 摘要 + 路径」，看全文用 `/batch <id>`。
+ *
+ * 底线：**归档失败不影响任务本身** —— 整段自己 try 住，写不进去就返回 undefined。
+ */
+function archiveTaskRun(a: {
+	bgId?: string;
+	tpl: Template;
+	names: Names;
+	task: string;
+	r: RunResult;
+	text: string;
+	status: string;
+}): string | undefined {
+	try {
+		const prev = a.bgId ? readBgTask(a.bgId) : undefined;
+		const body = String(a.text ?? "") || String(a.r?.partial ?? "");
+		const path = archiveResult({
+			id: a.names.id,
+			kind: "task",
+			name: a.tpl.name,
+			status: a.status,
+			...(prev?.startedAt ? { startedAt: prev.startedAt } : {}),
+			finishedAt: Date.now(),
+			summary: archiveSummary(a.r, body),
+			body,
+			meta: {
+				sessionId: a.names.id,
+				task: oneLine(a.task ?? "", 160),
+				outcome: a.r?.outcome,
+				elapsedMs: a.r?.elapsedMs,
+				...(a.bgId ? { bgId: a.bgId } : {}),
+			},
+		});
+		if (path && a.bgId) {
+			const cur = readBgTask(a.bgId);
+			if (cur) writeBgTask({ ...cur, resultPath: path });
+		}
+		if (path) archivePathOf.set(a.names.id, path); // 批次汇总卡要逐件列出路径
+		return path;
 	} catch {
 		return undefined;
 	}
@@ -2340,7 +2411,14 @@ async function tryRunInHerdr(
 		finalized = true;
 		clearGuard();
 		const fields = finalizeHerdrRun({ outcome, text, error, forced });
-		// ① 投递链：onSettle 负责「富卡片 + 交给 pollBgTasks 回投」（rpc 分支走的是同一条链）
+		// ① 正文归档（pane 这条路的收尾点）：完整正文落盘，路径写进 `.bg` 的 resultPath。
+		//    ⚠️ 必须**先于** onSettle：批次汇总卡的「正文归档」段要逐件列路径（archivePathOf）。
+		try {
+			archiveTaskRun({ bgId: opt.bgId, tpl, names: opt.names, task, r, text, status: fields.status });
+		} catch {
+			/* 归档失败不影响任务本身 */
+		}
+		// ② 投递链：onSettle 负责「富卡片 + 交给 pollBgTasks 回投」（rpc 分支走的是同一条链）
 		try {
 			opt.onSettle?.(r);
 		} catch (e) {
@@ -2350,14 +2428,14 @@ async function tryRunInHerdr(
 				/* ignore */
 			}
 		}
-		// ② 保险：onSettle 缺失 / 抛错时也把终态写进 `.bg`
+		// ③ 保险：onSettle 缺失 / 抛错时也把终态写进 `.bg`
 		//    （合并写：不覆盖已有卡片，绝不把 delivered:true 冲回 false）
 		try {
 			writeHerdrBgTerminal(opt.bgId, fields);
 		} catch {
 			/* 已经是最后一道兜底了 */
 		}
-		// ③ 面板小票
+		// ④ 面板小票
 		try {
 			markEnd(
 				job,
@@ -2921,6 +2999,21 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 			r.degradeNote = job.note; // 批次汇总卡要靠它标 ⚠️
 			releaseSessionLock(opt.names.id);
 			releaseSlot(); // 兜底：正常路径在 close/exit 里已经释放过，这里保证「无论如何都释放」
+			// 正文归档（rpc 这条路的收尾点，与 pane 的 settle 对齐）：
+			// ⚠️ 必须**先于** onSettle：批次汇总卡的「正文归档」段要逐件列路径（archivePathOf）。
+			try {
+				archiveTaskRun({
+					bgId: opt.bgId,
+					tpl,
+					names: opt.names,
+					task,
+					r,
+					text: r.text || r.partial,
+					status: outcomeToStatus(outcome),
+				});
+			} catch {
+				/* 归档失败不影响任务本身 */
+			}
 			opt.onSettle?.(r);
 			done(r);
 		};
@@ -3054,6 +3147,44 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 function oneLine(s: string, max: number): string {
 	const t = s.replace(/\s+/g, " ").trim();
 	return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+/** 取第一个**非空**行（压成一行），截到 120 字。回投只用它当摘要，正文不进口袋。 */
+function firstLine(s: string | undefined): string {
+	const line = String(s ?? "")
+		.split(/\r?\n/)
+		.map((l) => l.trim())
+		.find(Boolean) ?? "";
+	return line.length > 120 ? `${line.slice(0, 120)}…` : line;
+}
+
+/** trim 之后再判空。`x || "占位"` 的洞：`"\n\n  "` 是真值 → 会把一堆空白当正文投出去 */
+function trimOrPlaceholder(s: string | undefined, placeholder: string): string {
+	const t = String(s ?? "").trim();
+	return t || placeholder;
+}
+
+/**
+ * 回投文本硬上限（字符数）：超了保留头部 + 尾部（路径/会话ID 这类找回信息），
+ * 中间塞一行「已截断」。上下文是稀缺资源 —— 正文一律进归档文件，不进对话。
+ */
+function clampDelivery(text: string, max: number): string {
+	const s = String(text ?? "").trim();
+	if (s.length <= max) return s;
+	const marker = "…（已截断，完整内容见归档）";
+	const room = max - marker.length - 2; // 两个换行
+	if (room <= 0) return marker.slice(0, Math.max(0, max));
+	// 尾部最多留两行非空（`结果：<path>` / `会话ID：…`）
+	const lines = s.split("\n");
+	const tailLines: string[] = [];
+	for (let i = lines.length - 1; i >= 0 && tailLines.length < 2; i--) {
+		const l = lines[i].trim();
+		if (l) tailLines.unshift(l);
+	}
+	let tail = tailLines.join("\n");
+	if (tail.length > Math.floor(room / 2)) tail = tail.slice(0, Math.floor(room / 2)); // 尾行本身超预算 → 砍尾行
+	const head = s.slice(0, room - tail.length);
+	return `${head}\n${marker}\n${tail}`;
 }
 
 const HEADS: Record<Outcome, (name: string, secs: number, extra: string) => string> = {
@@ -3210,6 +3341,8 @@ export interface BatchItem {
 	note?: string;
 	/** 会话 ID（卡尾保留找回方式） */
 	sessionId?: string;
+	/** 正文归档路径（`results.ts` 写的那份；没归档就不给，卡里写「未归档」） */
+	resultPath?: string;
 }
 
 /** 从一段回执正文里取「结论:」那一行（没有就取第一行），压成一行并截断到 90 字 */
@@ -3224,6 +3357,9 @@ function batchConclusion(text: string | undefined): string {
 	return one.length > BATCH_CONCLUSION_MAX ? `${one.slice(0, BATCH_CONCLUSION_MAX)}…` : one;
 }
 
+/** 批次汇总卡的硬上限（比单任务宽松，但也不能无限） */
+export const BATCH_CARD_MAX = 1600;
+
 /**
  * 批次汇总卡（纯函数，不读盘 / 不看时钟 / 不改入参）：
  *
@@ -3231,12 +3367,14 @@ function batchConclusion(text: string | undefined): string {
  *   ✅ general#1  一句话结论（12s）
  *   ⚠️ general#7  pane 槽位等待 60s 超时已降级 rpc
  *   ❌ general#8  失败原因（3s）
- *   ──── 找回方式 ────
- *   general=a-1 · backend=b-2
+ *   ──── 正文归档 ────
+ *   #1 通用助理  a6tffv-xxx  结果：<path>
+ *   看完整正文：/batch <id>
  *
  * 「合计」= 这批的墙钟耗时（取最慢那条）；空列表也能渲染（不崩）。
+ * 卡里只给摘要 + 路径：正文不在上下文里。
  */
-export function buildBatchCard(items: BatchItem[]): string {
+export function buildBatchCard(items: BatchItem[], batchId?: string): string {
 	const list = Array.isArray(items) ? items : [];
 	const doneOk = list.filter((i) => i.outcome === "done" && !i.note).length;
 	const degraded = list.filter((i) => Boolean(i.note)).length;
@@ -3265,7 +3403,17 @@ export function buildBatchCard(items: BatchItem[]): string {
 	const tail = ids.length
 		? `\n\n──── 找回方式 ────\n${ids.join(" · ")}\n（要它接着做：delegate 带 resume: "<会话ID>"；要看过程：/resume-agent）`
 		: "";
-	return [head, ...rows].join("\n") + tail;
+	// 正文归档段：每件一行「谁 · 会话ID · 路径」。正文不进上下文，要看就开文件 / `/batch <id>`
+	const arch = [
+		"──── 正文归档 ────",
+		...list.map((it, i) => {
+			const who = it.name || "worker";
+			const sid = it.sessionId || "（无会话ID）";
+			return `#${i + 1} ${who}  ${sid}  ${it.resultPath ? resultPathLine(it.resultPath) : "结果：（未归档）"}`;
+		}),
+		`看完整正文：/batch${batchId ? ` ${batchId}` : ""}`,
+	].join("\n");
+	return clampDelivery([head, ...rows].join("\n") + tail + `\n\n${arch}`, BATCH_CARD_MAX);
 }
 
 /** 一批的记账状态（只活在内存：整批 settle 后才落一条 `.bg`） */
@@ -3412,9 +3560,42 @@ function noteBatchItem(batch: BatchState, seq: number, item: BatchItem): void {
 	if (batch.items.size < batch.expected) return;
 	pendingBatches.delete(batch.id);
 
-	const items = [...batch.items.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+	const items = [...batch.items.entries()]
+		.sort((a, b) => a[0] - b[0])
+		.map(([, v]) => v)
+		// 逐件补归档路径（正文归档段要每件一行；没归到的写「未归档」）
+		.map((v) => ({
+			...v,
+			resultPath: v.resultPath ?? (v.sessionId ? archivePathOf.get(v.sessionId) : undefined),
+		}));
 	const anyFail = items.some((i) => i.outcome === "failed" || i.outcome === "busy" || i.outcome === "empty");
 	const allTimeout = items.length > 0 && items.every((i) => i.outcome === "timeout");
+	const card = buildBatchCard(items, batch.id);
+	const status: BgTaskFile["status"] = allTimeout ? "timeout" : anyFail ? "failed" : "done";
+	const finishedAt = Date.now();
+	// 批次汇总卡原文也归档一份（`kind:"batch"`）。
+	// 注意：这里**只归档汇总卡** —— 每个任务的完整正文已经在单任务收尾
+	// （archiveTaskRun）里各自归过档了，再逐件归档等于同一份正文存两遍。
+	let resultPath: string | undefined;
+	try {
+		resultPath = archiveResult({
+			id: batch.id,
+			kind: "batch",
+			name: `批次 ${items.length} 个`,
+			status,
+			startedAt: batch.startedAt,
+			finishedAt,
+			summary: archiveSummary(undefined, card),
+			body: card,
+			meta: {
+				expected: batch.expected,
+				sessionIds: items.map((i) => i.sessionId ?? "").filter(Boolean),
+				outcomes: items.map((i) => i.outcome),
+			},
+		});
+	} catch {
+		/* 归档失败不影响回投 */
+	}
 	writeBgTask({
 		id: batch.id,
 		key: batch.key,
@@ -3422,14 +3603,15 @@ function noteBatchItem(batch: BatchState, seq: number, item: BatchItem): void {
 		task: batch.task,
 		sessionId: items.map((i) => i.sessionId ?? "").filter(Boolean).join(", "),
 		startedAt: batch.startedAt,
-		status: allTimeout ? "timeout" : anyFail ? "failed" : "done",
-		resultText: buildBatchCard(items),
-		finishedAt: Date.now(),
+		status,
+		resultText: card,
+		finishedAt,
 		delivered: false,
 		batch: true,
 		ownerSessionFile: batch.ownerSessionFile,
 		ownerSessionId: batch.ownerSessionId,
 		deadlineAt: batch.deadlineAt,
+		...(resultPath ? { resultPath } : {}),
 	});
 }
 
@@ -4619,44 +4801,151 @@ function claimIsStale(f: string): boolean {
 	}
 }
 
-/** 退避上限：每次失败后隔多久再试（2^n 秒，封顶 30s） */
-const DELIVER_BACKOFF_MAX_MS = 30 * 1000;
+/** 单次回投的字符硬上限：正文一律进归档，不进上下文 */
+export const DELIVERY_MAX = 800;
+/** 正文短于这个就直给全文（小任务不值得再让人去开文件） */
+export const DELIVERY_SHORT_BODY = 300;
+/** 投完多久看 isIdle 自证（pi 的 sendUserMessage 是异步起轮的） */
+export const DELIVER_PROOF_MS = 300;
+/** 退避上限：每次失败后隔多久再试（2^n 秒，封顶 60s） */
+const DELIVER_BACKOFF_MAX_MS = 60 * 1000;
 /** 超过这个时长还是发不出去 → 标 undelivered（不静默丢，但也不无限刷） */
 const DELIVER_GIVEUP_MS = 10 * 60 * 1000;
+/** 「发了却没起一轮」这类失败单独给配额（默认 3 次、’14s 就用完，一次竞态就永久丢） */
+export const DELIVER_RETRY_MAX = 6;
+/** 「发了却没生效」的报错特征（deliverBgTask 自证失败时抛的那句） */
+export const DELIVER_NOT_EFFECTIVE = "投递未生效";
 
 function deliverBackoffMs(attempts: number): number {
-	return Math.min(DELIVER_BACKOFF_MAX_MS, 1000 * 2 ** Math.min(attempts, 5));
+	return Math.min(DELIVER_BACKOFF_MAX_MS, 1000 * 2 ** Math.min(Math.max(0, Number(attempts) || 0), 6));
 }
 
-/** 要投给主会话的文本 */
+/** 这条报错算不算「投了但没生效」（只有这种才放宽重试次数） */
+export function isDeliveryNotEffective(msg: string | undefined): boolean {
+	return String(msg ?? "").includes(DELIVER_NOT_EFFECTIVE);
+}
+
+/** 这类失败最多自动试几次 */
+function deliverRetryCap(msg: string | undefined): number {
+	return isDeliveryNotEffective(msg) ? DELIVER_RETRY_MAX : AUTO_DELIVER_MAX_ATTEMPTS;
+}
+
+/**
+ * 该不该自动投？（`bg-store` 的 `autoDeliverSkipReason` 只认 3 次上限）
+ *
+ * 这里在 delegate 侧开一张小覆盖表：只有「投递未生效」这种**发了没起轮**的错才放宽到
+ * `DELIVER_RETRY_MAX`（bg-store 的常量不动 —— 别的模块/单测依赖它）。
+ */
+export function deliverSkipReason(t: BgTaskFile, now: number = Date.now()): "old" | "attempts" | undefined {
+	const why = autoDeliverSkipReason(t, now);
+	if (why !== "attempts") return why;
+	if (isDeliveryNotEffective(t.lastError) && (t.attempts ?? 0) < DELIVER_RETRY_MAX) return undefined;
+	return why;
+}
+
+/**
+ * 投递失败后怎么记账（纯函数，便于单测）：次数 / 退不退 / 写什么错误。
+ *
+ * 「投递未生效」到第 6 次（`DELIVER_RETRY_MAX`）才放弃，且放弃时把话说清楚。
+ */
+export function planDeliverFailure(a: {
+	attempts: number;
+	msg: string;
+	now: number;
+	firstFailAt: number;
+}): { attempts: number; undelivered: boolean; lastError: string; retryCap: number } {
+	const attempts = Math.max(0, Math.floor(Number(a.attempts) || 0));
+	const msg = String(a.msg ?? "");
+	const cap = deliverRetryCap(msg);
+	const next = attempts + 1;
+	const exhausted = isDeliveryNotEffective(msg) && next >= cap;
+	const byTime = Number(a.now) - Number(a.firstFailAt) > DELIVER_GIVEUP_MS;
+	return {
+		attempts: next,
+		undelivered: exhausted || byTime,
+		lastError: exhausted ? `投递 ${cap} 次未生效，用 /batch 看归档` : msg,
+		retryCap: cap,
+	};
+}
+
+/**
+ * 要投给主会话的文本：**状态 + 摘要 + 路径**，正文不进上下文。
+ *
+ * - 批次汇总卡：本身已经是摘要（每件一行 + 归档路径）→ 原样投
+ * - 小任务（正文 ≤ 300 字）：直接给全文
+ * - 大任务：只给首行摘要 + 归档路径（正文写进 `.md`，要看就 `/batch <id>`）
+ */
 function bgDeliveryText(t: BgTaskFile): string {
-	// 批次汇总卡：卡里已经带了每个任务的一行结论 + 找回方式 → 原样投（不套壳、不再重复会话 ID）
-	if (t.batch) return t.resultText || "（批次没有结果文本）";
-	return (
-		`子Agent「${t.name}」回来了（后台任务）\n${t.resultText || "（没有结果文本）"}\n\n` +
-		`会话ID：${t.sessionId}（要翻看：/resume-agent）`
+	// 批次汇总卡：卡里已经带了每个任务的一行结论 + 找回/归档方式 → 原样投（不套壳）
+	if (t.batch) return clampDelivery(trimOrPlaceholder(t.resultText, "（批次没有结果文本）"), DELIVERY_MAX);
+	const head = `子Agent「${t.name}」回来了（${t.status}）`;
+	const body = String(t.resultText ?? "").trim();
+	const path = String(t.resultPath ?? "").trim();
+	// 纯空白正文（"\n\n  "）不能靠 `||` 当空判 —— trim 后才是真相
+	if (!body) {
+		return clampDelivery(
+			[head, "（没有正文）", "", path ? resultPathLine(path) : "（归档失败，可 /resume-agent 续跑查看）", `会话ID：${t.sessionId}`].join("\n"),
+			DELIVERY_MAX,
+		);
+	}
+	if (body.length <= DELIVERY_SHORT_BODY) {
+		const text = [head, body, "", `会话ID：${t.sessionId}`, path ? resultPathLine(path) : ""].join("\n").trim();
+		return clampDelivery(text, DELIVERY_MAX);
+	}
+	return clampDelivery(
+		[
+			head,
+			firstLine(body) || "（没有正文）",
+			"",
+			`正文 ${body.length} 字已归档，不在上下文里`,
+			path ? resultPathLine(path) : "（归档失败，可 /resume-agent 续跑查看）",
+			`会话ID：${t.sessionId}（/batch 可看归档）`,
+		].join("\n"),
+		DELIVERY_MAX,
 	);
+}
+
+/** 投完等一小会儿再看 self-proof。
+ *  ⚠️ 不能用文件里的 `sleep()`：它的计时器 `unref()` 了 —— 进程没别的事时
+ *  会直接退出（unsettled top-level await），自证就永远轮不到。 */
+function sleepRef(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		setTimeout(resolve, Math.max(0, Number(ms) || 0));
+	});
 }
 
 /**
  * 把一条已完成的后台任务投给主会话。
  *
- * ⚠️ 必须 await：sendUserMessage 返回 Promise，它 reject 时不会被同步 try/catch 接住
- *    （之前就是这么“假成功”的：异常没接住，却照旧写了 delivered:true → 结果永久丢）。
+ * ⚠️ pi 1.5.2 的 `sendUserMessage()` 运行时**根本不返回 Promise**（d.ts 谎报）且异常会被内部吞掉：
+ *    `await` 不会 reject —— 之前就是这么「假成功」的：发了没生效，却照旧写 `delivered:true` → 结果永久丢。
+ *    所以这里投完必须**自证**：空闲时投递必然起一轮 → 投后 `isIdle()` 应变 false；否则算失败进重试。
  */
 async function deliverBgTask(t: BgTaskFile): Promise<void> {
 	if (!apiRef) throw new Error("apiRef 未就绪");
 	if (isExtDisabled()) throw new Error("扩展已停用，不投递");
-	// ⚠️ 只在主会话**空闲**时投，而且**不带 deliverAs**：
-	//    pi 在 streaming 时 sendUserMessage 只是「入队」（followUp），而用户在 interactive 里按
-	//    Esc 中止时 pi 会 clearQueue() 把队列交还给编辑器（modes/interactive/interactive-mode.js）
-	//    —— 卡片压根没进上下文，可发送方已经 resolve，我们会记 delivered:true → 永久不再重投。
-	//    空闲时普通 prompt() 必然起新一轮（唤醒），或者在竞态时直接抛错（被 catch 记失败重试），
-	//    不会假成功。调用方已先判过空闲，这里再判一次纯防竞态。
+	// ⚠️ 只在主会话**空闲**时投：streaming 时 sendUserMessage 只是「入队」
+	//    （用户在 interactive 里按 Esc 中止时 pi 会 clearQueue() 把队列交还给编辑器）
 	if (bgCtx && !bgCtx.isIdle()) {
 		throw new Error("主会话正在跑，等它空闲再投（不排队，避免被 clearQueue 吞掉）");
 	}
-	await apiRef.sendUserMessage(bgDeliveryText(t));
+	const text = bgDeliveryText(t);
+	// 同步抛（assertActive / 旧版不认 deliverAs 的 TypeError）算失败；异步吞掉的靠下面自证
+	let sent: unknown;
+	try {
+		sent = apiRef.sendUserMessage(text, { deliverAs: "followUp" });
+	} catch (e) {
+		if (!(e instanceof TypeError)) throw e;
+		// 旧版 pi 的参数校验更严 → 不带 options 再试一次
+		sent = apiRef.sendUserMessage(text);
+	}
+	// pi 1.5.2 运行时**返回 undefined**（d.ts 谎报 Promise，异常也被内部吞掉）→ 没 thenable 就别等；
+	// 但桩/旧版本真返回 Promise 时得接住（否则 rejection 会变成 unhandled，
+	// 而且我们会把「发失败」当成功记 delivered:true）。
+	if (sent && typeof (sent as Promise<unknown>).then === "function") await (sent as Promise<unknown>);
+	await sleepRef(DELIVER_PROOF_MS);
+	const started = bgCtx ? !bgCtx.isIdle() : true; // 拿不到 ctx 时无法自证，按成功处理
+	if (!started) throw new Error(`${DELIVER_NOT_EFFECTIVE}（agent 仍空闲）——可能是流式竞态，稍后重试`);
 }
 
 /** 每秒扫一遍后台任务：终态、没回投过、且**属于本会话**的 → 回投 */
@@ -4683,7 +4972,7 @@ async function pollBgTasks(): Promise<void> {
 		//    /reload 会重新 load 扩展 → armBgTimer 又挂一轮 1 秒轮询；没有这两条，
 		//    任何一条没落成 delivered:true 的老卡都会**每次 reload 再投一遍**（还顺带唤起主会话跑一轮）。
 		//    跳过的记录**不删**：面板 / `/agents bg` 仍能看到「未投递」，手动 redeliver 可补。
-		if (autoDeliverSkipReason(t, now) && !forcedDeliver.has(t.id)) continue;
+		if (deliverSkipReason(t, now) && !forcedDeliver.has(t.id)) continue;
 		const attempts = t.attempts ?? 0;
 		// 退避：别每秒硬撞
 		if (t.lastAttemptAt && now - t.lastAttemptAt < deliverBackoffMs(attempts)) continue;
@@ -4708,15 +4997,17 @@ async function pollBgTasks(): Promise<void> {
 			const msg = e instanceof Error ? e.message : String(e);
 			// 首次失败就钉住 firstFailAt（之后取最早，不再改）—— 缺了它「多久没发出去」永远算不出来
 			const firstFailAt = t.firstFailAt ?? now;
-			const giveUp = now - firstFailAt > DELIVER_GIVEUP_MS;
+			// 「投递未生效」这类错放宽到 DELIVER_RETRY_MAX 次（否则 14s 就用完配额 → 一次流式竞态就永久丢）
+			const plan = planDeliverFailure({ attempts, msg, now, firstFailAt });
 			writeBgTask({
 				...t,
 				delivered: false,
-				attempts: attempts + 1,
+				attempts: plan.attempts,
 				lastAttemptAt: now,
 				firstFailAt,
-				lastError: msg,
-				undelivered: giveUp, // 超时→不再自动重试，但也不静默丢（面板 + /agents bg 能看到）
+				lastError: plan.lastError,
+				// 超时 / 次数用完 → 不再自动重试，但也不静默丢（面板 + /agents bg 能看到 /batch 归档）
+				undelivered: plan.undelivered,
 			});
 		} finally {
 			forcedDeliver.delete(t.id); // 手动重投只免一次闸门
@@ -5019,6 +5310,12 @@ export function setupDelegate(api: ExtensionAPI): void {
 		reapDeliveredBgTasks(); // 再回收「已投递成功且超 24h」的记账小票（不碰会话文件）
 		reapStaleLocks(); // 再回收 pid 已死/超时的会话运行锁
 		reapStaleShadowDirs(); // 再回收过期的影子目录（每次派发一个，超 24h 的删）
+		// 归档目录保留 `superagent.resultsKeepDays` 天（默认 30，0 = 不清理）
+		try {
+			pruneArchivedResults();
+		} catch {
+			/* 清理失败不影响启动 */
+		}
 		armBgTimer(); // 幂等再挂一次
 	});
 	api.on("session_shutdown", async () => {
@@ -5548,6 +5845,57 @@ export function setupDelegate(api: ExtensionAPI): void {
 			}
 			setRouterSession(hit);
 			ctx.ui.notify(`本会话已切到「${label(hit)}」（${hit}）—— 重启 pi 复位成配置值${offHint}`, "info");
+		},
+	});
+
+	// ---------- /batch：看归档的子助理结果（只读）----------
+	api.registerCommand("batch", {
+		description: "看归档的子助理结果：直接敲=最近 7 天列表（最多 20 条）；/batch <id>=看全文；/batch <id> --raw=只看正文",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const raw = parts.some((p) => p.toLowerCase() === "--raw");
+			const id = parts.filter((p) => !p.startsWith("--"))[0] ?? "";
+			const fmtTime = (ms?: number): string => {
+				if (!Number.isFinite(ms)) return "?";
+				const d = new Date(Number(ms));
+				const p = (n: number): string => String(n).padStart(2, "0");
+				return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+			};
+
+			// 没给 id：列最近 7 天
+			if (!id) {
+				const all = listArchivedResults(7);
+				if (!all.length) {
+					ctx.ui.notify("最近 7 天没有归档。（派活完成后会自动归档到 <agentDir>/results/）", "info");
+					return;
+				}
+				const rows = all.slice(0, 20).map((r) => {
+					const sum = (r.summary || "").replace(/\s+/g, " ").slice(0, 40);
+					return `${fmtTime(r.finishedAt ?? r.startedAt)} · ${r.status} · ${r.name || "?"} · ${sum} · ${r.id}`;
+				});
+				const more = all.length > rows.length ? `\n（还有 ${all.length - rows.length} 条没列，用 /batch <id> 直看正文）` : "";
+				ctx.ui.notify([`【归档】最近 7 天 ${all.length} 条`, ...rows].join("\n") + more, "info");
+				return;
+			}
+
+			// 给了 id：打印正文
+			const hit = readArchivedResult(id);
+			if (!hit) {
+				ctx.ui.notify(`没找到归档：${id}（用 /batch 看列表）`, "info");
+				return;
+			}
+			if (raw) {
+				ctx.ui.notify(hit.body || "（这份归档没有正文）", "info");
+				return;
+			}
+			const head = [
+				`# ${hit.name || "?"} · ${hit.id}`,
+				`- 状态: ${hit.status}`,
+				`- 开始: ${fmtTime(hit.startedAt)}`,
+				`- 结束: ${fmtTime(hit.finishedAt)}`,
+				`- 摘要: ${hit.summary}`,
+			];
+			ctx.ui.notify(`${head.join("\n")}\n\n──── 正文 ────\n${hit.body || "（没有正文）"}`, "info");
 		},
 	});
 

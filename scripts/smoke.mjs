@@ -53,6 +53,7 @@ const EXPECT = [
 	"delegate-mode",
 	"panes",
 	"pane-close",
+	"batch",
 ];
 
 const isWin = process.platform === "win32";

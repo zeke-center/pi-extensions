@@ -187,10 +187,13 @@ export interface WorkerReport {
 	notes: string;
 }
 
-/** 给 Worker 提示词尾部拼的那段（模式关 / 回执关 → 空串，等于什么都没加） */
-export function reportRule(): string {
-	const st = readSuperAgent();
-	if (!st.enabled || st.report === "off") return "";
+/**
+ * 回执约束的文案行（纯函数，便于单测 / 单点维护）。
+ *
+ * 为什么要有长度约束：回投只带「状态 + 摘要 + 路径」，正文归档不进主会话上下文，
+ * 所以 Worker 的 `<result>` 是主会话**唯一**能看到的实质内容 —— 它必须精炼且能直接行动。
+ */
+export function reportRuleLines(): string[] {
 	return [
 		"【回执要求】",
 		"做完之后，**最后**输出一个回执块，格式严格如下（单独一段，不要放进正文中间）：",
@@ -199,7 +202,18 @@ export function reportRule(): string {
 		"- changed：你改过的文件（相对路径）；一个没改就写 []。",
 		"- ran：你真跑过的命令 + 关键输出片段（别编；没跑就 []）。",
 		"- notes：一句话说清你做了什么。",
-	].join("\n");
+		"- 结论：**最多 3 行**，必须能直接行动（做了什么/结果如何/要不要跟进）。",
+		"- 证据：**最多 5 行**，每条一行（命令输出关键行 / 文件:行号 / 数字）。",
+		"- **禁止**把大段代码、完整文件内容、长日志贴进回执（那些放进正文，会自动归档）。",
+		"- 需要我细看时，在证据里写「详见正文」而不是复制过来。",
+	];
+}
+
+/** 给 Worker 提示词尾部拼的那段（模式关 / 回执关 → 空串，等于什么都没加） */
+export function reportRule(): string {
+	const st = readSuperAgent();
+	if (!st.enabled || st.report === "off") return "";
+	return reportRuleLines().join("\n");
 }
 
 // ======================= Router 操作协议（system prompt 段） =======================

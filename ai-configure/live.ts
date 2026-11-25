@@ -617,6 +617,13 @@ function toolLine(t: ToolRun, width: number, now: number): LiveLine {
 }
 
 /**
+ * 正文为空时的卡面兜底文案。
+ *
+ * 为什么需要：回执瘦身后正文会归档、不回上下文，卡上如果留白等于什么都没给用户。
+ */
+export const NO_BODY_TEXT = "（无正文，结果见归档）";
+
+/**
  * 分屏模式（split / tab）的 job：**只画一行**。
  * 为什么不再画工具列表：用户在真 pane 里能看全—— 面板再列一遍只是把对话区挤没。
  * 但**最近一个工具名**要带上（写在后半行的时间后面），否则面板上看不出它在干什么。
@@ -649,7 +656,12 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 		{ text: toolSeg, tone: "default" },
 	];
 	if (target) segs.push({ text: target, tone: "muted" });
-	if (job.note && detail) segs.push({ text: `  ${oneLine(job.note, Math.max(8, Math.floor(width / 3)))}`, tone: "warn" });
+	// 正文为空时的兜底：有 note 就先显 note（比留白强），两者都没有就明说「见归档」
+	if (job.note && (detail || !job.text.trim())) {
+		segs.push({ text: `  ${oneLine(job.note, Math.max(8, Math.floor(width / 3)))}`, tone: "warn" });
+	} else if (!job.text.trim()) {
+		segs.push({ text: `  ${oneLine(NO_BODY_TEXT, Math.max(8, Math.floor(width / 3)))}`, tone: "muted" });
+	}
 	return [{ segs }];
 }
 
@@ -706,6 +718,9 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	if (job.text.trim()) {
 		const tail = job.text.trim().split("\n").filter((l) => l.trim()).slice(-3);
 		for (const l of tail) out.push({ segs: [{ text: `  ${oneLine(l, width - 4)}`, tone: "default" }] });
+	} else if (!job.note) {
+		// 正文空且没 note：别留白（note 有值的话下面那行会显它，不重复）
+		out.push({ segs: [{ text: `  ${oneLine(NO_BODY_TEXT, width - 4)}`, tone: "muted" }] });
 	}
 
 	// 思考（要 detail 才给）
