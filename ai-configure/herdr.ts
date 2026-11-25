@@ -572,6 +572,7 @@ export function paneWho(name: string, idx: number, summary?: string): string {
 /**
  * pane 标题：**见名知意** —— `<状态> <助理名>#<序号> · <任务摘要>`。
  *   run     → `▶ 数据库助理#1 · 查订单表结构`
+ *   run + emoji → `🟡 服务器助理#2 · 跑部署`（健康灯顶掉 `▶`，见第 5 个参数）
  *   ok      → `✅ 通用助理#2 · 改 README 版式`
  *   stopped → `⏹ 服务器助理#1 · 部署契约（已停）` —— 保留的 pane 里 pi 已经 Ctrl+C 停掉
  *   err     → `❌ 前端助理#1 · 修菜单高亮（失败）`   —— 失败也把 pane 留着，方便回头看输出
@@ -582,8 +583,11 @@ export function paneWho(name: string, idx: number, summary?: string): string {
  *
  * 为什么不再写「按回车关闭」：回车关闭从没实现过，写出来就是骗人 —— 文案只说事实。
  */
-export function paneLabel(kind: PaneKind, name: string, idx: number, summary?: string): string {
-	const mark = kind === "ok" ? "✅" : kind === "err" || kind === "stalled" ? "❌" : kind === "stopped" ? "⏹" : "▶";
+export function paneLabel(kind: PaneKind, name: string, idx: number, summary?: string, emoji?: string): string {
+	const mark0 = kind === "ok" ? "✅" : kind === "err" || kind === "stalled" ? "❌" : kind === "stopped" ? "⏹" : "▶";
+	// 健康灯（可选）：给了就**顶掉**状态记号（🟡 服务器助理#2 · 跑部署），没给就保持老样子（▶ …）。
+	// 长度上限/砍法的逻辑完全不变 —— 记号本来就只占 1 个字符位。
+	const mark = String(emoji ?? "").trim() || mark0;
 	const tail = kind === "err" ? "（失败）" : kind === "stopped" ? "（已停）" : kind === "stalled" ? "（卡死已降级）" : "";
 	const base = String(name ?? "").trim() || "worker";
 	const pad = `#${idx}`;

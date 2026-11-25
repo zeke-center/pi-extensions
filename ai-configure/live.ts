@@ -15,6 +15,9 @@
 
 // 命名规则复用 herdr.ts 那一份（pane 标题 / tab 标题 / 面板这一行必须是同一套文案）
 import { paneSummary } from "./herdr";
+// 健康判据的阈值/文案复用 delegate.ts 那一份（delegate → live 已有依赖，这层是反向引用，
+// 只在函数体里用到，不在模块初始化时求值，所以 esbuild 打包不会踩 TDZ）
+import { HEALTH_ACTIVE_MS, HEALTH_SLOW_MS, fmtDuration, healthEmoji, type WorkerHealth } from "./delegate";
 
 // ======================= 类型 =======================
 
@@ -94,6 +97,12 @@ export interface LiveJob {
 	tabId?: string;
 	uiMode?: "panel" | "split" | "tab";
 	slotIndex?: number;
+	/** worker 健康判定（delegate 采样后写入；没样本 = 不显示健康提示） */
+	health?: WorkerHealth;
+	/** 最后一次活动距今多少毫秒（采样时算好） */
+	idleMs?: number;
+	/** worker 有没有子进程在跑（有 → 长命令静默不算异常，不报「无输出」） */
+	hasChildProc?: boolean;
 }
 
 const TEXT_LIMIT = 2000;
@@ -545,8 +554,39 @@ export interface RenderOpts {
 	maxLines?: number;
 }
 
-/** 静默多久就提醒「可能卡住」。 */
+/** 静默多久就提醒「可能卡住」。
+ * @deprecated 从 v2.6.1 起「无动静」改用健康判据（`healthLine`）：阈值是 `HEALTH_ACTIVE_MS` / `HEALTH_SLOW_MS`，
+ * 而且有子进程在跑时**不报「无输出」**（长命令静默是正常的）。保留只为兼容旧引用。 */
 export const STALE_MS = 25_000;
+
+/**
+ * 卡片上「最后输出 / 无输出警告」那一段（**纯函数**，时间已算好 → 直接断言）。
+ *
+ * 规则（和 delegate.ts 的 `judgeWorkerHealth` 同一套阈值，不另立标准）：
+ *   - 没有样本 / 拿不到 idleMs / `idleMs < 30s` → 什么都不显示（不扰民）
+ *   - 进程已退 → 不显示（状态行自己会说完成/失败）
+ *   - **有子进程在跑** → 只写「最后输出 Xs 前」（长命令静默是正常的，不算异常）
+ *   - 无子进程 + 30s~90s → `⚠ 45s 无输出（可能在跑长命令）`
+ *   - 无子进程 + >90s → `⚠ 5m 无活动（进程还在）`
+ */
+export function healthLine(input: {
+	idleMs?: number;
+	hasChildProc?: boolean;
+	pidAlive?: boolean;
+}): { text: string; warn: boolean } | undefined {
+	const idle = input.idleMs;
+	if (idle === undefined || !Number.isFinite(idle) || idle < HEALTH_ACTIVE_MS) return undefined;
+	if (input.pidAlive === false) return undefined;
+	if (input.hasChildProc === true) return { text: `最后输出 ${fmtDuration(idle)} 前`, warn: false };
+	return idle <= HEALTH_SLOW_MS
+		? { text: `⚠ ${fmtDuration(idle)} 无输出（可能在跑长命令）`, warn: true }
+		: { text: `⚠ ${fmtDuration(idle)} 无活动（进程还在）`, warn: true };
+}
+
+/** 这个 job 有没有可用健康样本（有才显示健康提示） */
+function hasHealthSample(job: LiveJob): boolean {
+	return job.health !== undefined || job.idleMs !== undefined;
+}
 
 function statusIcon(job: LiveJob): { text: string; tone: Tone } {
 	switch (job.status) {
@@ -659,6 +699,8 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const target = job.paneId ? `  → pane ${job.paneId}` : job.tabId ? `  → tab ${job.tabId}` : "";
 	// 见名知意：`数据库助理#1 · 查订单表结构`（不再写 `sa:` 前缀 —— 对用户是噪音）
 	const who = `${job.name}#${idx}`;
+	// 健康灯（有样本才涂）：一眼看出「在跑 / 无输出 / 进程已退」，不改行结构
+	const light = isActiveStatus(job.status) && job.health ? `${healthEmoji(job.health)} ` : "";
 	const sum = paneSummary(job.taskBrief);
 	const lead = `  ${who}`;
 	const tail = `  ${elapsed}${target}`;
@@ -668,10 +710,10 @@ function renderPaneJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 	const toolSeg = lastTool ? ` · ${oneLine(lastTool, 20)}` : "";
 	// 宽度先扣掉「标记 + 名字 + 时间 + 去向 + 工具名」，剩下的才给任务摘要。
 	// 宽度不够时**先砍摘要、绝不砍工具名**（任务摘要在 panel 卡片里另有显示，工具名这里没有第二个地方）。
-	const room = width - widthOf(`${mark} ${lead}`) - widthOf(tail) - widthOf(toolSeg);
+	const room = width - widthOf(`${mark} ${light}${lead}`) - widthOf(tail) - widthOf(toolSeg);
 	const brief = sum && room >= 8 ? ` · ${oneLine(sum, Math.max(4, room - 3))}` : "";
 	const segs: Seg[] = [
-		{ text: `${mark} `, tone },
+		{ text: `${mark} ${light}`, tone },
 		{ text: who, tone: "bold" },
 		{ text: brief, tone: "muted" },
 		{ text: `  ${elapsed}`, tone: "muted" },
@@ -710,7 +752,13 @@ export function renderJob(job: LiveJob, opts: RenderOpts): LiveLine[] {
 		// 一眼分清「这张卡是在面板里看的」还是「已在真 pane 里看的」（分屏卡片走 renderPaneJob，行尾有 → pane xxx）
 		// 宽度不够就省掉，别为此把名字挤没
 		if (width >= 24) head.push({ text: "  🖥 panel", tone: "muted" });
-		if (quiet > STALE_MS) head.push({ text: `  ⚠ ${fmtDur(quiet)}无动静`, tone: "warn" });
+		// 健康提示：有样本就按判据说人话；没样本（rpc 模式不采样）退回去看事件流静默多久
+		if (hasHealthSample(job)) {
+			const hl = healthLine({ idleMs: job.idleMs, hasChildProc: job.hasChildProc });
+			if (hl) head.push({ text: `  ${hl.text}`, tone: hl.warn ? "warn" : "muted" });
+		} else if (quiet > STALE_MS) {
+			head.push({ text: `  ⚠ ${fmtDur(quiet)}无动静`, tone: "warn" });
+		}
 	} else {
 		head.push({ text: `  ${elapsed}`, tone: "muted" });
 		head.push({

@@ -36,7 +36,7 @@
  *   PI_PACKAGE_DIR  覆盖 pi 包目录（Nix/Guix 场景）
  */
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1140,6 +1140,250 @@ export function paneStallReason(
 	return "idle";
 }
 
+// ---------------- 子助理健康判据（纯函数，不含任何真实采样） ----------------
+
+/** 最近这么久内有活动 → 「正常」 */
+export const HEALTH_ACTIVE_MS = 30_000;
+/** 这么久内没活动 → 从「慢」变成「可疑」 */
+export const HEALTH_SLOW_MS = 90_000;
+
+/** 一次健康采样的输入（调用方负责采集；本模块只做判定） */
+export interface HealthSample {
+	/** worker 进程 pid（拿不到传 undefined） */
+	pid?: number;
+	/** 该 worker 是否有子进程在跑（node/npm/pnpm/build 之类） */
+	hasChildProc: boolean;
+	/** 会话文件最后写入时间（ms） */
+	sessionMtime?: number;
+	/** pane 屏幕最后一次变化时间（ms） */
+	screenChangedAt?: number;
+	/** 任务开始时间（ms） */
+	startedAt: number;
+	/** 现在 */
+	now: number;
+	/** 有没有收到 `<result>` 回执 */
+	gotReceipt: boolean;
+	/** 进程是否还活（调用方用已有 pidAlive() 算好传进来；undefined = 未知） */
+	pidAlive?: boolean;
+}
+
+export type WorkerHealth = "running" | "slow" | "suspicious" | "dead" | "done" | "unknown";
+
+export interface HealthVerdict {
+	health: WorkerHealth;
+	/** 给人看的短标签 */
+	label: string;
+	/** 最后一次活动距今多少毫秒（拿不到 = undefined） */
+	idleMs?: number;
+	/** 为什么这么判（一句话，写日志/详情用） */
+	reason: string;
+}
+
+/** 毫秒 → 人话：`45s` / `2m10s` / `2m` / `1h3m`（>1h 只到分钟） */
+export function fmtDuration(ms: number): string {
+	const n = Number(ms);
+	const total = Number.isFinite(n) && n > 0 ? Math.floor(n / 1000) : 0;
+	if (total < 60) return `${total}s`;
+	if (total < 3600) {
+		const m = Math.floor(total / 60);
+		const s = total % 60;
+		return s ? `${m}m${s}s` : `${m}m`;
+	}
+	const h = Math.floor(total / 3600);
+	const m = Math.floor((total % 3600) / 60);
+	return m ? `${h}h${m}m` : `${h}h`;
+}
+
+/** 健康状态 → 一眼看懂的 emoji */
+export function healthEmoji(h: WorkerHealth): string {
+	switch (h) {
+		case "running":
+			return "🟢";
+		case "slow":
+			return "🟡";
+		case "suspicious":
+			return "🟠";
+		case "dead":
+			return "🔴";
+		case "done":
+			return "✅";
+		default:
+			return "❔";
+	}
+}
+
+/**
+ * 判定子助理健康度。**顺序即优先级**：
+ *   ① 有回执 → done
+ *   ② 进程已死 → dead
+ *   ③ 拿不到 pid 也没探活结果 → unknown
+ *   ④ 有子进程 → running（**优先于「无输出」**：跑长命令几分钟没输出是正常的）
+ *   ⑤ 按「最后一次活动」算 idle：≤30s 正常 / ≤90s 慢 / 更长可疑
+ */
+export function judgeWorkerHealth(s: HealthSample): HealthVerdict {
+	if (s.gotReceipt) return { health: "done", label: "已完成", reason: "已收到回执" };
+	if (s.pidAlive === false) return { health: "dead", label: "进程已退", reason: "worker 进程不存在" };
+	if (s.pidAlive === undefined && !s.pid) {
+		return { health: "unknown", label: "状态未知", reason: "拿不到 pid" };
+	}
+	if (s.hasChildProc) return { health: "running", label: "在跑命令", reason: "有子进程在执行" };
+	// 最后一次活动 = 会话写入 / 屏幕变化 / 开始时间 里最新的那个
+	const last = Math.max(
+		Number.isFinite(s.sessionMtime) ? Number(s.sessionMtime) : 0,
+		Number.isFinite(s.screenChangedAt) ? Number(s.screenChangedAt) : 0,
+		Number.isFinite(s.startedAt) ? Number(s.startedAt) : 0,
+	);
+	const idleMs = Number(s.now) - last;
+	if (idleMs <= HEALTH_ACTIVE_MS) return { health: "running", label: "正常", reason: "最近有活动", idleMs };
+	if (idleMs <= HEALTH_SLOW_MS) {
+		return { health: "slow", label: `无输出 ${fmtDuration(idleMs)}`, reason: "可能在跑长任务", idleMs };
+	}
+	return {
+		health: "suspicious",
+		label: `可疑 ${fmtDuration(idleMs)} 无活动`,
+		reason: "长时间无活动（无任何输出）但进程还在",
+		idleMs,
+	};
+}
+
+// ---------------- 真实采样（拿不到的字段就别编） ----------------
+
+/** 写健康样本需要的活信息（job / 槽位能提供的那几个字段） */
+export interface HealthSampleJob {
+	/** worker 进程 pid（已经读到就传） */
+	pid?: number;
+	/** launcher 写的 pid 文件（进程号稍后才落盘，这里现读） */
+	pidFile?: string;
+	/** worker 会话 jsonl（取 mtime / 回执） */
+	sessionFile?: string;
+	/** pane 屏幕最后一次变化时刻（pane 模式；rpc 模式不传） */
+	screenChangedAt?: number;
+	/** 任务开始时刻 */
+	startedAt?: number;
+	/** 调用方已经判定过「收到回执」（手里有正文时直接传，省一次读文件） */
+	gotReceipt?: boolean;
+}
+
+/** 查子进程的节流窗口：**每 10 秒最多查一次**（Windows 上起 PowerShell 很贵） */
+export const CHILD_PROC_CACHE_MS = 10_000;
+
+const childProcCache = new Map<number, { at: number; has: boolean }>();
+/** 单测注入用：给了就不真跑 PowerShell（返回 true = 有子进程） */
+let childProcProbe: ((pid: number) => boolean) | undefined;
+
+/** 单测用：注入假的子进程探针（不传 = 复位成真的） */
+export function setChildProcProbe(fn?: (pid: number) => boolean): void {
+	childProcProbe = fn;
+	childProcCache.clear();
+}
+
+/** 真查一次子进程（只 Windows 有；失败一律当 false，绝不抛） */
+function queryHasChildProc(pid: number): boolean {
+	// 非 Windows 不查（`wmic` / CIM 都没有）——「没有证据」就当 false，绝不编。
+	if (process.platform !== "win32") return false;
+	try {
+		// `Get-CimInstance` 比 wmic 稳（新版 Windows 已经把 wmic 卸了）；-NoProfile 免掉用户 profile 的副作用。
+		const out = execFileSync(
+			"powershell",
+			["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | Measure-Object).Count`],
+			{ encoding: "utf8", timeout: 2000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+		);
+		return Number(String(out ?? "").trim()) > 0;
+	} catch {
+		return false; // 超时 / 没装 / 权限不够 —— 都当「查不到」
+	}
+}
+
+/** 带 10 秒缓存地查「这个 pid 有没有子进程在跑」（抛错一律变 false） */
+export function hasChildProcess(pid: number | undefined, now: number = Date.now()): boolean {
+	if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
+	const hit = childProcCache.get(pid);
+	if (hit && now - hit.at < CHILD_PROC_CACHE_MS) return hit.has; // 节流：10 秒内直接用缓存
+	let has = false;
+	try {
+		has = childProcProbe ? childProcProbe(pid) === true : queryHasChildProc(pid);
+	} catch {
+		has = false;
+	}
+	childProcCache.set(pid, { at: now, has });
+	return has;
+}
+
+/** 读 launcher 落盘的 worker pid（还没写 / 读到垃圾 → undefined） */
+function readWorkerPid(pidFile: string | undefined): number | undefined {
+	if (!pidFile) return undefined;
+	try {
+		const n = Number(readFileSync(pidFile, "utf8").trim());
+		return Number.isFinite(n) && n > 0 ? n : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 会话文件 mtime（读不到 → undefined） */
+function fileMtime(file: string | undefined): number | undefined {
+	if (!file) return undefined;
+	try {
+		return statSync(file).mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * 给某个运行中的 job 采一次健康样本（拿不到的字段就别编，传 undefined/false）。
+ *
+ * 采集成本：`pidAlive` 是一次 kill(pid,0)（很便宜），`hasChildProc` 要起 PowerShell
+ * （Windows 上 ~几百 ms）→ 走 `hasChildProcess()` 的 10 秒节流，**每秒采样也不会把机器拖垮**。
+ */
+export function sampleJobHealth(job: HealthSampleJob, now: number = Date.now()): HealthSample {
+	const pid = Number.isFinite(job.pid) && (job.pid as number) > 0 ? job.pid : readWorkerPid(job.pidFile);
+	// pid 拿不到就没法探活 → pidAlive 传 undefined（judgeWorkerHealth 会判 unknown，不瞎猜「活着」）
+	const alive = pid === undefined ? undefined : pidAlive(pid);
+	const sessionFile = job.sessionFile;
+	let gotReceipt = job.gotReceipt === true;
+	if (job.gotReceipt === undefined && sessionFile) {
+		// 已有的判定：会话正文里有完整 `<result>` 或人话回执（和 pane 收尾用的是同一套）
+		// 调用方手里已经有正文时**别传 sessionFile 去重读**（轮询里已经每轮读过一次了）
+		const text = lastAssistantTextIn(sessionFile) ?? "";
+		gotReceipt = /<\/result>/.test(text) || paneHasReceiptText(text);
+	}
+	return {
+		pid,
+		pidAlive: alive,
+		hasChildProc: alive === true ? hasChildProcess(pid, now) : false,
+		sessionMtime: fileMtime(sessionFile),
+		screenChangedAt: job.screenChangedAt,
+		startedAt: Number.isFinite(job.startedAt) ? Number(job.startedAt) : now,
+		now,
+		gotReceipt,
+	};
+}
+
+/**
+ * **只在灯变了时才改名**（每秒都调 `herdr pane rename` 既贵又闪）。
+ * `state.emoji` 记着上一次的灯；返回 true = 这次真的改了。
+ * `rename` 可注入（单测用桩断言「同样 emoji 连调两次只改一次」）。
+ */
+export function renameOnHealthChange(
+	state: { emoji?: string },
+	paneId: string,
+	build: (emoji: string) => string,
+	emoji: string,
+	rename: (paneId: string, label: string) => unknown = paneRename,
+): boolean {
+	const next = String(emoji ?? "").trim();
+	if (!next || !paneId) return false;
+	if (state.emoji === next) return false;
+	state.emoji = next;
+	try {
+		rename(paneId, build(next));
+	} catch {
+		/* rename 失败不该连累派活 */
+	}
+	return true;
+}
+
 /** `finalizeHerdrRun()` 的入参 */
 export interface HerdrFinalizeInput {
 	/** 运行结果（和 `RunResult.outcome` 同源） */
@@ -1356,10 +1600,10 @@ function withDegrade(job: LiveJob, note: string | undefined): string | undefined
 	return note ? `${note_}；${note}` : note_;
 }
 
-/** 删掉 launcher 的两个临时文件（脚本 + JSON） */
+/** 删掉 launcher 的三个临时文件（脚本 + JSON + pid） */
 function dropLauncher(script: string | undefined): void {
 	if (!script) return;
-	for (const f of [script, launcherJsonPath(script)]) {
+	for (const f of [script, launcherJsonPath(script), launcherPidPath(script)]) {
 		try {
 			rmSync(f, { force: true });
 		} catch {
@@ -1557,6 +1801,16 @@ interface HerdrSlot {
 	where: "main" | "overflow";
 	/** 这个格子里跑的是哪个助理（显示名）—— 只用来算 tab 标题，账里不参与分配 */
 	name?: string;
+	/** 任务摘要（12 字）—— 轮询里重命名 pane 标题要用它，启动时记下来 */
+	summary?: string;
+	/** worker 进程 pid（pane 模式从 launcher 写的 `.pid` 文件里读；拿不到 = undefined） */
+	pid?: number;
+	/** launcher 写的 pid 文件（进程号是稍后才落盘的，所以留路径现读） */
+	pidFile?: string;
+	/** worker 会话 jsonl（采样要看它的 mtime / 回执） */
+	sessionFile?: string;
+	/** 任务开跑时刻（采样的 startedAt） */
+	startedAt?: number;
 }
 
 /** 进程内槽位表（split / tab 两种模式共用）：key = 全局第几格（planSlot 的 index） */
@@ -1627,6 +1881,11 @@ function launcherJsonPath(script: string): string {
 	return script.replace(/\.mjs$/i, ".json");
 }
 
+/** worker 进程号落盘的位置（launcher 写的，`<json>.pid`） */
+function launcherPidPath(script: string): string {
+	return `${launcherJsonPath(script)}.pid`;
+}
+
 /**
  * 把「跑这个 worker 的完整命令行」写成 **JSON 数据 + 纯 ASCII Node 启动脚本**，再用 pane run 启动脚本。
  *
@@ -1685,11 +1944,13 @@ function writePaneLauncher(tpl: Template, argv: string[], opt: RunOptions, tag: 
 /** 启动脚本源码（纯 ASCII：不写路径、不拼命令行，只读 JSON 后 spawn） */
 function launcherSource(): string {
 	return [
-		'import { readFileSync } from "node:fs";',
+		'import { readFileSync, writeFileSync } from "node:fs";',
 		'import { spawn } from "node:child_process";',
 		"const cfgPath = process.argv[2];",
 		'const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));',
 		'const child = spawn(cfg.node, cfg.args, { stdio: "inherit", env: { ...process.env, ...cfg.env } });',
+		// 把 worker（pi）自己的 pid 落盘：主进程靠它探活/查子进程（健康灯要）
+		'try { writeFileSync(cfgPath + ".pid", String(child.pid || ""), "utf8"); } catch (e) {}',
 		'child.on("exit", (code) => process.exit(code ?? 0));',
 		'child.on("error", () => process.exit(1));',
 		"",
@@ -2180,6 +2441,14 @@ export interface PaneRow {
 	index: number;
 	paneId: string;
 	label: string;
+	/** 采到的健康判定（没有样本 = 没接上健康判据 → 退回旧格式） */
+	health?: WorkerHealth;
+	/** 给人看的健康短标签（`在跑命令` / `无输出 45s` / `进程已退`） */
+	healthLabel?: string;
+	/** worker 进程 pid（拿不到就 undefined → 行里显 `—`） */
+	pid?: number;
+	/** 最后一次活动距今多少毫秒 */
+	idleMs?: number;
 }
 
 /**
@@ -2219,17 +2488,50 @@ function collectPaneRows(): PaneRow[] {
 	} catch {
 		panes = [];
 	}
-	return buildPaneRows(panes, [...herdrSlots.values()]);
+	const rows = buildPaneRows(panes, [...herdrSlots.values()]);
+	// 账上还在的格子补一份健康详情（/panes 是手动命令，采一次不心疼）
+	for (const r of rows) {
+		const slot = herdrSlots.get(r.index);
+		if (!slot || slot.paneId !== r.paneId) continue; // 不是账上的格子（/reload 后猜出来的）→ 没样本
+		try {
+			const verdict = judgeWorkerHealth(
+				sampleJobHealth({
+					pid: slot.pid,
+					pidFile: slot.pidFile,
+					sessionFile: slot.sessionFile,
+					startedAt: slot.startedAt,
+				}),
+			);
+			r.health = verdict.health;
+			r.healthLabel = verdict.label;
+			r.pid = slot.pid ?? readWorkerPid(slot.pidFile);
+			r.idleMs = verdict.idleMs;
+		} catch {
+			/* 采样失败就不显示详情（剩下的列照常列） */
+		}
+	}
+	return rows;
 }
+
+/** 标题前面的记号（状态 + 可选健康灯）—— /panes 只要「助理名#序号 · 摘要」那一段 */
+const LABEL_MARK_RE = /^(?:[▶✅❌⏹🟢🟡🟠🔴❔⚠]\s*)+/u;
 
 /** /panes 的多行文本（纯函数，方便断言） */
 export function formatPaneReport(rows: PaneRow[], selfId?: string, mainId?: string): string[] {
 	if (rows.length === 0) return ["当前没有子助理 pane"];
 	const out = ["子助理 pane（本会话）："];
 	for (const r of rows) {
-		// 标题去掉状态记号，剩下的就是 `<助理名>#<序号> · <任务摘要>`（和 pane 标题、面板卡片同一份文案）
-		const who = String(r.label ?? "").replace(/^[▶✅❌⏹]\s*/, "");
+		// 标题去掉状态记号 / 健康灯，剩下的就是 `<助理名>#<序号> · <任务摘要>`
+		const who = String(r.label ?? "").replace(LABEL_MARK_RE, "");
 		const name = who || `（herdr 里没标签）${r.paneId}`;
+		if (r.health) {
+			// 新格式：编号 / 灯 / 名字#序号 / pane / pid / 健康 label / 最后活动
+			const pid = r.pid ? `pid ${r.pid}` : "pid —";
+			const act = r.idleMs === undefined ? "最后活动 —" : `最后活动 ${fmtDuration(r.idleMs)} 前`;
+			out.push(`  #${r.index} ${healthEmoji(r.health)} ${name}  ${r.paneId}  ${pid}  ${r.healthLabel ?? ""}  ${act}`);
+			continue;
+		}
+		// 没采样到（账丢了 / 没接健康样本）→ 退回旧的「记号状态」一列
 		out.push(`  #${r.index} ${name}  ${r.paneId}  ${paneStateText(r.label)}`);
 	}
 	out.push(`  （自己：${selfId ?? "未知"} —— 不会被关）`);
@@ -2437,6 +2739,11 @@ export interface PaneWaitOps {
 	 * 已经跑满的会话会立刻被砍（卡片上白写着「resume 能接着干」）。
 	 */
 	maxTurns?: number;
+	/**
+	 * 每轮采样完健康判定的回调（delegate 用它把灯写回面板小票）。
+	 * 只传事实，不传行为 —— 这里不做任何 UI 决定。
+	 */
+	onHealth?(verdict: HealthVerdict, sample: HealthSample): void;
 }
 
 const realPaneWaitOps: PaneWaitOps = {
@@ -2487,6 +2794,8 @@ export async function waitPaneDone(
 	// ---- 回执正文的稳定窗口账（和看门狗分开算：那只盯整屏，这里只盯「回执这段文字」）----
 	let receiptSrc = "";
 	let receiptSinceAt = 0;
+	// ---- 健康灯：只在灯变了才 rename（每秒都调 herdr CLI 太贵，标题也会闪）----
+	const healthState: { emoji?: string } = {};
 	// 采集异常计数：读 pane / paneList 对已关闭的 pane 真机上会抛错。
 	// 以前它直接把 waitPaneDone 的 promise 拒掉 → run 永不 settle → `.bg` 永远 running。
 	// 也不再把「连续 3 次抛错」当失败：抛错只说明**读不到**，不等于活失败。
@@ -2555,6 +2864,33 @@ export async function waitPaneDone(
 			}
 			if (signal?.aborted) return { outcome: "failed", text, tail, stallLog };
 			if (Date.now() - started > timeoutMs) return { outcome: "timeout", text, tail, stallLog };
+
+			// ---- 健康灯（采样 → 判定 → 变了才改名）----
+			// 采不到的字段就别编：pid 还没落盘 → unknown → **不涂灯**（否则每秒闪一下 ❔）
+			try {
+				const sample = sampleJobHealth(
+					{
+						pid: slot.pid,
+						pidFile: slot.pidFile,
+						sessionFile: file,
+						screenChangedAt: lastChangeAt,
+						startedAt: started,
+						gotReceipt: false, // 有回执上面就 return 了，走到这里一定是没有
+					},
+					Date.now(),
+				);
+				if (sample.pid && slot.pid === undefined) slot.pid = sample.pid; // 补记 pid（/panes 要用）
+				const verdict = judgeWorkerHealth(sample);
+				ops.onHealth?.(verdict, sample);
+				if (verdict.health !== "unknown") {
+					renameOnHealthChange(healthState, slot.paneId, (emoji) =>
+						paneLabel("run", slot.name ?? "", slot.index, slot.summary, emoji),
+						healthEmoji(verdict.health),
+					);
+				}
+			} catch {
+				/* 采样失败不影响收尾判定（收尾只看回执 / 看门狗） */
+			}
 
 			// ---- 卡死看门狗 ----
 			// 注意：read.ok === false / 空屏 / 有执行迹象 → isPaneStalled 都不杀，这里只把原因记进日志，
@@ -2756,6 +3092,7 @@ async function tryRunInHerdr(
 		const label = paneLabel("run", tpl.name, slot.index, summary);
 		paneRename(slot.paneId, label);
 		slot.name = tpl.name; // 记账：tab 标题要用「这个 tab 里有谁」
+		slot.summary = summary; // 记账：轮询里重命名 pane 标题要用（不然灯一变标题就只剩名字）
 		syncTabLabel(slot.tabId);
 		job.paneId = slot.paneId;
 		job.tabId = slot.tabId;
@@ -2836,6 +3173,10 @@ async function tryRunInHerdr(
 		}
 		// 从这一刻起：活真的在 pane 里跑了，怎么结束都必须有终态
 		started = true;
+		// 健康采样要的东西现在都齐了：pid 文件（launcher 写的）、会话 jsonl、任务开跑时刻
+		slot.pidFile = launcherPidPath(script!);
+		slot.sessionFile = findSessionFileIn(opt.sessionDir, opt.names.id);
+		slot.startedAt = Date.now();
 
 		stage = "wait";
 		let res: Awaited<ReturnType<typeof waitPaneDone>>;
@@ -2843,6 +3184,14 @@ async function tryRunInHerdr(
 			res = await waitPaneDone(slot, opt.sessionDir, opt.names.id, opt.timeoutMs, opt.signal, delivered, {
 				...realPaneWaitOps,
 				maxTurns,
+				// 健康灯同步到面板小票上（卡片自己的文案由 live.ts 的 healthLine 算）
+				onHealth: (verdict, sample) => {
+					const changed = job.health !== verdict.health;
+					job.health = verdict.health;
+					job.idleMs = verdict.idleMs;
+					job.hasChildProc = sample.hasChildProc;
+					if (changed) notifyLive();
+				},
 			});
 		} catch (e) {
 			// waitPaneDone 内部已经接住了大部分异常，这里是最后一道：

@@ -2015,6 +2015,148 @@ allOk =
 		{ TPROJ: proj, PI_CODING_AGENT_DIR: join(tmp, "agent-conclusion"), PI_UNIT_SRC: join(ext, "delegate.ts") },
 	) && allOk;
 
+// ---------- 套件：子助理健康判据（纯函数；真实采样 / UI 下一批接） ----------
+bundle("delegate.ts", "delegate-health.mjs");
+allOk =
+	runSuite(
+		"delegate：子助理健康判据",
+		join(tmp, "delegate-health.mjs"),
+		[
+			'const HS = (o) => ({ pid: 1234, hasChildProc: false, startedAt: 1000, now: 1000, gotReceipt: false, pidAlive: true, ...(o || {}) });',
+			'// ① 有回执',
+			'const h1 = judgeWorkerHealth(HS({ gotReceipt: true, pidAlive: false }));',
+			'ok("① 有回执 → done（优先于进程已死），label 已完成 / reason 已收到回执", h1.health === "done" && h1.label === "已完成" && h1.reason === "已收到回执");',
+			'// ② 进程已死',
+			'const h2 = judgeWorkerHealth(HS({ pidAlive: false }));',
+			'ok("② pidAlive=false + 无回执 → dead「进程已退」", h2.health === "dead" && h2.label === "进程已退");',
+			'// ③ 拿不到 pid',
+			'const h3 = judgeWorkerHealth(HS({ pid: undefined, pidAlive: undefined }));',
+			'ok("③ 无 pid 且没探活结果 → unknown「状态未知」/ reason 拿不到 pid", h3.health === "unknown" && h3.label === "状态未知" && h3.reason === "拿不到 pid");',
+			'// ④ 关键回归：跑长命令不算可疑',
+			'const h4 = judgeWorkerHealth(HS({ hasChildProc: true, sessionMtime: 1000, now: 1000 + 600000 }));',
+			'ok("④ 有子进程 + 10 分钟无输出 → 仍 running「在跑命令」（长命令不算可疑）", h4.health === "running" && h4.label === "在跑命令" && h4.idleMs === undefined);',
+			'ok("④b 有子进程优先于「进程已死」之后的判定：pidAlive 未知也不算 unknown", judgeWorkerHealth(HS({ pid: undefined, pidAlive: undefined, hasChildProc: true })).health === "unknown");',
+			'// ⑤ 最近有活动',
+			'const h5 = judgeWorkerHealth(HS({ sessionMtime: 1000, screenChangedAt: 1000, now: 11000 }));',
+			'ok("⑤ 无子进程 + 最近 10 秒有活动 → running「正常」/ idleMs 10000", h5.health === "running" && h5.label === "正常" && h5.idleMs === 10000);',
+			'// ⑥ 慢',
+			'const h6 = judgeWorkerHealth(HS({ sessionMtime: 1000, now: 46000 }));',
+			'ok("⑥ 无子进程 + 45 秒无活动 → slow，label 含 45s", h6.health === "slow" && h6.label.includes("45s") && h6.label === "无输出 45s" && h6.idleMs === 45000);',
+			'// ⑦ 可疑',
+			'const h7 = judgeWorkerHealth(HS({ sessionMtime: 1000, now: 301000 }));',
+			'ok("⑦ 无子进程 + 5 分钟无活动 → suspicious（label 含 5m）", h7.health === "suspicious" && h7.label.includes("5m") && h7.idleMs === 300000);',
+			'// ⑧ idleMs 取三者最大',
+			'const h8 = judgeWorkerHealth(HS({ startedAt: 0, screenChangedAt: 90000, sessionMtime: 95000, now: 100000 }));',
+			'ok("⑧ idleMs 取「会话 mtime / 屏幕 / 开始」最大（95000 最新 → idle 5000）", h8.idleMs === 5000 && h8.health === "running");',
+			'ok("⑧b 屏幕比会话新 → 按屏幕算（idle 8000）", judgeWorkerHealth(HS({ startedAt: 0, screenChangedAt: 92000, sessionMtime: 1000, now: 100000 })).idleMs === 8000);',
+			'ok("⑧c 只有一个 startedAt（刚起 20 秒）→ 按开始时间算 running", judgeWorkerHealth(HS({ startedAt: 80000, now: 100000 })).idleMs === 20000);',
+			'// ⑨ 只有 sessionMtime',
+			'const h9 = judgeWorkerHealth(HS({ screenChangedAt: undefined, sessionMtime: 99000, now: 100000 }));',
+			'ok("⑨ 只有 sessionMtime、没有 screenChangedAt 也能算（idle 1000）", h9.idleMs === 1000 && h9.health === "running");',
+			'// ⑩-⑬ fmtDuration',
+			'ok("⑩ fmtDuration(45_000) === 45s", fmtDuration(45000) === "45s");',
+			'ok("⑪ fmtDuration(130_000) === 2m10s", fmtDuration(130000) === "2m10s");',
+			'ok("⑫ fmtDuration(120_000) === 2m（秒为 0 不显示）", fmtDuration(120000) === "2m");',
+			'ok("⑬ fmtDuration(3_780_000) === 1h3m", fmtDuration(3780000) === "1h3m");',
+			'ok("⑬b fmtDuration 边界：0/负数/NaN → 0s，59.9s → 59s", fmtDuration(0) === "0s" && fmtDuration(-5) === "0s" && fmtDuration(NaN) === "0s" && fmtDuration(59900) === "59s");',
+			'// ⑭ emoji',
+			'ok("⑭ healthEmoji 六态 = 🟢🟡🟠🔴✅❔", ["running", "slow", "suspicious", "dead", "done", "unknown"].map(healthEmoji).join("") === "🟢🟡🟠🔴✅❔");',
+			'// ⑮ 常量',
+			'ok("⑮ HEALTH_ACTIVE_MS=30000 / HEALTH_SLOW_MS=90000", HEALTH_ACTIVE_MS === 30000 && HEALTH_SLOW_MS === 90000);',
+			'// ⑯ reason 文案',
+			'ok("⑯ reason：dead 含「进程」/ suspicious 含「无活动」/ 子进程 running 含「子进程」", judgeWorkerHealth(HS({ pidAlive: false })).reason.includes("进程") && judgeWorkerHealth(HS({ startedAt: 0, now: 999999 })).reason.includes("无活动") && judgeWorkerHealth(HS({ hasChildProc: true })).reason.includes("子进程"));',
+			'// 阈值边界',
+			'ok("边界：idle=30000 → running；30001 → slow", judgeWorkerHealth(HS({ startedAt: 0, now: 30000 })).health === "running" && judgeWorkerHealth(HS({ startedAt: 0, now: 30001 })).health === "slow");',
+			'ok("边界：idle=90000 → slow；90001 → suspicious", judgeWorkerHealth(HS({ startedAt: 0, now: 90000 })).health === "slow" && judgeWorkerHealth(HS({ startedAt: 0, now: 90001 })).health === "suspicious");',
+		],
+	);
+
+// ---------- 套件：健康判据接到界面（pane 标题灯 / /panes 详情 / 卡片文案 / 采样节流） ----------
+// ① 标题：paneLabel 的第 5 个参数 = 健康灯
+bundle("herdr.ts", "herdr-health.mjs");
+allOk =
+	runSuite("herdr：pane 标题带健康灯", join(tmp, "herdr-health.mjs"), [
+		'ok("标题：带 emoji → 以 emoji 开头（不再是 ▶）", paneLabel("run", "服务器助理", 2, "跑部署", "🟡") === "🟡 服务器助理#2 · 跑部署");',
+		'ok("标题：不带 emoji → 保持老样子（以 ▶ / ✅ 开头）", paneLabel("run", "db", 1).startsWith("▶ ") && paneLabel("ok", "db", 1).startsWith("✅ "));',
+		'ok("标题：emoji 顶掉状态记号，不会两个都在", !paneLabel("run", "db", 1, undefined, "🔴").includes("▶") && paneLabel("run", "db", 1, undefined, "🔴").startsWith("🔴"));',
+		'ok("标题：emoji + 超长摘要 → 总长仍 ≤ 40", [...paneLabel("run", "名字超长超长超长超长超长超长", 7, "摘要也超长超长超长超长超长超长超长", "🟠")].length <= 40);',
+		'ok("标题：emoji + 超长摘要 → 先砍摘要（名字 #编号 还在）", (() => { const s = paneLabel("run", "数据库助理", 3, "一二三四五六七八九十一二三四五六七八九十", "🟢"); return s.startsWith("🟢 数据库助理#3"); })());',
+	]);
+
+// ② /panes 每行带详情 + 采样节流 + 灯变才改名
+bundle("delegate.ts", "delegate-healthui.mjs");
+allOk =
+	runSuite(
+		"delegate：/panes 详情 / 采一节流 / 灯变才改名",
+		join(tmp, "delegate-healthui.mjs"),
+		[
+			'const HR = (o) => ({ index: 1, paneId: "w2:p5X", label: "🟢 数据库助理#1 · 查表", health: "running", healthLabel: "在跑命令", pid: 12345, idleMs: 3000, ...(o || {}) });',
+			'const repLines = formatPaneReport([HR(), HR({ index: 2, paneId: "w2:p5Y", label: "🟡 服务器助理#2 · 部署", health: "slow", healthLabel: "无输出 1m48s", pid: 12399, idleMs: 108000 })]);',
+			'ok("/panes：行里有 pid", repLines[1].includes("pid 12345"));',
+			'ok("/panes：行里有健康 label", repLines[1].includes("在跑命令") && repLines[2].includes("无输出 1m48s"));',
+			'ok("/panes：行里有最后活动（fmtDuration）", repLines[1].includes("最后活动 3s 前") && repLines[2].includes("最后活动 1m48s 前"));',
+			'ok("/panes：行里有健康灯 + 助理名#序号 + pane", repLines[1].includes("🟢") && repLines[1].includes("数据库助理#1") && repLines[1].includes("w2:p5X") && !repLines[1].includes("▶"));',
+			'ok("/panes：没有 pid → 显 —（不编数字）", formatPaneReport([HR({ pid: undefined })])[1].includes("pid —"));',
+			'ok("/panes：没有样本（账丢了）→ 退回旧格式（仍能用 /pane-close 关）", formatPaneReport([{ index: 2, paneId: "w2:p59", label: "⏹ sa:db#1（已停）" }])[1].includes("⏹已停"));',
+			'// ---- 采集：pid 缺 / 节流（真的不重复跑 PowerShell）----',
+			'setChildProcProbe(() => true);',
+			'const s1 = sampleJobHealth({ pid: process.pid, startedAt: Date.now() - 5000 }, 1000);',
+			'ok("采样：pidAlive 用已有的 pidAlive()", s1.pid === process.pid && s1.pidAlive === true);',
+			'ok("采样：有子进程 → hasChildProc=true，判定 running「在跑命令」", s1.hasChildProc === true && judgeWorkerHealth(s1).label === "在跑命令");',
+			'const sNone = sampleJobHealth({ startedAt: 1000 }, 1000);',
+			'ok("采样：没 pid 不瞎编 → pidAlive undefined + 判 unknown", sNone.pid === undefined && sNone.pidAlive === undefined && judgeWorkerHealth(sNone).health === "unknown");',
+			'let probes = 0;',
+			'setChildProcProbe(() => { probes += 1; return false; });',
+			'for (let i = 0; i < 10; i++) sampleJobHealth({ pid: process.pid, startedAt: 0 }, 1000 + i * 100);',
+			'ok("采样：10 次采样只真查 1 次子进程（每 10 秒最多查一次）", probes === 1);',
+			'sampleJobHealth({ pid: process.pid, startedAt: 0 }, 1000 + CHILD_PROC_CACHE_MS + 1);',
+			'ok("采样：过了 10 秒缓存才过期 → 再查一次", probes === 2);',
+			'setChildProcProbe(() => { throw new Error("powershell 挂了"); });',
+			'ok("采样：查子进程抛错 → 当 false（不连累派活）", sampleJobHealth({ pid: process.pid, startedAt: 0 }, 999999).hasChildProc === false);',
+			'setChildProcProbe();',
+			'// ---- 会话 mtime / 回执（复用已有的判定）----',
+			'const sf = join(tmpdir(), "sa-health-sess.jsonl");',
+			'writeFileSync(sf, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "结论: 好了\\n<result>{}</result>" }] } }), "utf8");',
+			'const sRec = sampleJobHealth({ pid: process.pid, sessionFile: sf, startedAt: 1 }, 5000);',
+			'ok("采样：会话里有 <result> → gotReceipt=true → 判 done（不误报可疑）", sRec.gotReceipt === true && judgeWorkerHealth(sRec).health === "done");',
+			'ok("采样：sessionMtime 真读到了（不是编的）", Number.isFinite(sRec.sessionMtime) && sRec.sessionMtime > 0);',
+			'ok("采样：显式传 gotReceipt=false 时不重读文件（轮询里已读过一次）", sampleJobHealth({ pid: process.pid, sessionFile: sf, gotReceipt: false, startedAt: 1 }, 5000).gotReceipt === false);',
+			'// ---- 灯变才 rename（桩 rename 断言次数）----',
+			'const renames = [];',
+			'const st = {};',
+			'const rn = (id, label) => { renames.push(label); };',
+			'const first = renameOnHealthChange(st, "w2:p5X", (e) => `▶ ${e}`, "🟢", rn);',
+			'const second = renameOnHealthChange(st, "w2:p5X", (e) => `▶ ${e}`, "🟢", rn);',
+			'ok("rename：同样 emoji 连调两次 → 只 rename 一次", first === true && second === false && renames.length === 1);',
+			'ok("rename：灯变了才改（🟢→🟡→🟡 只改两次）", renameOnHealthChange(st, "w2:p5X", (e) => `▶ ${e}`, "🟡", rn) === true && renameOnHealthChange(st, "w2:p5X", (e) => `▶ ${e}`, "🟡", rn) === false && renames.length === 2);',
+			'const boom = renameOnHealthChange({}, "w2:p5X", (e) => e, "🔴", () => { throw new Error("herdr 挂了"); });',
+			'ok("rename：rename 抛错也不往外抛", boom === true);',
+		],
+	);
+
+// ③ 卡片文案（live.ts）：健康语义取代含糊的「Ns 无动静」
+bundle("live.ts", "live-health.mjs");
+allOk =
+	runSuite("live：卡片健康文案（最后输出 / 无输出 / 无活动）", join(tmp, "live-health.mjs"), [
+		'ok("卡片：idleMs < 30s → 什么都不显示（不扰民）", healthLine({ idleMs: 3_000 }) === undefined && healthLine({ idleMs: 29_999 }) === undefined);',
+		'ok("卡片：45s 无子进程 → ⚠ 45s 无输出（可能在跑长命令）", (healthLine({ idleMs: 45_000 }) || {}).text === "⚠ 45s 无输出（可能在跑长命令）");',
+		'ok("卡片：5m 无子进程 → ⚠ 5m 无活动（进程还在）", (healthLine({ idleMs: 300_000 }) || {}).text === "⚠ 5m 无活动（进程还在）");',
+		'ok("卡片：有子进程 → 只写「最后输出 Ns 前」，绝不报无输出", (() => { const h = healthLine({ idleMs: 600_000, hasChildProc: true }); return !!h && h.text === "最后输出 10m 前" && h.warn === false && !h.text.includes("无输出") && !h.text.includes("无活动"); })());',
+		'ok("卡片：进程已退 → 不显示健康提示（状态行自己会说）", healthLine({ idleMs: 600_000, pidAlive: false }) === undefined);',
+		'// 关键回归：hasChildProc=true 时整张卡片都不出现「无输出」',
+		'const j = newJob({ key: "k", name: "服务器助理", task: "跑部署", sessionId: "s1" });',
+		'j.lastEventAt = Date.now() - 600_000;',
+		'j.health = "running"; j.hasChildProc = true;',
+		'const jt = plainLines(renderJob(j, { width: 60, now: Date.now() })).join("\\n");',
+		'ok("卡片：有子进程在跑长命令 → 卡片不出现「无输出」（关键回归）", !jt.includes("无输出") && !jt.includes("无活动"));',
+		'const j2 = newJob({ key: "k2", name: "前端助理", task: "修菜单", sessionId: "s2" });',
+		'j2.lastEventAt = Date.now() - 300_000;',
+		'j2.health = "suspicious"; j2.idleMs = 300_000; j2.hasChildProc = false;',
+		'const j2t = plainLines(renderJob(j2, { width: 60, now: Date.now() })).join("\\n");',
+		'ok("卡片：无子进程 + 5 分钟无活动 → 卡片上有「5m 无活动（进程还在）」", j2t.includes("5m 无活动（进程还在）"));',
+		'ok("卡片：没有样本时仍退回旧文案（rpc 模式不瞎报健康）", healthLine({}) === undefined);',
+	]);
+
 // ---------- 套件 2：mcp-pool（影子目录） ----------
 bundle("mcp-pool.ts", "mcp-pool.mjs");
 allOk =
