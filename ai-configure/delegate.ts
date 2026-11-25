@@ -1305,6 +1305,56 @@ function queryHasChildProc(pid: number): boolean {
 	}
 }
 
+/**
+ * 便宜信号：**会话文件最后一条是不是「命令还在跑」**。
+ *
+ * 判据：从文件尾部往前找最后一条实质消息 ——
+ *   - 是 `toolResult` → 命令跑完了 → false
+ *   - 是 assistant 且带 `toolCall`/`toolUse` → 命令还在跑 → true
+ *   - 都没有（纯文字/思考）→ false
+ *
+ * 为什么需要它：Windows 上查子进程要 spawn 一个 PowerShell + `Get-CimInstance`，
+ * **实测单次 546ms**；8 个并发任务每 10 秒一次 = 每 10 秒烧掉 4.4 秒 CPU，
+ * 还会临时拉起 8 个 PowerShell（每个 ~76MB，杀软再扫一遍）—— 机器就是这么卡的。
+ * 读同一个会话文件只要 **0.21ms**（快 2600 倍），而且轮询里本来就每轮读它。
+ */
+export function sessionHasPendingTool(file: string | undefined): boolean | undefined {
+	if (!file) return undefined;
+	let raw = "";
+	try {
+		const buf = readFileSync(file);
+		const chunk = buf.subarray(Math.max(0, buf.length - 64 * 1024));
+		raw = chunk.toString("utf8");
+	} catch {
+		return undefined; // 读不到 → 让调用方决定（别当成「跑完了」）
+	}
+	const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+	for (let i = lines.length - 1; i >= 0; i--) {
+		let o: any;
+		try { o = JSON.parse(lines[i]); } catch { continue; } // 截断的首行解析失败很正常
+		const msg = o?.message ?? o;
+		const role = String(msg?.role ?? o?.type ?? "");
+		const content = msg?.content;
+		const blocks = Array.isArray(content) ? content : [];
+		const kinds = blocks.map((b: any) => String(b?.type ?? ""));
+		if (role.includes("toolResult") || o?.type === "toolResult" || kinds.includes("toolResult")) return false;
+		if (role === "assistant" || o?.type === "assistant") {
+			if (kinds.some((k) => k === "toolCall" || k === "toolUse" || k === "tool_call")) return true;
+		}
+		// 别的类型（thinking / user / 系统事件）继续往前找
+	}
+	return false;
+}
+
+/**
+ * 真 PowerShell 探针默认**关掉**（546ms/次太贵）；要开就 `PI_SA_CHILD_PROC=1`。
+ * 单测显式注入 `setChildProcProbe()` 时也算「允许用探针」（否则那些用例没意义）。
+ */
+export function childProcProbeEnabled(): boolean {
+	if (childProcProbe) return true;
+	return process.env.PI_SA_CHILD_PROC === "1";
+}
+
 /** 带 10 秒缓存地查「这个 pid 有没有子进程在跑」（抛错一律变 false） */
 export function hasChildProcess(pid: number | undefined, now: number = Date.now()): boolean {
 	if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
@@ -1352,6 +1402,7 @@ export function sampleJobHealth(job: HealthSampleJob, now: number = Date.now()):
 	// pid 拿不到就没法探活 → pidAlive 传 undefined（judgeWorkerHealth 会判 unknown，不瞎猜「活着」）
 	const alive = pid === undefined ? undefined : pidAlive(pid);
 	const sessionFile = job.sessionFile;
+	const pendingTool = sessionHasPendingTool(sessionFile);
 	let gotReceipt = job.gotReceipt === true;
 	if (job.gotReceipt === undefined && sessionFile) {
 		// 已有的判定：会话正文里有完整 `<result>` 或人话回执（和 pane 收尾用的是同一套）
@@ -1362,7 +1413,13 @@ export function sampleJobHealth(job: HealthSampleJob, now: number = Date.now()):
 	return {
 		pid,
 		pidAlive: alive,
-		hasChildProc: alive === true ? hasChildProcess(pid, now) : false,
+		// 「在跑命令」优先看会话文件（0.2ms）；PowerShell 探针默认关（546ms/次）
+		hasChildProc:
+			pendingTool !== undefined
+				? pendingTool
+				: alive === true && childProcProbeEnabled()
+					? hasChildProcess(pid, now)
+					: false,
 		sessionMtime: fileMtime(sessionFile),
 		screenChangedAt: job.screenChangedAt,
 		startedAt: Number.isFinite(job.startedAt) ? Number(job.startedAt) : now,

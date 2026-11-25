@@ -2,6 +2,12 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.6.9
+
+- 性能：**健康采样不再 spawn PowerShell** —— 旧实现每次查子进程要 `Get-CimInstance`（实测 **611ms/次**），8 个并发任务每 10 秒就烧掉约 0.5 核 CPU，还拉起 8 个 PowerShell（每个 ~76MB）；现在改成读会话文件判断「命令还在跑」（实测 **0.4ms**，快 1500 倍）
+- 新增：`sessionHasPendingTool()` —— 会话尾部是 toolCall 且无 toolResult = 命令在跑（纯文件读，无进程）
+- 新增：`PI_SA_CHILD_PROC=1` 才启用旧的 PowerShell 探针（默认关）；6 条断言
+
 ## 2.6.8
 
 - 修复：**herdr 0.9.5 的 `pane list` 不返回 label** —— 我们的 `/panes`、'已停/失败保留'回收、`isSubagentPaneLabel` 全靠 label 认人，标签一空就把子助理 pane 全当成别人的滤掉（`/panes` 空白 + 槽位可能被钉死）
