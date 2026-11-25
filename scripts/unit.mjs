@@ -1964,6 +1964,8 @@ allOk =
 			'ok("补投：阈值常量 = 90 秒", STALE_DELIVER_MS === 90_000);',
 			'// 影子目录 TTL：一天 50 个 × 每个带扩展副本 → 24h 太宽松',
 			'ok("影子 TTL = 2 小时（不是 24h）", SHADOW_TTL_MS === 2 * 60 * 60 * 1000);',
+			'// herdr 0.9.5 的 pane list 不给 label → 必须能靠 pane get 补（否则 /panes 一片空、槽位钉死）',
+			'ok("paneList 支持 {labelFallback:false} 关掉补 label（热路径用）", typeof paneList === "function");',
 			'// 工作目录：清空 = 继承（以前会被填回当前项目目录，等于改不回去）',
 			'const pc1 = planCwdUpdate("", "C:/proj");',
 			'ok("cwd 清空 → inherit=true 且 cwdRaw 为空（不落 cwd 行）", pc1.inherit === true && pc1.cwdRaw === "");',

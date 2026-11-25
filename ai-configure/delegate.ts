@@ -1862,7 +1862,7 @@ export interface SlotWaitDeps {
 interface HerdrSlotOps {
 	mainPaneId(): string | undefined;
 	workspaceId(): string | undefined;
-	paneList(): { paneId: string; label?: string; tabId?: string }[];
+	paneList(opts?: { labelFallback?: boolean }): { paneId: string; label?: string; tabId?: string }[];
 	paneSplit(target: string, dir: "right" | "down", ratio: number, cwd: string): string | undefined;
 	tabCreate(workspace: string, label: string, cwd: string): { tabId: string; paneId: string } | undefined;
 	tabClose(tabId: string): boolean;
@@ -2205,7 +2205,8 @@ function pruneHerdrSlots(): void {
 		}
 		return;
 	}
-	const alive = new Set(herdrSlotOps.paneList().map((p) => p.paneId));
+	// 只要 paneId：明确告诉 herdr 别为 label 去逐个 `pane get`（这是轮询里的热路径）
+	const alive = new Set(herdrSlotOps.paneList({ labelFallback: false }).map((p) => p.paneId));
 	if (alive.size === 0) return; // herdr 刚挂/刚重启 —— 这轮先不下结论
 	const touchedTabs = new Set<string>();
 	for (const [idx, s] of [...herdrSlots]) {
@@ -2759,7 +2760,7 @@ export interface PaneWaitOps {
 
 const realPaneWaitOps: PaneWaitOps = {
 	read: (paneId) => paneReadEx(paneId),
-	alive: (paneId) => paneList().some((p) => p.paneId === paneId),
+	alive: (paneId) => paneList({ labelFallback: false }).some((p) => p.paneId === paneId),
 	sendKeys: (paneId, keys) => paneSendKeys(paneId, keys),
 };
 

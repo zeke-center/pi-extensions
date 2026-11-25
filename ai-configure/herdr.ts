@@ -379,10 +379,54 @@ export interface PaneInfo {
 	agentStatus?: string;
 }
 
-export function paneList(): PaneInfo[] {
+/** `pane get` 单个 pane 的 label（herdr 0.9.5 的 `pane list` **不返回 label**，只有 get 有） */
+function paneLabelOf(paneId: string): string | undefined {
+	const raw = runJson(["pane", "get", paneId]);
+	if (raw === undefined) return undefined;
+	const res = unwrapResult(raw);
+	const p = asRec(res.pane ?? findKey(raw, "pane"));
+	return typeof p.label === "string" && p.label ? p.label : undefined;
+}
+
+/**
+ * 列出所有 pane。
+ *
+ * ⚠️ herdr **0.9.5 的 `pane list` 不返回 label**（只有 `pane get <id>` 才有），
+ * 而我们的 `/panes`、'已停/失败保留'回收、`isSubagentPaneLabel` 全靠 label 认人 ——
+ * 不补就会把它们**全部当成别人的 pane 滤掉**（槽位被钉死 + `/panes` 一片空）。
+ *
+ * 补法：list 里缺 label 的那些，**逐个 `pane get`** 补一次。
+ * 只在确实缺的时候补（label 齐了就是 1 次调用），且带 3 秒缓存，避免轮询里反复调 CLI。
+ */
+const PANE_GET_CACHE_MS = 3000;
+const paneGetCache = new Map<string, { at: number; label: string | undefined }>();
+
+export function paneList(opts: { labelFallback?: boolean } = {}): PaneInfo[] {
 	const raw = runJson(["pane", "list"]);
 	if (raw === undefined) return [];
-	return parsePaneList(raw);
+	const list = parsePaneList(raw);
+	if (opts.labelFallback === false) return list;
+	const now = Date.now();
+	let missing = 0;
+	for (const p of list) {
+		if (p.label) continue;
+		missing += 1;
+		const c = paneGetCache.get(p.paneId);
+		if (c && now - c.at < PANE_GET_CACHE_MS) {
+			p.label = c.label;
+			continue;
+		}
+		const label = paneLabelOf(p.paneId);
+		paneGetCache.set(p.paneId, { at: now, label });
+		p.label = label;
+	}
+	// 缓存别无限长：超过 200 条就丢掉最旧的
+	if (paneGetCache.size > 200) {
+		const sorted = [...paneGetCache.entries()].sort((a, b) => a[1].at - b[1].at);
+		for (const [k] of sorted.slice(0, 100)) paneGetCache.delete(k);
+	}
+	void missing;
+	return list;
 }
 
 /** 把 `pane list` 的原始 JSON 解成 PaneInfo[]（不碰命令行，纯函数） */

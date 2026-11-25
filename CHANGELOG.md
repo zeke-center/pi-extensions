@@ -2,6 +2,11 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.6.8
+
+- 修复：**herdr 0.9.5 的 `pane list` 不返回 label** —— 我们的 `/panes`、'已停/失败保留'回收、`isSubagentPaneLabel` 全靠 label 认人，标签一空就把子助理 pane 全当成别人的滤掉（`/panes` 空白 + 槽位可能被钉死）
+- 新增：`paneList()` 缺 label 时逐个 `pane get` 补齐（3 秒缓存）；热路径显式 `{labelFallback:false}` 跳过（实测 274ms → 40ms）
+
 ## 2.6.7
 
 - 修复：**工作目录改不回“跟随当前项目”** —— 以前把它删空再 ctrl+s，文件里又被填回当前项目目录；现在留空 = 继承（不落 `cwd` 行）
