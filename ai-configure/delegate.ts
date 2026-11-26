@@ -1,4 +1,4 @@
-/**
+﻿/**
  * delegate · 派活给临时助理（并行 + 同步停止 + 超时续期）
  *
  * 一个工具：delegate(assistant, task | tasks) —— 起**独立的后台 pi 进程**干活，
@@ -81,6 +81,7 @@ import {
 	badEnumValues,
 } from "./permissions";
 import { guardCtx, readExtCfg } from "./shared";
+import { logError, logEvent, logTimed, setLogSession } from "./log";
 import {
 	mainPaneId,
 	herdrLog,
@@ -3208,6 +3209,7 @@ async function tryRunInHerdr(
 		if (!slot) {
 			// 等满 60s 还是没格 → 降级 rpc（备注要能让用户看出「不是派失败，是没位了」）
 			job.note = SLOT_WAIT_NOTE;
+			logEvent("herdr.slot.timeout", { assistant: tpl.key, waitMs: HERDR_SLOT_WAIT_MS, fallback: "rpc" }, "warn");
 			notifyLive();
 			return undefined;
 		}
@@ -3621,6 +3623,7 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// 没走成（非 Herdr / 任何 herdr 调用失败）→ 返回 undefined，下面原封不动走 rpc 无头模式。
 	{
 		const viaPane = await tryRunInHerdr(tpl, task, opt, args, job, sink, base);
+		logEvent("worker.mode", { assistant: tpl.key, mode: viaPane ? "pane" : "rpc", note: job.note }, viaPane ? "info" : "warn");
 		if (viaPane) return viaPane;
 	}
 
@@ -6331,6 +6334,9 @@ async function deliverBgTask(t: BgTaskFile): Promise<void> {
 }
 
 /** 每秒扫一遍后台任务：终态、没回投过、且**属于本会话**的 → 回投 */
+/** 同一张卡只记一次「为什么跳过」（否则每秒轮询刷爆日志） */
+const skipLoggedOnce = new Set<string>();
+
 async function pollBgTasks(): Promise<void> {
 	if (!apiRef) return;
 	// 停用态：一条也不投（小票保留，/ai-ext on 后 armBgTimer 会接着投）
@@ -6354,7 +6360,14 @@ async function pollBgTasks(): Promise<void> {
 		//    /reload 会重新 load 扩展 → armBgTimer 又挂一轮 1 秒轮询；没有这两条，
 		//    任何一条没落成 delivered:true 的老卡都会**每次 reload 再投一遍**（还顺带唤起主会话跑一轮）。
 		//    跳过的记录**不删**：面板 / `/agents bg` 仍能看到「未投递」，手动 redeliver 可补。
-		if (deliverSkipReason(t, now) && !forcedDeliver.has(t.id)) continue;
+		const skipWhy = deliverSkipReason(t, now);
+		if (skipWhy && !forcedDeliver.has(t.id)) {
+			if (!skipLoggedOnce.has(t.id)) {
+				skipLoggedOnce.add(t.id);
+				logEvent("deliver.skip", { id: t.id, why: skipWhy });
+			}
+			continue;
+		}
 		const attempts = t.attempts ?? 0;
 		// 退避：别每秒硬撞
 		if (t.lastAttemptAt && now - t.lastAttemptAt < deliverBackoffMs(attempts)) continue;
@@ -6375,10 +6388,12 @@ async function pollBgTasks(): Promise<void> {
 			// 只有真发出去才标 delivered，而且**紧接着就落盘**：
 			// 中间不 await 任何东西，别让后面的 markEnd / 看门狗拿着旧快照把 delivered 冲回 false。
 			writeBgTask({ ...t, delivered: true, attempts: attempts + 1, lastAttemptAt: now, lastError: undefined });
+			logEvent("deliver.ok", { id: t.id, attempts: attempts + 1 });
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			// 首次失败就钉住 firstFailAt（之后取最早，不再改）—— 缺了它「多久没发出去」永远算不出来
 			const firstFailAt = t.firstFailAt ?? now;
+			logEvent("deliver.fail", { id: t.id, why: msg, attempts }, "error");
 			// 「投递未生效」这类错放宽到 DELIVER_RETRY_MAX 次（否则 14s 就用完配额 → 一次流式竞态就永久丢）
 			const plan = planDeliverFailure({ attempts, msg, now, firstFailAt });
 			writeBgTask({
@@ -6691,6 +6706,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 
 	// 后台任务轮询：session_start 挂 timer，session_shutdown 清理（与 panel.ts 同一套模式）
 	api.on("session_start", async (_event, ctx) => {
+		setLogSession(ctx.sessionId, ctx.cwd);
+		logEvent("session.start", { cwd: ctx.cwd });
 		// 每个会话重新探测一次：别把上个会话的失败结论 / 坏锁带过来（坏锁现在只是 30s 冷却，但结论也得清）
 		resetHerdrCache();
 		rememberCurrentSession(ctx); // 记下「我是哪个会话」，后台结果靠它认领
@@ -6821,7 +6838,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 					const have = can.length
 						? `可派的有：${can.map((t) => `${t.key}(${t.name})`).join(", ")}`
 						: `可是现在**一个能派的都没有**（只有 base 和示例模板，用 /assistants 看）`;
-					return {
+logEvent("dispatch.reject", { assistant: name, why: "template_not_found" }, "warn");
+return {
 						content: [{ type: "text" as const, text: `找不到助理「${name}」。${have}` }],
 						details: { ok: false, reason: "template_not_found" },
 					};
@@ -6829,7 +6847,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 
 				// demo:true 是「示例模板」—— 只是拿来示范字段写法的，能看不能派
 				if (tpl.demo === true) {
-					return {
+logEvent("dispatch.reject", { assistant: tpl.key, why: "template_is_demo" }, "warn");
+return {
 						content: [
 							{
 								type: "text" as const,
@@ -6845,7 +6864,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 				// base:true 是「基础模板」，只给 extends 用，不能直接派
 				if (tpl.base === true) {
 					const kids = templates.filter((t) => t.extends === tpl.key).map((t) => t.key);
-					return {
+logEvent("dispatch.reject", { assistant: tpl.key, why: "template_is_base" }, "warn");
+return {
 						content: [
 							{
 								type: "text" as const,
@@ -6859,7 +6879,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 				}
 
 				if (!existsSync(tpl.cwd)) {
-					return {
+logEvent("dispatch.reject", { assistant: tpl.key, why: "cwd_not_found", cwd: tpl.cwd }, "warn");
+return {
 						content: [{ type: "text" as const, text: `助理「${tpl.name}」的工作目录不存在：${tpl.cwd}` }],
 						details: { ok: false, reason: "cwd_not_found" },
 					};
@@ -6891,7 +6912,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 				}
 				// 关键配置没写成功 → 直接拒绝启动（否则可能挂着错的 MCP 还假装在干活）
 				if (shadow.errors.length) {
-					return {
+logEvent("dispatch.reject", { assistant: tpl.key, why: "shadow_build_failed", errs: shadow.errors }, "warn");
+return {
 						content: [
 							{
 								type: "text" as const,
@@ -6908,7 +6930,8 @@ export function setupDelegate(api: ExtensionAPI): void {
 				// 为什么不只 warn：一个连不上库的「数据库助理」会假装在干活、给你编结果，
 				// 这比直接失败更吓人。此处还没进 Promise.all(runAssistant)，子进程一个都不会起。
 				if (shadow.missing.length) {
-					return {
+logEvent("dispatch.reject", { assistant: tpl.key, why: "mcp_not_found", missing: shadow.missing, pool: Object.keys(pool.servers) }, "warn");
+return {
 						content: [
 							{
 								type: "text" as const,
@@ -6936,6 +6959,11 @@ export function setupDelegate(api: ExtensionAPI): void {
 				ready.set(name, { tpl, shadow });
 			}
 			const plan = wants.map((w) => ({ ...w, ...ready.get(w.assistant)! }));
+			logEvent("dispatch.accept", {
+				n: plan.length,
+				assistants: [...new Set(plan.map((p) => p.tpl.key))],
+				mcp: plan.map((p) => p.shadow.names.join("+") || "-"),
+			});
 
 			// 超时/默认值沿用第一个任务的模板（单助理派发时和以前完全一致）
 			const raw =

@@ -18,6 +18,7 @@ import { paneSummary } from "./herdr";
 // 健康判据的阈值/文案复用 delegate.ts 那一份（delegate → live 已有依赖，这层是反向引用，
 // 只在函数体里用到，不在模块初始化时求值，所以 esbuild 打包不会踩 TDZ）
 import { HEALTH_ACTIVE_MS, HEALTH_SLOW_MS, fmtDuration, healthEmoji, type WorkerHealth } from "./delegate";
+import { logEvent } from "./log";
 
 // ======================= 类型 =======================
 
@@ -531,6 +532,24 @@ export function markEnd(
 	job.status = outcome;
 	if (note) job.note = note;
 	const now = Date.now();
+	// 埋点：所有终态都在这里收口（分屏 / rpc / 闸门中止都走 markEnd）
+	try {
+		logEvent(
+			"worker.end",
+			{
+				assistant: job.key,
+				status: outcome,
+				ms: job.startedAt ? now - job.startedAt : undefined,
+				tools: job.tools.length,
+				note: note,
+				pane: job.paneId,
+				tab: job.tabId,
+			},
+			outcome === "done" ? "info" : outcome === "partial" ? "warn" : "error",
+		);
+	} catch {
+		/* 日志失败不影响终态 */
+	}
 	job.lastEventAt = now;
 	job.endedAt = now;
 	for (const t of job.tools) {

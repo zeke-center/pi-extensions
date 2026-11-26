@@ -1,6 +1,6 @@
-# pi-extensions
+﻿# pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.9.2**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.10.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1326,6 +1326,55 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 2. 影子目录的 `mcp.json` 里有没有写进去 → `~/.pi/agent/shadow/<助理>-*/mcp.json`
 3. 那个 server 的 command 能不能手动跑起来（exe 路径 / 参数 / 环境变量 / 凭据）
 4. worker 那次会话开头有没有 MCP 报错 → `/resume-agent`
+
+### 事件日志（v2.10.0，出问题先看这个）
+
+插件自己埋点，**一行一个 JSON**，按天滚：
+
+```
+<agentDir>/logs/events-2026-11-26.jsonl
+```
+
+| 项 | 值 |
+|---|---|
+| 保留 | **3 天**（超出自动删；同时看 mtime 和文件名日期） |
+| 上限 | 单文件 4MB / 总目录 20MB，超了删最旧的 |
+| 写入 | 缓冲 50 条或 1 秒 flush，批量写；**写失败静默**（日志绝不拖垮插件） |
+| 脱敏 | `password` / `token` / `*Key` / `dsn` 全部 `***` |
+| 限流 | 同事件同 key 10 秒内只记 1 条 + 累计次数 |
+
+**看日志**（不用开文件）：
+
+```
+/aidoctor log          # 最近 30 条 warn 以上 + 按事件汇总
+/aidoctor log 100      # 最近 100 条
+/aidoctor log 50 error # 只要 error
+```
+
+**事件词典**（排障时对照着看）：
+
+| 事件 | 意思 |
+|---|---|
+| `worker.mode` `mode=rpc` | **分屏降级了**（本该在 pane 里跑，退成无头模式） |
+| `herdr.degrade` | 本会话不再尝试分屏，`why` 里是原因 |
+| `herdr.fail` | 单条 herdr 命令失败（带退出码/超时/`err`）—— 分屏挂了先看它 |
+| `herdr.slot.timeout` | 等 pane 槽位满 60s 超时 |
+| `dispatch.reject` | 派活被拒，`why`：`template_not_found` / `template_is_demo` / `template_is_base` / `cwd_not_found` / `shadow_build_failed` / `mcp_not_found` |
+| `worker.end` | Worker 终态（`status` + 耗时 + 工具数 + `note`）；`partial`/`failed` 是 warn/error |
+| `worker.ext-load.fail` | **扩展加载失败 = Worker 起不来**（v2.8.0 那次全崩就是这个） |
+| `deliver.fail` / `deliver.skip` | 回投失败 / 为什么没投 |
+| `mcp.shadow.build` | 本次派活往影子写了哪些 MCP、漏了哪些 |
+| `perm.deny` | 守卫拦了一次工具调用（`tool` + `kind`） |
+| `perm.mask` | L1 摘掉了哪些工具 |
+| `ext.load` / `ext.module.fail` | 插件启动；哪块模块加载失败 |
+| `crash.uncaught` / `crash.unhandled` | 未捕获异常（**只记不崩**） |
+| `herdr.slow` / 任何带 `ms` 的 | 超过 1s 的慢操作自动升 warn |
+
+**开关**（`~/.pi/agent/ai-extensions.json`）：
+
+```json
+{ "log": { "enabled": true, "level": "info" } }
+```
 
 ### 自检报告（给别人用的，v2.9.0）
 

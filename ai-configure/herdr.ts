@@ -24,6 +24,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readExtCfg } from "./shared";
+import { logEvent, logTimed } from "./log";
 
 /** 一条 herdr 命令最多等这么久（卡住的 herdr 不该把派活拖死） */
 const TIMEOUT_MS = 10_000;
@@ -32,7 +33,15 @@ const BIN = "herdr";
 
 // ======================= 底层：跑命令 + 解析 JSON =======================
 
+/**
+ * 所有 herdr CLI 调用都从这里过 —— 所以埋点只放这一处就够，不用在每个调用点手写。
+ *
+ * 记什么：命令、耗时、失败原因（超时 / 非 0 退出 / 找不到 bin）。
+ * 分屏降级时，日志里就能直接看到是**哪条 herdr 命令**先挂的。
+ */
 function run(args: string[]): string | undefined {
+	const sub = args.slice(0, 2).join(" ");
+	const t0 = Date.now();
 	try {
 		const out = execFileSync(BIN, args, {
 			encoding: "utf8",
@@ -41,11 +50,34 @@ function run(args: string[]): string | undefined {
 			stdio: ["ignore", "pipe", "pipe"],
 			maxBuffer: 8 * 1024 * 1024,
 		});
+		const ms = Date.now() - t0;
+		// 慢的才记（正常 pane 操作几十毫秒，全记会把日志刷满）
+		if (ms >= HERDR_SLOW_MS) logTimed("herdr.slow", ms, { cmd: sub, args: args.slice(2, 6) });
 		return typeof out === "string" ? out : String(out ?? "");
-	} catch {
-		return undefined; // 非 0 退出 / 超时 / 找不到 herdr —— 一律当失败
+	} catch (e) {
+		const ms = Date.now() - t0;
+		const err = e as { code?: string; status?: number | null; signal?: string; killed?: boolean; message?: string };
+		// 非 0 退出 / 超时 / 找不到 herdr —— 一律当失败（**绝不抛**），但要说清是哪种
+		logEvent(
+			"herdr.fail",
+			{
+				cmd: sub,
+				args: args.slice(2, 6),
+				ms,
+				code: err?.code,
+				status: err?.status ?? undefined,
+				signal: err?.signal,
+				killed: err?.killed === true,
+				err: String(err?.message ?? e).slice(0, 200),
+			},
+			"warn",
+		);
+		return undefined;
 	}
 }
+
+/** herdr 单次调用超过这个值就算慢（记一条 warn） */
+export const HERDR_SLOW_MS = 800;
 
 function runJson(args: string[]): unknown | undefined {
 	const out = run(args);
@@ -247,6 +279,8 @@ export function herdrStatus(at: number = Date.now()): HerdrStatus {
 export function markHerdrBroken(reason: string, at: number = Date.now()): void {
 	brokenReason = String(reason ?? "").trim() || "未知原因";
 	brokenAt = at;
+	// 分屏降级：本会话不再试分屏，全部回 panel / rpc —— 用户看到的「分屏没出来」就是这条
+	logEvent("herdr.degrade", { why: brokenReason }, "warn");
 	statusCache = undefined; // 让下一次 herdrStatus() 立刻反映
 	statusCachedAt = 0;
 	herdrLog(`HERDR_BROKEN ${brokenReason}`);

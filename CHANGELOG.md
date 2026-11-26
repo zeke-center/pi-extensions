@@ -1,6 +1,39 @@
-# 更新日志
+﻿# 更新日志
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
+
+## 2.10.0
+
+**新增：插件运行时事件日志（`<agentDir>/logs/events-YYYY-MM-DD.jsonl`）**
+
+以前插件出问题（分屏降级、Worker 起不来、MCP 挂不上、回投失败）没有任何埋点 —— `guard.log` 只记拒绝、`herdr.log` 只有几行、`.bg` 没失败原因，事后只能猜。现在：
+
+- 一行一个 JSON（JSONL），按天滚；**保留 3 天**、单文件 4MB、总 20MB，超了自动删最旧的（`cleanLogs()` 同时看 mtime 和文件名日期）
+- 内存缓冲 50 条 / 1 秒 flush 一次，批量 `appendFileSync`；**写日志失败一律静默**（日志绝不能拖垮插件）
+- 所有值走 `redactDeep` 脱敏（`password` / `telemetryKey` / `dsn` 这类全打码）
+- 限流：同事件同 key 10 秒内只记 1 条 + 累计次数（防每秒轮询刷爆）
+- 开关：`ai-extensions.json` 里 `log: { enabled, level }`
+
+**埋点覆盖（32 处）**
+
+| 域 | 事件 |
+|---|---|
+| 派活 | `dispatch.accept` / `dispatch.reject`（six reasons）/ `worker.mode`（pane 还是 rpc） |
+| Worker | `worker.end`（在 `markEnd` 收口，含 status/耗时/工具数/note）/ `worker.ext-load.fail` |
+| 分屏 | `herdr.fail`（命令级，含退出码/超时）/ `herdr.degrade` / `herdr.slot.timeout` / `herdr.slow` |
+| 回投 | `deliver.ok` / `deliver.fail` / `deliver.skip` |
+| MCP | `mcp.shadow.build` / `mcp.missing` |
+| 权限 | `perm.mask` / `perm.deny` / `perm.observe` |
+| 进程 | `ext.load` / `ext.module.fail` / `crash.uncaught` / `crash.unhandled` |
+| 会话 | `session.start` |
+
+**新增：`/aidoctor log [条数] [级别]`** —— 不用开文件、不用导报告，直接看最近事件 + 按事件汇总
+
+**自检报告升级第 9 段**：`9a 最近 3 天事件统计`（表格：事件/级别/次数/最后发生/样例，并说明 `worker.mode=rpc` = 分屏降级、`herdr.degrade` = 本会话不再试分屏）+ `9b 最近的 error/warn 原文`；老的 guard.log/herdr.log 退到 9c
+
+**其它**
+- 脱敏逻辑抽到独立 `redact.ts`（原来住在 diagnose.ts 里，log 引用它会形成循环 import）
+- Worker 守卫（影子目录那份）也用同一套日志：`installGuard` 把 `logDir` 写进 `guard-config.json`，守卫自带 12 行写入器（影子目录里没有插件其它模块，不能 import）
 
 ## 2.9.2
 

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * /ai doctor —— AI configure 自检。
  *
  * 为什么要有：以前出错只能靠猜（"MCP 绿点不对"「连接连不上」）。
@@ -31,6 +31,7 @@ import { assistantSessionRoot, localCatalogPath, shadowRoot } from "./mcp-pool";
 import { panelMode } from "./panel";
 import { resolveRouterPrompt } from "./superagent";
 
+import { logSummaryLine, readRecentLogs, summarizeLogs, cleanLogs, logsDir, LOG_RETAIN_DAYS } from "./log";
 export function showDoctor(ctx: ExtensionContext): void {
 	const cwd = ctx.cwd ?? process.cwd();
 	const L: string[] = ["ai-configure doctor", ""];
@@ -189,11 +190,63 @@ export function setupDoctor(api: ExtensionAPI): void {
 		description: "AI configure 自检：模块健康度 / MCP 连接 / 助理 / 看板（\`/aidoctor export\` 生成可外发的诊断报告）",
 		handler: async (args: string, ctx: ExtensionContext) => {
 			const a = String(args ?? "").trim().toLowerCase();
-			if (a === "export" || a === "report") {
+			// /aidoctor log [条数] [级别] —— 不用开文件、不用导出报告，直接看最近埋点
+			if (a === "log" || a.startsWith("log ")) {
+				showLog(ctx, a.replace(/^log\s*/, ""));
+				return;
+			}			if (a === "export" || a === "report") {
 				writeDiagnose(ctx);
 				return;
 			}
 			showDoctor(ctx);
 		},
 	});
+}
+
+/**
+ * `/aidoctor log [条数] [级别]`：直接打印最近事件（默认 30 条、warn 以上）。
+ *
+ * 为什么需要：`/aidoctor export` 是「打包发给作者」用的完整报告；
+ * 自己排查时只想看「刚才那条错误长什么样」，翻文件太慢。
+ */
+export function showLog(ctx: ExtensionContext, arg = ""): void {
+	const parts = String(arg ?? "")
+		.trim()
+		.split(/\s+/)
+		.filter(Boolean);
+	let limit = 30;
+	let lvl: "info" | "warn" | "error" = "warn";
+	for (const p of parts) {
+		const n = Number(p);
+		if (Number.isFinite(n) && n > 0) limit = Math.min(500, Math.floor(n));
+		else if (p === "info" || p === "warn" || p === "error") lvl = p;
+	}
+	// 兜底：先清一遍过期文件（用户可能是几天后第一次来看）
+	cleanLogs();
+	const { rows, files } = readRecentLogs(limit, { lvl });
+	const sum = summarizeLogs();
+	const lines: string[] = [];
+	lines.push(`事件日志：${logsDir()}`);
+	lines.push(`保留 ${LOG_RETAIN_DAYS} 天　${logSummaryLine()}`);
+	if (!files.length) {
+		lines.push("");
+		lines.push("（还没有日志。派一次活、出一次错之后再看，或者 /aidoctor export 拿完整报告）");
+	} else {
+		lines.push("");
+		for (const r of rows) {
+			const d = (r.d ?? {}) as Record<string, unknown>;
+			const time = String(r.t ?? "").replace("T", " ").replace("Z", "");
+			const bits = Object.entries(d)
+				.filter(([, v]) => v !== undefined && v !== "")
+				.map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+				.join(" ");
+			lines.push(`${time}  ${String(r.lvl).toUpperCase().padEnd(5)} ${r.ev}  ${bits}`);
+		}
+	}
+	if (sum.length) {
+		lines.push("");
+		lines.push("按事件汇总（近 3 天）：");
+		for (const s of sum.slice(0, 12)) lines.push(`  ${s.lvl === "error" ? "❌" : s.lvl === "warn" ? "⚠️" : "  "} ${s.ev}  ×${s.count}`);
+	}
+	ctx.ui.notify(lines.join("\n"), "info");
 }

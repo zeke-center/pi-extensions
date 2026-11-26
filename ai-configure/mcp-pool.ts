@@ -1,4 +1,4 @@
-/**
+﻿/**
  * MCP 候选池 + 影子 agentDir。
  *
  * 为什么需要这个东西
@@ -36,6 +36,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { WorkerPermissions } from "./permissions";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { logEvent, logError } from "./log";
 
 /** 一个 MCP server 的原始定义（直接透传 pi 的格式） */
 export type McpServerDef = Record<string, unknown>;
@@ -415,6 +416,7 @@ export function buildShadow(
 		const def = pool.servers[name] ?? inherit[name];
 		if (!def) {
 			missing.push(name);
+			logEvent("mcp.missing", { server: name }, "warn");
 			continue;
 		}
 		chosen[name] = opts.exposure ? { ...def, exposure: opts.exposure } : { ...def };
@@ -428,6 +430,12 @@ export function buildShadow(
 		errors.push(`mcp.json 写入失败：${e instanceof Error ? e.message : String(e)}`);
 	}
 
+	// 一次派活写了哪些 MCP 进影子 / 漏了哪些 / 出错没有 —— 卡在「MCP 挂不上」时第一条要看的就是它
+	logEvent(
+		"mcp.shadow.build",
+		{ dir: dir.split(/[\\/]/).slice(-1)[0], names: Object.keys(chosen), inherited, missing, warns: warnings.length, errs: errors.length },
+		errors.length ? "error" : missing.length ? "warn" : "info",
+	);
 	return { dir, names: Object.keys(chosen), inherited, missing, errors, warnings };
 }
 
@@ -455,7 +463,14 @@ export function installGuard(
 		writeFileSync(
 			join(dir, "guard-config.json"),
 			`${JSON.stringify(
-				{ cwd: opts.cwd, pluginDir: srcDir, protectedPaths: opts.protectedPaths ?? [] },
+				{
+				cwd: opts.cwd,
+				pluginDir: srcDir,
+				protectedPaths: opts.protectedPaths ?? [],
+				// Worker 的 agentDir 是影子目录（2h 就被回收），日志必须写到**主进程**的 logs/ 下，
+				// 否则「分屏降级 / 守卫拒绝」这些现场一过 TTL 就跟着影子目录一起没了。
+				logDir: join(getAgentDir(), "logs"),
+			},
 				null,
 				2,
 			)}\n`,

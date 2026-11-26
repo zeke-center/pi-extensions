@@ -1,4 +1,4 @@
-/**
+﻿/**
  * guard-entry.ts —— L3 兜底的**极薄入口**（会被复制进影子目录，Worker 侧生效）。
  *
  * 为什么单独一个文件、而且这么薄
@@ -13,7 +13,7 @@
  * **fail-open**：读不到配置（还没接线 / 配置坏了）→ 一个都不拦。
  * 保险丝不该在"自己出故障"的时候把 Worker 整个锁死。
  */
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -39,14 +39,42 @@ function readJson(file: string): Record<string, unknown> | undefined {
 	}
 }
 
-export default function (pi: ExtensionAPI) {
-	// 最外层兜底：**守卫坏了也不能让 Worker 起不来**（fail-open 的最后一道）
+/**
+ * 加载期致命错误 → 主进程日志。影子目录 2h 就被回收，只写影子等于没写。
+ * 这里**故意不复用 evLog**：那个在 initGuard 里，此刻还没跑起来。
+ */
+function logFatalToMain(e: unknown): void {
+	try {
+		const cfg = readJson(join(shadowRoot(), "guard-config.json"));
+		const dir = typeof cfg?.logDir === "string" ? cfg.logDir : "";
+		if (!dir) return;
+		mkdirSync(dir, { recursive: true });
+		const day = new Date().toISOString().slice(0, 10);
+		const row = JSON.stringify({
+			t: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+			lvl: "error",
+			ev: "worker.ext-load.fail",
+			pid: process.pid,
+			who: "worker",
+			d: { err: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? (e.stack ?? "").split("\n").slice(1, 4).join(" <- ").trim() : undefined },
+		});
+		appendFileSync(join(dir, `events-${day}.jsonl`), row + "\n", "utf8");
+	} catch {
+		/* 忽略 */
+	}
+}
+
+export default function (pi: ExtensionAPI) {	// 最外层兜底：**守卫坏了也不能让 Worker 起不来**（fail-open 的最后一道）
 	try {
 		initGuard(pi);
 	} catch (e) {
 		try {
 			appendFileSync(join(shadowRoot(), "guard.log"), `${new Date().toISOString()} GUARD_INIT_FAIL ${e instanceof Error ? e.message : String(e)}\n`, "utf8");
+			// 这一条最值钱：扩展加载失败 = Worker 进程直接起不来（v2.8.0 就是这么整批崩的）。
+			// 影子目录 2h 就被回收，所以必须同时写进**主进程**的 logs/。
+			logFatalToMain(e);
 		} catch {
+			/* 连日志都写不了就只能放弃 */
 			/* 连日志都写不了就只能放弃 */
 		}
 	}
@@ -74,6 +102,33 @@ export function initGuard(pi: ExtensionAPI): void {
 		execHardBlock,
 	};
 	const logFile = join(root, "guard.log");
+
+	/**
+	 * 结构化事件 → **主进程**的 logs/events-*.jsonl（和主进程同一份，按 pid 区分）。
+	 *
+	 * 为什么不用 `./log`：Worker 的影子目录里只有 guard-entry.ts + guard/perm-guard.ts，
+	 * 插件其它模块不存在，import 会直接把扩展加载搞崩（v2.8.0 已经踩过一次）。
+	 * 所以这里自带十几行写入器；失败一律静默。
+	 */
+	const mainLogDir = typeof cfg.logDir === "string" && cfg.logDir ? cfg.logDir : "";
+	const evLog = (ev: string, d: Record<string, unknown>, lvl: "info" | "warn" | "error" = "info"): void => {
+		if (!mainLogDir) return;
+		try {
+			mkdirSync(mainLogDir, { recursive: true });
+			const day = new Date().toISOString().slice(0, 10);
+			const row = JSON.stringify({
+				t: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+				lvl,
+				ev,
+				pid: process.pid,
+				who: "worker",
+				d,
+			});
+			appendFileSync(join(mainLogDir, `events-${day}.jsonl`), row + "\n", "utf8");
+		} catch {
+			/* 记不上就记不上 */
+		}
+	};
 
 	const logLine = (line: string): void => {
 		try {
@@ -109,7 +164,9 @@ export function initGuard(pi: ExtensionAPI): void {
 		if (keep.length && keep.length !== all.length) {
 			try {
 				api.setActiveTools(keep);
-				logLine(`L1_MASK removed=${[...drop].filter((n) => all.includes(n)).join(",") || "(none)"}`);
+				const removed = [...drop].filter((n) => all.includes(n));
+				logLine(`L1_MASK removed=${removed.join(",") || "(none)"}`);
+				evLog("perm.mask", { before: all.length, after: keep.length, removed });
 			} catch {
 				/* 摘不掉就算了，L3 还在 */
 			}
@@ -147,8 +204,10 @@ export function initGuard(pi: ExtensionAPI): void {
 		if (d.logOnly) {
 			// 观察期：只记录，不真拦（先量一下误拦率，再决定切不切硬拦）
 			logLine(`WOULD_BLOCK ${d.kind ?? "?"} ${event.toolName} ${summarizeCall(event.toolName, event.input)}`);
+			evLog("perm.observe", { tool: event.toolName, kind: d.kind }, "warn");
 			return undefined;
 		}
+		evLog("perm.deny", { tool: event.toolName, kind: d.kind, call: summarizeCall(event.toolName, event.input).slice(0, 200) }, "warn");
 		return {
 			block: true,
 			reason: d.reason ?? `EPERM[${d.kind ?? "policy"}] 这个动作超出当前 Worker 的权限。`,

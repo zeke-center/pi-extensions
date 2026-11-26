@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
  * 无头单元测试。
  *
@@ -275,6 +275,7 @@ let allOk = true;
 // ---------- 套件 3：board（MCP 栏的表头 / 三态标记） ----------
 bundle("board.ts", "board.mjs");
 bundle("diagnose.ts", "diagnose.mjs");
+bundle("log.ts", "log.mjs");
 // guard-entry 在**影子里的布局**是 extensions/guard-entry.ts + extensions/guard/perm-guard.ts，
 // 仓库里 perm-guard.ts 是平铺的 —— 所以先按影子布局复制一份再打包。
 {
@@ -3433,7 +3434,7 @@ allOk =
 	'const fakeFacts = { pluginVersion: "t", piVersion: "t", nodeVersion: "t", os: "t", cwd: "C:/p", agentDir: "C:/a", trusted: false, assistants: [], mcpPool: [], shadow: { count: 0 }, files: [], taskHistory: [], herdr: { ok: false }, logs: { guardTail: [], herdrTail: [], crashes: "(无)" }, notes: [] };',
 	'const rep = buildDiagnoseReport(fakeFacts);',
 	'ok("报告：有「给读报告的 AI」说明段", rep.includes("给读这份报告的 AI"));',
-	'ok("报告：11 段结构齐全", ["## 1. 结论","## 2. 环境与路径","## 3. 关键文件清单","## 4. 配置","## 5. 助理","## 6. MCP","## 7. 影子目录","## 8. 最近任务","## 9. 日志尾巴","## 11. 还需要用户提供什么"].every((x) => rep.includes(x)));',
+	'ok("报告：11 段结构齐全", ["## 1. 结论","## 2. 环境与路径","## 3. 关键文件清单","## 4. 配置","## 5. 助理","## 6. MCP","## 7. 影子目录","## 8. 最近任务","## 9. 日志","## 11. 还需要用户提供什么"].every((x) => rep.includes(x)));',
 	'ok("报告：项目未信任会进结论", rep.includes("项目未信任"));',
 	'ok("报告：明确写了已脱敏", rep.includes("已脱敏"));',
 	'ok("脱敏：telemetryKey 这种 *Key 结尾也要打码（v2.9.1 用户机器实漏）", JSON.stringify(redactDeep({ telemetryKey: "abc123" })).includes("***"));',
@@ -3496,6 +3497,63 @@ allOk =
 	'try { initGuard(brokenPi); } catch (e) { threw = e; }',
 	'ok("工厂层兜底：内部异常不外抛", threw === null);',
 ], { PI_CODING_AGENT_DIR: join(tmp, "guard-shadow") }) && allOk;
+
+// ---------- log：运行时事件日志（v2.10.0）----------
+const logDir = join(tmp, "logs-suite");
+mkdirSync(logDir, { recursive: true });
+allOk =
+	runSuite("log：格式 / 限流 / 清理 / 脱敏", join(tmp, "log.mjs"), [
+		'ok("保留 3 天", LOG_RETAIN_DAYS === 3);',
+		'ok("单文件 4MB / 总 20MB 上限", LOG_FILE_MAX_BYTES === 4 * 1024 * 1024 && LOG_DIR_MAX_BYTES === 20 * 1024 * 1024);',
+		'ok("缓冲 50 条 / 1 秒 flush", LOG_FLUSH_ROWS === 50 && LOG_FLUSH_MS === 1000);',
+		'ok("限流窗口 10 秒 / 慢操作阈值 1000ms", LOG_DEDUPE_MS === 10000 && LOG_SLOW_MS === 1000);',
+		'setLogSession("a6tffv-20261126-123456-1", "F:\\\\AI\\\\My_Center");',
+		'const row = JSON.parse(formatLogRow("herdr.degrade", "warn", { why: "切 pane 失败" }, new Date("2026-01-02T03:04:05.678Z")));',
+		'ok("行格式：t/lvl/ev/pid/sid/cwd/d", row.t === "2026-01-02T03:04:05Z" && row.lvl === "warn" && row.ev === "herdr.degrade" && typeof row.pid === "number");',
+		'ok("sid 截到 22 字以内", String(row.sid).length <= 22);',
+		'ok("cwd 落盘（跨项目也能区分）", row.cwd === "F:\\\\AI\\\\My_Center");',
+		'ok("明细保留", row.d.why === "切 pane 失败");',
+		'const secretRow = JSON.parse(formatLogRow("x", "info", { password: "p@ss", telemetryKey: "k1", tool: "bash" }));',
+		'ok("脱敏：password / telemetryKey 打码", secretRow.d.password === "***" && secretRow.d.telemetryKey === "***");',
+		'ok("脱敏：非敏感键保留", secretRow.d.tool === "bash");',
+		'const urlRow = JSON.parse(formatLogRow("x", "info", { dsn: "postgres://u:123456@h/db" }));',
+		'ok("脱敏：dsn 整个打码", urlRow.d.dsn === "***");',
+		'ok("没有 d 就不带 d 字段", !("d" in JSON.parse(formatLogRow("x", "info", undefined))));',
+		'configureLog({ level: "warn" });',
+		'let filtered = 0;',
+		'const origPush = buf && null;',
+		'logEvent("t.filtered", { a: 1 }, "info");',
+		'ok("级别过滤：info 被挡掉（不抛）", true);',
+		'configureLog({ level: "info" });',
+		'configureLog({ enabled: false });',
+		'logEvent("t.off", {});',
+		'configureLog({ enabled: true });',
+		'ok("开关能关（不抛）", true);',
+		'logTimed("t.fast", 12);',
+		'logTimed("t.slow", 2500);',
+		'logError("t.err", new Error("boom"));',
+		'flushLog();',
+		'const back = readRecentLogs(50, { lvl: "warn" }).rows;',
+		'ok("logTimed 慢的进 warn、快的进 info", back.some((r) => r.ev === "t.slow") && !back.some((r) => r.ev === "t.fast"));',
+		'ok("logError 带 err 和栈", (() => { const e = back.find((r) => r.ev === "t.err"); return !!e && !!e.d.err && !!e.d.stack; })());',
+		'const sum = summarizeLogs();',
+		'ok("summarizeLogs 聚合出事件", sum.length > 0 && sum.every((s) => s.count >= 1));',
+		'ok("logSummaryLine 是中文摘要", /最近 3 天/.test(logSummaryLine()));',
+		'// 限流：同一事件连发 5 次只落 1 条（窗口 10s）',
+		'for (let i = 0; i < 5; i++) logEvent("t.dup", { where: "w2" }, "error");',
+		'flushLog();',
+		'const dups = readRecentLogs(200, { lvl: "error" }).rows.filter((r) => r.ev === "t.dup");',
+		'ok("限流：同事件同 key 只记 1 条", dups.length === 1);',
+		'// 清理：造一个 5 天前的文件 + 一个 1 天前的',
+		'const oldF = join(logsDir(), "events-2020-01-01.jsonl");',
+		'const newF = logFileFor();',
+		'appendFileSync(oldF, "{\\"t\\":\\"2020-01-01T00:00:00Z\\"}\\n", "utf8");',
+		'const removed = cleanLogs();',
+		'ok("清理：>3 天的删掉", removed.some((f) => f.includes("2020-01-01")) && !existsSync(oldF));',
+		'ok("清理：当天的不动", existsSync(newF));',
+		'ok("日志目录在 <agentDir>/logs", logsDir().endsWith("logs") && logsDir().includes(getAgentDir()));',
+		'ok("读不存在的目录不抛", (() => { try { cleanLogs(); return true; } catch { return false; } })());',
+	], { PI_CODING_AGENT_DIR: join(tmp, "agent-log") }) && allOk;
 
 rmSync(tmp, { recursive: true, force: true });
 

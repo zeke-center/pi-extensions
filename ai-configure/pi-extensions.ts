@@ -1,4 +1,4 @@
-/**
+﻿/**
  * AI configure —— 一个插件，四块功能。
  *
  * 为什么是「目录」而不是单个 .ts：
@@ -35,7 +35,7 @@ import { setupDoctor } from "./doctor";
 import { isExtDisabled, setupGate } from "./gate";
 import { openSettings } from "./settings";
 import { registerPanelActions } from "./actions";
-import { healthLine, markFail, markOk } from "./health";
+import { failedParts, healthLine, markFail, markOk } from "./health";
 
 // 供测试/诊断用：把配置面板的注册表暴露出来（面板本体在 settings.ts）
 export { settingsSnapshot } from "./settings";
@@ -62,6 +62,9 @@ function withCommandIndex(api: ExtensionAPI, cmds: CommandMap): ExtensionAPI {
 	});
 }
 
+import { configureLog, logError, logEvent } from "./log";
+import { readExtCfg } from "./shared";
+
 /** 装配全部模块（默认导出就是它；另起个名字是为了测试能直接调） */
 export function setupAll(api: ExtensionAPI): void {
 	// ⚠ 每个模块各自 try/catch：一块坏不许带下水（比如后端连不上，看板/派活要照常用）。
@@ -85,10 +88,29 @@ export function setupAll(api: ExtensionAPI): void {
 			markOk(name);
 		} catch (e) {
 			markFail(name, e);
+			logError("ext.module.fail", e, { module: name });
 			console.error(`[ai-configure] 模块 ${name} 加载失败：`, e);
 		}
 	}
 
+	// ---------- 事件日志（v2.10.0）----------
+	// 配置：ai-extensions.json 里 `log: { enabled, level }`；不写就用默认（开、info、保留 3 天）
+	try {
+		const cfg = readExtCfg();
+		const lc = (cfg.log ?? {}) as { enabled?: boolean; level?: "info" | "warn" | "error" };
+		configureLog({ enabled: lc.enabled !== false, level: lc.level });
+	} catch {
+		/* 配置读不了就用默认 */
+	}
+	logEvent("ext.load", { parts: parts.length, failed: failedParts().map((x) => x.name) });
+	// 未捕获异常：**只记录，不改变进程行为**（不重抛、不退出）——
+	// 插件里的定时器/回调抛错以前是彻底静默的，现在至少留下一条现场。
+	try {
+		process.on("uncaughtException", (e) => logError("crash.uncaught", e));
+		process.on("unhandledRejection", (e) => logError("crash.unhandled", e));
+	} catch {
+		/* 老版本 node 忽略 */
+	}
 	// 状态栏露出健康度：全好就不占地方，坏了几块一眼看见
 	api.on("session_start", (_event, ctx) => {
 		try {

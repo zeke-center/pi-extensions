@@ -17,6 +17,8 @@ import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { badEnumValues, configConflicts, permSummary, type WorkerPermissions } from "./permissions";
 import { loadTemplates, projectTrusted, shadowDetail } from "./delegate";
+import { isSensitiveKey, redactArgList, redactDeep, redactSecrets } from "./redact";
+import { readRecentLogs, summarizeLogs } from "./log";
 import { loadMcpPool } from "./mcp-pool";
 import { herdrStatus } from "./herdr";
 
@@ -98,75 +100,22 @@ export interface DiagnoseFacts {
 	/** 最近任务（.bg 记录摘要） */
 	taskHistory: { id: string; status: string; reason?: string; lastError?: string; elapsedMs?: number; note?: string }[];
 	herdr: { ok: boolean; reason?: string; panes?: number; term?: string };
-	logs: { guardTail: string[]; herdrTail: string[]; crashes: string; guardStats?: { kind: string; count: number }[] };
+	logs: {
+		/** 结构化事件统计（v2.10.0 新增，最重要的一段） */
+		events?: { ev: string; lvl: string; count: number; last: string; sample?: string }[];
+		/** 最近的 error/warn 原文（最多 50 条，已脱敏） */
+		eventTail?: Record<string, unknown>[];
+		guardTail: string[];
+		herdrTail: string[];
+		crashes: string;
+		guardStats?: { kind: string; count: number }[];
+	};
 	notes: string[];
 }
 
-// ======================= 脱敏 =======================
+// ======================= 脱敏（实现搬到 redact.ts） =======================
 
-/** 打码：URL 里的密码 + 常见的 key/token/secret 字段 */
-export function redactSecrets(input: string): string {
-	let s = String(input ?? "");
-	s = s.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)([^\s@]+)(@)/gi, "$1***$3");
-	s = s.replace(
-		/(["']?[A-Za-z0-9_.-]*(?:token|secret|passwd|password|api[-_]?key|apikey|dsn|database_url|auth)["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi,
-		"$1***",
-	);
-	// 命令行参数：--password 123456 / --token abc（空格分隔，不是 = 也不是 :）
-	s = s.replace(
-		/(--?(?:password|passwd|pwd|token|secret|api[-_]?key|apikey|auth|dsn)[=\s]+)("[^"]*"|'[^']*'|\S+)/gi,
-		"$1***",
-	);
-	return s;
-}
-
-/**
- * 命令行参数数组打码：`["--password", "123456"` 这种**值在下一项**的写法，逐个元素过正则抓不到，
- * 必须按「flag 后面那一项」处理。
- */
-export function redactArgList(args: string[]): string[] {
-	const SECRET_FLAG = /^--?(password|passwd|pwd|token|secret|api-?key|apikey|auth|dsn|key)$/i;
-	const out = [...args];
-	for (let i = 0; i < out.length; i++) {
-		if (SECRET_FLAG.test(out[i])) {
-			if (i + 1 < out.length) out[i + 1] = "***";
-			continue;
-		}
-		if (/^--?(password|passwd|pwd|token|secret|api-?key|apikey|auth|dsn|key)=/i.test(out[i])) {
-			out[i] = out[i].replace(/=.*$/, "=***");
-			continue;
-		}
-		out[i] = redactSecrets(out[i]);
-	}
-	return out;
-}
-
-/** JSON 递归打码（键名敏感 → 整个值变 ***） */
-/**
- * 这个**键名**是不是敏感（值要打码）。
- *
- * ⚠️ 别只认 `apikey`/`api_key`：v2.9.1 的报告里 `telemetryKey` 就是明文漏出去的
- *    （用户机器上实拍）。凡是 key/token/secret/passw/auth/dsn/credential 沾边的一律打码，
- *    宁可多打（键名还在，读的人仍知道「配了哪一项」）。
- */
-export function isSensitiveKey(k: string): boolean {
-	return /(^|[_\-. ])(key|keys|token|secret|passw(or)?d|auth|auth(orization)?|credential|credentials|dsn|database_url|conn(ection)?_?str(ing)?)$|key$|token$|secret$|passwd|password|apikey|api_key|private|signature|salt|hash/i.test(
-		k,
-	);
-}
-
-export function redactDeep(v: unknown): unknown {
-	if (typeof v === "string") return redactSecrets(v);
-	if (Array.isArray(v)) return v.map(redactDeep);
-	if (v && typeof v === "object") {
-		const out: Record<string, unknown> = {};
-		for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-			out[k] = isSensitiveKey(k) ? "***" : redactDeep(val);
-		}
-		return out;
-	}
-	return v;
-}
+export { isSensitiveKey, redactArgList, redactDeep, redactSecrets } from "./redact";
 
 // ======================= 问题提炼 =======================
 
@@ -387,7 +336,33 @@ export function buildDiagnoseReport(f: DiagnoseFacts): string {
 	}
 
 	// ---------- 9. 日志 ----------
-	L.push("## 9. 日志尾巴（已脱敏）", "");
+	L.push("## 9. 日志（已脱敏）", "");
+
+	// 9a. 结构化事件（v2.10.0）—— 先看这段，通常一眼就能定位
+	L.push("### 9a. 最近 3 天事件统计（最重要）", "");
+	L.push("> 这些是插件自己埋的点：每条都是**真实发生过**的事实，不是推测。");
+	L.push("> `worker.mode=rpc` 说明分屏降级了；`herdr.degrade` 说明本会话不再试分屏；");
+	L.push("> `dispatch.reject` 说明派活被拒了（括号里是原因）；`perm.deny` 说明守卫拦了一次工具调用。", "");
+	if (!f.logs.events?.length) {
+		L.push("（没有事件记录。可能是：① 日志功能关着 ② 最近 3 天没派过活 ③ `<agentDir>/logs/` 被清掉了）", "");
+	} else {
+		L.push("| 事件 | 级别 | 次数 | 最后发生 | 样例（错误/原因） |", "|---|---|---|---|---|");
+		for (const e of f.logs.events.slice(0, 40)) {
+			const lv = e.lvl === "error" ? "❌ error" : e.lvl === "warn" ? "⚠️ warn" : "info";
+			const when = String(e.last).replace("T", " ").replace("Z", "");
+			L.push("| " + "`" + e.ev + "`" + " | " + lv + " | " + e.count + " | " + when + " | " + (e.sample ? String(e.sample).slice(0, 120) : "") + " |");
+		}
+		L.push("");
+	}
+	if (f.logs.eventTail?.length) {
+		L.push("### 9b. 最近的 error / warn 原文（最多 50 条）", "");
+		L.push("```json");
+		for (const r of f.logs.eventTail) L.push(JSON.stringify(r));
+		L.push("```", "");
+	}
+
+	// 9c. 老的纯文本日志（向后兼容）
+	L.push("### 9c. 旧日志尾巴", "");
 	if (f.logs.guardStats?.length) {
 		L.push("guard 命中统计：", "");
 		L.push(...md.bullets(f.logs.guardStats.map((g) => `${g.kind}: ${g.count} 次`)), "");
@@ -747,7 +722,14 @@ export function collectDiagnoseFacts(cwd: string, pluginVersion: string, piVersi
 		extensions,
 		taskHistory,
 		herdr,
-		logs: { guardTail, herdrTail: tailOf(join(agentDir, "herdr.log"), 100), crashes, guardStats },
+		logs: {
+			events: summarizeLogs(),
+			eventTail: readRecentLogs(50, { lvl: "warn" }).rows,
+			guardTail,
+			herdrTail: tailOf(join(agentDir, "herdr.log"), 100),
+			crashes,
+			guardStats,
+		},
 		notes,
 	};
 }
