@@ -7,6 +7,21 @@
  * 用法：/ai doctor   或   /aidoctor
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { collectDiagnoseFacts, diagnoseSummaryLine, writeDiagnoseReport } from "./diagnose";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** 插件版本：从包根 package.json 读（读不到就 "?"，报告里不影响排障） */
+const PLUGIN_VERSION = (() => {
+	try {
+		const here = dirname(fileURLToPath(import.meta.url));
+		const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version?: string };
+		return pkg.version ?? "?";
+	} catch {
+		return "?";
+	}
+})();
 import { boardSnapshot, computeMcp } from "./board";
 import { loadTemplates, undeliveredBgCount } from "./delegate";
 import { formatHerdrDiagnostic, herdrStatus, readUiConfig, resolveUiMode, type HerdrDiagInput } from "./herdr";
@@ -147,10 +162,37 @@ export function herdrDiagnosticLines(cwd: string): string[] {
 	}
 }
 
+/**
+ * `/aidoctor export`：把自检结果写成一份**可以整份发给作者**的 markdown（已脱敏）。
+ *
+ * 为什么要有它：别人报问题时最缺的是"事实" —— 版本、哪份助理在生效、MCP 有没有定义、
+ * 配置有没有写错、日志尾巴长什么样。以前全靠来回问 5 轮；现在一条命令出文档。
+ */
+function writeDiagnose(ctx: ExtensionContext): void {
+	const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+	const version = (ctx as { getVersion?: () => string }).getVersion?.() ?? "(未知)";
+	const facts = collectDiagnoseFacts(cwd, PLUGIN_VERSION, version);
+	const line = diagnoseSummaryLine(facts);
+	const out = writeDiagnoseReport(facts);
+	if ("error" in out) {
+		ctx.ui.notify(`报告写不出去：${out.error}\n（可以直接把 ${line} 发我，但信息少很多）`, "error");
+		return;
+	}
+	ctx.ui.notify(
+		`${line}\n\n报告已写到：\n${out.path}\n\n发给作者前扫一眼：密码/token 已自动打码，但项目路径和库名会原样保留。`,
+		"info",
+	);
+}
+
 export function setupDoctor(api: ExtensionAPI): void {
 	api.registerCommand("aidoctor", {
-		description: "AI configure 自检：模块健康度 / MCP 连接 / 助理 / 看板",
-		handler: async (_args: string, ctx: ExtensionContext) => {
+		description: "AI configure 自检：模块健康度 / MCP 连接 / 助理 / 看板（\`/aidoctor export\` 生成可外发的诊断报告）",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const a = String(args ?? "").trim().toLowerCase();
+			if (a === "export" || a === "report") {
+				writeDiagnose(ctx);
+				return;
+			}
 			showDoctor(ctx);
 		},
 	});

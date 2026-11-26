@@ -274,6 +274,7 @@ let allOk = true;
 
 // ---------- 套件 3：board（MCP 栏的表头 / 三态标记） ----------
 bundle("board.ts", "board.mjs");
+bundle("diagnose.ts", "diagnose.mjs");
 allOk =
 	runSuite("board：MCP 栏表头与连接标记", join(tmp, "board.mjs"), [
 			'ok("表头：没全连上时补 ●n", JSON.stringify(mcpHeaderParts(7, 2)) === JSON.stringify([" MCP 7", " ●2"]));',
@@ -751,8 +752,10 @@ allOk =
 			'newRunningBg(bg2);',
 			'writeHerdrBgTerminal(bg2, finalizeHerdrRun({ outcome: "done", text: "跑完了但忘了交卡" }));',
 			'const t2 = readBgTask(bg2);',
-			'ok("回归：没交 <result> → status=empty（绝不留在 running）", t2 && t2.status === "empty");',
-			'ok("回归：没交回执时留下排查线索（lastError）", !!t2 && /回执/.test(String(t2.lastError || "")));',
+			'ok("回归：没交 <result> 但有正文 → status=done（v2.8.1 起不再误判成失败）", t2 && t2.status === "done");',
+			'ok("回归：并在卡片挂「未按格式回执」", t2 && /未按格式回执/.test(String(t2.note || "")));',
+			'ok("回归：真没正文（空跑）→ 仍判 empty", finalizeHerdrRun({ outcome: "done", text: "   " }).status === "empty");',
+			'ok("回归：有正文无回执 → 判 done 且 note 说明", (() => { const f = finalizeHerdrRun({ outcome: "done", text: "我是答案" }); return f.status === "done" && /未按格式/.test(String(f.note || "")); })());',
 			'// ---- ③ 收尾过程中抛异常 → .bg 仍被写终态（failed）----',
 			'const bg3 = paneBgId(3);',
 			'newRunningBg(bg3);',
@@ -3380,6 +3383,30 @@ allOk =
 	}
 }
 if (!allOk) console.log(String.fromCharCode(10) + "❌ 静态检查失败");
+
+// ---------- diagnose：自检报告（脱敏 / 结构 / 能力推导）----------
+runSuite("diagnose：自检报告（脱敏 + 结构）", join(tmp, "diagnose.mjs"), [
+	'ok("脱敏：URL 里的密码", !redactSecrets("postgresql://u:123456@h/db").includes("123456"));',
+	'ok("脱敏：DATABASE_URL=…", !redactSecrets("DATABASE_URL=postgres://u:p@h/db").includes("postgres://u:p"));',
+	'ok("脱敏：TOKEN=abc", !redactSecrets("TOKEN=abc123").includes("abc123"));',
+	'ok("脱敏：--password 123456（空格分隔）", !redactSecrets("x --password 123456 --pty").includes("123456"));',
+	'ok("脱敏：参数数组值在下一项", !redactArgList(["--password", "123456"]).join(" ").includes("123456"));',
+	'ok("脱敏：--token=abc 形式", !redactArgList(["--token=abc999"]).join(" ").includes("abc999"));',
+	'ok("脱敏：正常文字不变", redactSecrets("git status --short") === "git status --short");',
+	'ok("脱敏：JSON 深打码（key 敏感）", JSON.stringify(redactDeep({ token: "abc", name: "center" })) === JSON.stringify({ token: "***", name: "center" }));',
+	'const capRead = capabilityLines({ fs: "read", paths: [], exec: "none", cmds: [], net: "none" });',
+	'ok("能力推导：fs=read → 不能改文件", capRead.cannotDo.some((x) => x.includes("改文件")));',
+	'ok("能力推导：net=none → 说明 MCP 起不来", capRead.cannotDo.some((x) => x.includes("MCP")));',
+	'const capWrite = capabilityLines({ fs: "write", paths: ["src/"], exec: "any", cmds: [], net: "allow" });',
+	'ok("能力推导：fs=write + paths → 只写指定目录", capWrite.canDo.some((x) => x.includes("src/")));',
+	'ok("能力推导：net=allow → 允许联网", capWrite.canDo.some((x) => x.includes("联网")));',
+	'const fakeFacts = { pluginVersion: "t", piVersion: "t", nodeVersion: "t", os: "t", cwd: "C:/p", agentDir: "C:/a", trusted: false, assistants: [], mcpPool: [], shadow: { count: 0 }, files: [], taskHistory: [], herdr: { ok: false }, logs: { guardTail: [], herdrTail: [], crashes: "(无)" }, notes: [] };',
+	'const rep = buildDiagnoseReport(fakeFacts);',
+	'ok("报告：有「给读报告的 AI」说明段", rep.includes("给读这份报告的 AI"));',
+	'ok("报告：11 段结构齐全", ["## 1. 结论","## 2. 环境与路径","## 3. 关键文件清单","## 4. 配置","## 5. 助理","## 6. MCP","## 7. 影子目录","## 8. 最近任务","## 9. 日志尾巴","## 11. 还需要用户提供什么"].every((x) => rep.includes(x)));',
+	'ok("报告：项目未信任会进结论", rep.includes("项目未信任"));',
+	'ok("报告：明确写了已脱敏", rep.includes("已脱敏"));',
+]);
 
 rmSync(tmp, { recursive: true, force: true });
 

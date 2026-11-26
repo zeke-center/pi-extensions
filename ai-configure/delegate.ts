@@ -1524,6 +1524,8 @@ export interface HerdrFinalizeFields {
 	finishedAt: number;
 	/** 排查线索（没交回执 / 收尾异常 / 兜底计时器） */
 	lastError?: string;
+	/** 提示类说明（不改变判定，如「未按格式回执」） */
+	note?: string;
 	/** 判定依据，只用于日志/单测 */
 	reason: string;
 }
@@ -1541,13 +1543,14 @@ export function finalizeHerdrRun(input: HerdrFinalizeInput): HerdrFinalizeFields
 	const receipt = parseReport(text);
 	const now = Number.isFinite(input.now) ? Number(input.now) : Date.now();
 	const finishedAt = now;
-	const fields = (status: BgTaskFile["status"], reason: string, lastError?: string): HerdrFinalizeFields => ({
+	const fields = (status: BgTaskFile["status"], reason: string, lastError?: string, note?: string): HerdrFinalizeFields => ({
 		status,
 		// 有正文就有卡片（没正文也给一句人话，别让 .bg 只剩 status）
 		resultText: text.trim() ? text : lastError ? `（没有正文）${lastError}` : undefined,
 		delivered: false, // 写终态这一刻一定还没投；投递成功后会再写一次 true
 		finishedAt,
 		...(lastError ? { lastError } : {}),
+		...(note ? { note } : {}),
 		reason,
 	});
 
@@ -1564,11 +1567,15 @@ export function finalizeHerdrRun(input: HerdrFinalizeInput): HerdrFinalizeFields
 			// 到轮数上限被停下：既不算失败也不算成功 —— 正文照样归档，卡片标 partial
 			return fields("partial", "turn-limit");
 		case "done":
-			// 跑完了但**没交 `<result>`**：以前会被当成 done 混过去（卡片上看起来“成功”），
-			// 现在明确标 empty —— 既不是 failed，也绝不留在 running。
-			return receipt
-				? { ...fields("done", "receipt"), resultText: text }
-				: fields("empty", "no-receipt", "pane 跑完了但没交 <result> 回执");
+			// 跑完了但**没交 `<result>``：分两种 ——
+			//   ① 有正文：人话都说清了，只是没按格式交回执 → 算 done（否则卡片显示「失败」误导人），
+			//      再挂一句 `⚠ 未按格式回执`，让我知道提示词没约束住（结论仍由 pickConclusionLine 从正文挑）
+			//   ② 真没正文：才判 empty（既不是 failed，也绝不留在 running）
+			if (receipt) return { ...fields("done", "receipt"), resultText: text };
+			if (text.trim()) {
+				return fields("done", "no-receipt-text", undefined, "⚠ 未按格式回执（正文有内容，结论取首行）");
+			}
+			return fields("empty", "no-receipt", "pane 跑完了但没交 <result> 回执，也没有任何正文");
 		case "timeout":
 			return fields("timeout", "timeout");
 		case "empty":
@@ -1598,6 +1605,7 @@ export function writeHerdrBgTerminal(bgId: string | undefined, fields: HerdrFina
 			resultText: prev.resultText ?? fields.resultText,
 			finishedAt: prev.finishedAt ?? fields.finishedAt,
 			...(fields.lastError ? { lastError: fields.lastError } : {}),
+			...(fields.note ? { note: fields.note } : {}),
 		});
 	} catch {
 		return undefined;

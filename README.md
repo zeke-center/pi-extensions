@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.8.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.9.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1326,6 +1326,33 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 2. 影子目录的 `mcp.json` 里有没有写进去 → `~/.pi/agent/shadow/<助理>-*/mcp.json`
 3. 那个 server 的 command 能不能手动跑起来（exe 路径 / 参数 / 环境变量 / 凭据）
 4. worker 那次会话开头有没有 MCP 报错 → `/resume-agent`
+
+### 自检报告（给别人用的，v2.9.0）
+
+出问题时跑：
+
+```
+/aidoctor export
+```
+
+会在**当前项目**生成 `.pi/pi-extensions-diagnose.md`（700~1800 行），把整份发给我就行。里面包含：
+
+| 段 | 内容 |
+|---|---|
+| 0 | **给读报告的 AI 的说明**（怎么读、哪些被脱敏了） |
+| 1 | 结论：❌ 严重 / ⚠ 注意，每条带修法 |
+| 2 | 环境：插件/pi/node 版本、路径、trust 状态、Herdr 可用性、影子目录数 |
+| 3 | 关键文件清单（存在性 + 大小 + 修改时间） |
+| 4 | 全局与项目配置原文（脱敏） |
+| 5 | **每个助理逐一**：来源/类型/extends/描述/工作目录/权限/MCP/模型/超时/轮数 + 「能做 / 不能做」人话 + 原始 frontmatter + 正文开头 |
+| 6 | MCP 候选池全量（含 exposure）+ **Worker 实际加载的 mcp.json** |
+| 7 | 影子目录（Worker 的 PI_CODING_AGENT_DIR）概况 |
+| 8 | 最近 20 次派活的状态/原因/耗时/错误 |
+| 9 | guard.log（200 行）+ 命中统计、herdr.log（100 行）、崩溃记录 |
+| 10 | 采集过程中读不到的东西（明确列出缺失信息） |
+| 11 | **还需要你提供什么**（现象描述、会话 ID、是否重启过…） |
+
+**脱敏**：URL 密码、`TOKEN=`、`--password xxx`、JSON 敏感键 → 全部 `***`；键名保留。发之前扫一眼路径/库名即可。
 
 ### 排障：现象 → 原因 → 怎么办
 
