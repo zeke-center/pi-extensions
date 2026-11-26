@@ -56,7 +56,38 @@ function split(s: string | undefined): string[] {
 }
 
 /** 从 frontmatter 的原始键值解析（不认识 / 写错了一律回默认，绝不让一个字段把派活搞挂） */
+/**
+ * 上次 `parsePerms` 遇到的非法枚举值（模块级记账，供面板/卡片/aidoctor 报出来）。
+ *
+ * 为什么需要：`exec: restrict`、`net: yes` 这种写错的值以前**静默回落默认**，
+ * 用户以为改好了，实际一直跑默认 —— 「改了没反应」的头号原因。
+ */
+let lastBadEnums: { key: string; value: string; allowed: string[]; used: string }[] = [];
+
+/** 读走（并清空）上一次解析到的非法值 */
+export function takeBadEnums(): { key: string; value: string; allowed: string[]; used: string }[] {
+	const out = lastBadEnums;
+	lastBadEnums = [];
+	return out;
+}
+
+/** 直接问「这些 frontmatter 值里哪些是不认识的」（纯函数，不依赖上次解析） */
+export function badEnumValues(fm: Record<string, string | undefined>): { key: string; value: string; allowed: string[]; used: string }[] {
+	const out: { key: string; value: string; allowed: string[]; used: string }[] = [];
+	const check = (key: string, allowed: readonly string[], fallback: string) => {
+		const raw = String(fm[key] ?? "").trim();
+		if (!raw) return;
+		if (allowed.includes(raw.toLowerCase())) return;
+		out.push({ key, value: raw, allowed: [...allowed], used: fallback });
+	};
+	check("fs", FS_VALUES, PERM_DEFAULTS.fs);
+	check("exec", EXEC_VALUES, PERM_DEFAULTS.exec);
+	check("net", NET_VALUES, PERM_DEFAULTS.net);
+	return out;
+}
+
 export function parsePerms(fm: Record<string, string | undefined>): WorkerPermissions {
+	lastBadEnums = badEnumValues(fm);
 	const fs = String(fm.fs ?? "").trim().toLowerCase();
 	const exec = String(fm.exec ?? "").trim().toLowerCase();
 	const net = String(fm.net ?? "").trim().toLowerCase();
@@ -105,6 +136,53 @@ export function permSummary(p: WorkerPermissions): string {
 	const netBit = p.net === "none" ? "无网" : "可联网";
 	const budgetBit = p.budget ? ` · 预算 ${p.budget}` : "";
 	return `${fsBit} · ${execBit} · ${netBit}${budgetBit}`;
+}
+
+/**
+ * 配置矛盾检测（纯函数）：**声明面和事实面打架**的地方，必须说出来。
+ *
+ * 踩过的坑：助理写了 `mcp: dbx`、`net: none` ——
+ *   - 卡片「连接 (dbx)」看起来一切正常
+ *   - 实际 MCP 是「子进程 + 走网络」，被 `net: none` 拦掉 → **一个工具都没挂上**
+ * 用户看到的"连上了"和实际"什么都没有"完全相反。
+ *
+ * `mcp` 里若含 `inherit` 也照样算「要连 MCP」（继承主会话也是要走网络的）。
+ * 返回空数组 = 没矛盾。每条都带可执行的修法。
+ */
+export function configConflicts(tpl: { mcp: string[]; perms: WorkerPermissions }): { code: string; text: string }[] {
+	const out: { code: string; text: string }[] = [];
+	const wantsMcp = (tpl.mcp ?? []).length > 0;
+	const names = (tpl.mcp ?? []).filter((n) => n.toLowerCase() !== "inherit");
+	if (wantsMcp && tpl.perms.net !== "allow") {
+		const which = names.length ? names.join(", ") : "inherit";
+		out.push({
+			code: "mcp-net",
+			text: `声明连 MCP（${which}）但 net=${tpl.perms.net}：MCP 是子进程且要联网，会被拦掉 → 一个工具都挂不上。要连就把 net 设成 allow`,
+		});
+	}
+	if (tpl.perms.fs === "write" && tpl.perms.paths.length === 0) {
+		out.push({
+			code: "write-all",
+			text: "fs=write 且可写目录留空 = 全盘可写（插件源码/~/.pi/.git 除外）。建议至少写一个目录",
+		});
+	}
+	if (tpl.perms.exec === "cmds" && tpl.perms.cmds.length === 0) {
+		out.push({
+			code: "exec-empty",
+			text: "exec=cmds 但白名单是空的 = 什么命令都不能跑。要么写命令，要么改成 none",
+		});
+	}
+	return out;
+}
+
+/** 卡片「连接」行的**事实**写法：矛盾时直接说明挂不上，而不是假装连上了 */
+export function mcpFactLine(tpl: { mcp: string[]; perms: WorkerPermissions }): string {
+	if (!(tpl.mcp ?? []).length) return "(不连 MCP)";
+	const joined = tpl.mcp.join(", ");
+	if (tpl.perms.net !== "allow") {
+		return `${joined}（⚠ 挂不上：net=${tpl.perms.net}，MCP 起不来 → 0 个工具）`;
+	}
+	return joined;
 }
 
 /** 多行详情（面板右栏用） */

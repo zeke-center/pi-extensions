@@ -76,6 +76,9 @@ import {
 	type WorkerPermissions,
 	PERM_DEFAULTS,
 	permsDeclared,
+	configConflicts,
+	mcpFactLine,
+	badEnumValues,
 } from "./permissions";
 import { guardCtx, readExtCfg } from "./shared";
 import {
@@ -189,6 +192,8 @@ interface Template {
 	env: Record<string, string>;
 	/** 能力权限（frontmatter 的 fs/paths/exec/cmds/net/budget） */
 	perms: WorkerPermissions;
+	/** frontmatter 里写错的枚举值（如 exec: restrict）—— 会被静默回落默认，必须报出来 */
+	badEnums?: { key: string; value: string; allowed: string[]; used: string }[];
 	/** 子模板自己写过权限吗（没写就继承父模板的） */
 	permsDeclared: boolean;
 	/** 系统提示词正文（extends 时 = 父正文 + 子正文） */
@@ -246,11 +251,51 @@ interface RunResult {
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_DIR = dirname(EXT_DIR);
 
+/**
+ * 这个目录在当前 pi 里「被信任」吗？读 pi 自己的 `<agentDir>/trust.json`（键是规范化后的绝对路径）。
+ *
+ * 为什么要管：项目没被信任时，pi 会忽略该项目的 `.pi` 资源（settings / mcp / extensions…）。
+ * 我们如果不看这个标记，就会**加载一份 pi 认为不可信的助理配置** —— 用户改了却不知道到底谁生效。
+ * 返回 undefined = 没有记录 / 读不到（此时按「照常加载」处理，不擅自禁）。
+ */
+export function projectTrusted(cwd: string): boolean | undefined {
+	const norm = (x: string) => x.replace(/[\\/]+/g, "\\").replace(/\\$/, "").toLowerCase();
+	let data: Record<string, unknown> = {};
+	try {
+		data = JSON.parse(readFileSync(join(getAgentDir(), "trust.json"), "utf8")) as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+	const wanted = norm(cwd);
+	for (const [key, value] of Object.entries(data)) {
+		if (norm(key) === wanted && (value === true || value === false)) return value;
+	}
+	// 没精确命中就往上一层层找（和 pi 的 findNearestTrustEntry 一个语义）
+	let dir = wanted;
+	while (true) {
+		const parent = dir.replace(/\\[^\\]+$/, "");
+		if (!parent || parent === dir) return undefined;
+		dir = parent;
+		for (const [key, value] of Object.entries(data)) {
+			if (norm(key) === dir && (value === true || value === false)) return value;
+		}
+	}
+}
+
+/** 项目级助理目录存在但被 trust 机制挡住时，这条提示要出现在 /assistants 和 /aidoctor 里 */
+export function untrustedProjectNote(cwd: string): string | undefined {
+	const proj = join(cwd, ".pi", "assistants");
+	if (!existsSync(proj)) return undefined;
+	if (projectTrusted(cwd) !== false) return undefined;
+	return `⚠ 项目未信任（pi 的 trust.json 判为 false）：项目级 ${proj} 已被忽略，实际用的是全局那份。\n   要让它生效：在主会话输入 /trust 保存信任决定，然后重启 pi。`;
+}
+
 /** 模板搜索目录：项目级优先，全局其次，最后是包自带的（pi install 装进来的） */
 function templateDirs(cwd: string): string[] {
 	const dirs: string[] = [];
 	const project = join(cwd, ".pi", "assistants");
-	if (existsSync(project)) dirs.push(project);
+	// 未信任 → 不读项目级（和 pi 对 .pi 资源的态度一致；否则会出现「改了项目级文件却不生效/或反过来」）
+	if (existsSync(project) && projectTrusted(cwd) !== false) dirs.push(project);
 	const global = join(getAgentDir(), "assistants");
 	if (existsSync(global)) dirs.push(global);
 	// 包自带：别人 pi install 装完就有一份能看的样板，同名时前面两个优先
@@ -378,6 +423,7 @@ function parseTemplate(file: string, key: string): Template | null {
 		envPassthrough: meta.env_passthrough ? splitList(meta.env_passthrough) : undefined,
 		env: meta.env ? splitEnv(meta.env) : {},
 		perms: parsePerms(meta),
+		badEnums: badEnumValues(meta),
 		permsDeclared: permsDeclared(meta),
 		body: body.trim(),
 		file,
@@ -4074,13 +4120,28 @@ function renderCard(r: RunResult): string {
 		`会话名  ${r.resumed ? "(沿用原有名字)" : r.names.display}`,
 		`会话ID  ${r.names.id}`,
 		`代理    ${name}（${r.tpl.key}${r.tpl.model ? ` · ${r.tpl.model}` : ""}）`,
+		`来源    ${sourceLine(r.tpl, tplsForSource())}${untrustedProjectNote(r.tpl.cwd) ? "　⚠ 项目级被 trust 挡住" : ""}`,
 		`目录    ${r.tpl.cwd}`,
-		`连接    ${r.tpl.mcp.length ? r.tpl.mcp.join(", ") : "(不连 MCP)"}`,
-		`权限    ${permSummary(r.tpl.perms)}`,
+		`连接    ${mcpFactLine(r.tpl)}`,
+		`权限    ${permSummary(r.tpl.perms)}${conflictSuffix(r.tpl)}${badEnumSuffix(r.tpl)}`,
 		`任务    ${oneLine(r.task, 40)}`,
 		`耗时    ${secs}s`,
 		`找回    /resume-agent 里挑${file ? `，或 pi --session "${file}"` : ""}`,
 	].join("\n");
+}
+
+/** 非法枚举值提示（写错的 exec: restrict / net: yes 之类，会被静默回落默认） */
+export function badEnumSuffix(t: { badEnums?: { key: string; value: string; allowed: string[]; used: string }[] }): string {
+	const bad = t.badEnums ?? [];
+	if (!bad.length) return "";
+	const one = bad[0];
+	return `  ⚠ ${bad.length} 处取值不认识（${one.key}: ${one.value} → 按 ${one.used} 处理）`;
+}
+
+/** 卡片上「权限」行尾的矛盾提示（有矛盾才出现，一眼能对上 /aidoctor） */
+function conflictSuffix(tpl: { mcp: string[]; perms: WorkerPermissions }): string {
+	const cs = configConflicts(tpl);
+	return cs.length ? `  ⚠ 配置矛盾 ${cs.length} 处（/aidoctor 看详情）` : "";
 }
 
 // ======================= 批次汇总卡（同一次 delegate(tasks) 只投一张）=======================
@@ -5190,9 +5251,71 @@ async function commitForm(
 		const n = Object.keys(mainSessionMcpServers(cwdIn)).length;
 		notes.push(`⚠ 已继承主会话 MCP（当前 ${n} 个）—— 派出去时权限等同主会话，可能含可写库 / SSH`);
 	}
+	// 面板值 → 真正生效的权限（和下面 updates 用同一套转换，别分叉）
+	const nextPerms: WorkerPermissions = {
+		fs: (fromLabel(FS_KEYS, FS_OPTIONS, v.fs ?? "") || PERM_DEFAULTS.fs) as WorkerPermissions["fs"],
+		paths: (v.paths ?? "").split(",").map((x) => x.trim()).filter(Boolean),
+		exec: (fromLabel(EXEC_KEYS, EXEC_OPTIONS, v.exec ?? "") || PERM_DEFAULTS.exec) as WorkerPermissions["exec"],
+		cmds: (v.cmds ?? "").split(",").map((x) => x.trim()).filter(Boolean),
+		net: (fromLabel(NET_KEYS, NET_OPTIONS, v.net ?? "") || PERM_DEFAULTS.net) as WorkerPermissions["net"],
+		budget: (v.budget ?? "").trim() || undefined,
+	};
+	// 保存即体检：矛盾组合（mcp + net:none 之类）**当场**说出来，别等派活才发现工具没挂上
+	const conflicts = configConflicts({ mcp: wantMcp.concat(mcpInherit ? ["inherit"] : []), perms: nextPerms });
+	if (conflicts.length) {
+		ctx.ui.notify(
+			`⚠ 这份配置有 ${conflicts.length} 处矛盾（已保存，但大概率不按你想的跑）：\n` +
+				conflicts.map((c, i) => `${i + 1}. ${c.text}`).join("\n"),
+			"warning",
+		);
+	}
 	if (!mcpOk) return; // 不一致已经在 verifySavedMcp 里报错了，不再报「已保存」
 	ctx.ui.notify(`已保存\n${file}\n${notes.join("\n")}\n\n改模板不用 /reload，下次派发立即生效。`, "info");
 }
+/** 卡片/详情里的「来源」：写清哪份文件在生效，以及同名那份是不是被忽略了 */
+export function sourceLine(t: { key: string; file: string }, shadowedKeys: Set<string>): string {
+	const tag = sourceTag(t);
+	const warn = shadowedKeys.has(t.key) ? "（另一级有同名文件，已被忽略）" : "";
+	return `${tag} ${t.file}${warn}`;
+}
+
+/** 卡片渲染时按当前 cwd 算一次「谁被同名盖住」（读目录，很轻） */
+function tplsForSource(): Set<string> {
+	try {
+		const cwd = process.cwd();
+		return shadowedFiles(cwd, loadTemplates(cwd));
+	} catch {
+		return new Set<string>();
+	}
+}
+
+/** 这个助理来自哪一级（项目级 / 用户级）—— 列表和卡片都要能看出来 */
+export function sourceTag(t: { file: string }, cwd?: string): string {
+	const base = join(getAgentDir(), "assistants");
+	return t.file.startsWith(base) ? "[全局]" : "[项目]";
+}
+
+/**
+ * 哪些 key 有「项目级 + 用户级同名」的情况（返回被忽略的那些 key）。
+ * 用户级的同名文件仍在，只是**不生效** —— 不标出来就会出现「改了文件却没反应」。
+ */
+export function shadowedFiles(cwd: string, tpls: { key: string; file: string }[]): Set<string> {
+	// Windows 下 join 出来的分隔符和手写路径可能不一致（"/" vs "\"），比较前统一
+	const norm = (x: string) => x.replace(/[\\/]+/g, "\\").toLowerCase();
+	const globalDir = norm(join(getAgentDir(), "assistants"));
+	const projDir = norm(projectAssistantDir(cwd));
+	const inProj = new Set<string>();
+	const inGlobal = new Set<string>();
+	for (const t of tpls) {
+		const f = norm(t.file);
+		if (f.startsWith(globalDir)) inGlobal.add(t.key);
+		else if (f.startsWith(projDir)) inProj.add(t.key);
+	}
+	const out = new Set<string>();
+	for (const k of inProj) if (inGlobal.has(k)) out.add(k);
+	return out;
+}
+
 function listAssistants(ctx: ExtensionContext, cwd: string): void {
 	const tpls = loadTemplates(cwd);
 	const dirs = templateDirs(cwd);
@@ -5204,19 +5327,25 @@ function listAssistants(ctx: ExtensionContext, cwd: string): void {
 		);
 		return;
 	}
+	const trustNote = untrustedProjectNote(cwd);
 	const usable = tpls.filter((t) => t.base !== true && t.demo !== true);
 	const bases = tpls.filter((t) => t.base === true);
 	const demos = tpls.filter((t) => t.demo === true);
+	// 同名两级都存在时：谁生效、谁被忽略，必须写出来（踩过：改了项目级那份，实际跑的是全局那份）
+	const shadowed = shadowedFiles(cwd, tpls);
 	const fmt = (t: Template): string =>
-		`• ${t.key} — ${t.name}\n` +
+		`• ${t.key} — ${t.name}　${sourceTag(t)}${shadowed.has(t.key) ? "　⚠ 全局同名被忽略" : ""}\n` +
 		`    ${t.desc}\n` +
 		`    cwd: ${t.cwd}　mcp: ${mcpLabel(t)}　timeout: ${t.timeoutMs ? `${Math.round(t.timeoutMs / 60000)}m` : "默认"}` +
 		(t.extends ? `\n    extends: ${t.extends}` : "") +
-		(t.desc === DESC_MISSING ? `　⚠ 无描述（/assistants edit ${t.key} 补一句，否则 Router 挑不到它）` : "");
+		(t.desc === DESC_MISSING ? `　⚠ 无描述（/assistants edit ${t.key} 补一句，否则 Router 挑不到它）` : "") +
+		badEnumSuffix(t) +
+		(configConflicts(t).length ? `　⚠ 配置矛盾 ${configConflicts(t).length} 处` : "");
 	const fmtBase = (t: Template): string =>
 		fmt(t) +
 		`\n    → 基于它建：/assistants new <你的名字> ${t.key}　看原文：/assistants show ${t.key}`;
 	const out = usable.length ? [`可派发的助理（${usable.length}）`, ...usable.map(fmt)] : ["可派发的助理（0）—— 现在没有能派的"];
+	if (trustNote) out.unshift(trustNote, "");
 	if (bases.length) out.push("", `基础模板 / 底座（${bases.length}，只读 + 只能 extends，不能直接派）`, ...bases.map(fmtBase));
 	if (demos.length) out.push("", `示例模板（${demos.length}，给你看字段怎么写法的，不能派）`, ...demos.map(fmt));
 	out.push(
@@ -5234,6 +5363,10 @@ function showAssistant(ctx: ExtensionContext, cwd: string, what: string): void {
 		`${tpl.name}　(${tpl.key})`,
 		`文件    ${tpl.file}`,
 		`描述    ${tpl.desc}`,
+		...(tpl.badEnums?.length
+			? ["取值    ⚠ " + tpl.badEnums.map((b) => `${b.key}: ${b.value}（不认识，合法：${b.allowed.join("/")}）→ 按 ${b.used} 处理`).join("；")]
+			: []),
+		...configConflicts(tpl).map((c) => `矛盾    ⚠ ${c.text}`),
 		`目录    ${tpl.cwd}`,
 		`MCP     ${mcpLabel(tpl)}${tpl.mcpExposure ? `　exposure: ${tpl.mcpExposure}` : ""}`,
 		`模型    ${tpl.model ?? "(继承主会话)"}`,

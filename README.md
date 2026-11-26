@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.6.9**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.7.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1294,6 +1294,38 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 | ✅ | 已完成（有回执） | — |
 
 灯只在**状态变化时**才重命名 pane（不每秒调 herdr CLI）。
+
+### 配置项之间的限制关系（v2.7.0）
+
+**每个配置只管一件事，管不到的别指望它**：
+
+| 配置 | 真正影响 | **不影响** |
+|---|---|---|
+| `mcp: <名字>` | 影子 `mcp.json` 写哪几个 server → **只启动这几个** | 与 `exec` / `net` 无关 |
+| `fs: read/write` | 拦写文件工具 | 不影响跑命令、不影响 MCP |
+| `paths` | **只在 `fs: write` 时生效** | `fs: read` 时写了没用 |
+| `exec: none/safe/any` | 拦跑命令的工具；`safe` 只放行 `cmds` | ❌ **不拦 MCP 子进程**（MCP 由 pi 拉起） |
+| `net: none/allow` | 按工具名关键词（fetch/http/web/curl/request）判定，**目前只记录不拦** | ❌ 不真断网、不拦 MCP、不拦 psql |
+| `cwd` | AGENTS.md 注入、`paths`/`${cwd}` 的基准目录 | 不决定能读哪些文件 |
+| `timeout` / `maxTurns` | 到点停 / 到限标 `partial` | 不影响 MCP |
+| `budget` | 纯显示 | 不做任何限制 |
+
+**容易写错的地方**（v2.7.0 起会在卡片 / `/assistants` 里标出来）：
+
+| 写法 | 后果 |
+|---|---|
+| `exec: restrict` / `net: yes` | **非法值** → 静默回落默认（`none`）。合法：`exec: none|safe|any`、`net: none|allow` |
+| `exec: safe` + `cmds` 空 | 等于 `none`，什么都不能跑 |
+| `fs: write` + `paths` 空 | 全盘可写（插件源码 / `~/.pi` / `.git` 仍受保护） |
+| `mcp:` 留空 | 一个 MCP 都不连（默认隔离） |
+| 项目级助理 + 项目未信任 | 项目级被忽略 → 实际用全局同名那份（会在列表/卡片里明说） |
+
+**MCP 工具没挂上时，按这个顺序查**（跟 exec/net 无关）：
+
+1. 候选池有没有这个 server 定义 → `~/.pi/agent/mcp-catalog.json`
+2. 影子目录的 `mcp.json` 里有没有写进去 → `~/.pi/agent/shadow/<助理>-*/mcp.json`
+3. 那个 server 的 command 能不能手动跑起来（exe 路径 / 参数 / 环境变量 / 凭据）
+4. worker 那次会话开头有没有 MCP 报错 → `/resume-agent`
 
 ### 排障：现象 → 原因 → 怎么办
 
