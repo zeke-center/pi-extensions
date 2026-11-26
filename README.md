@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.7.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.8.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1302,10 +1302,10 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 | 配置 | 真正影响 | **不影响** |
 |---|---|---|
 | `mcp: <名字>` | 影子 `mcp.json` 写哪几个 server → **只启动这几个** | 与 `exec` / `net` 无关 |
-| `fs: read/write` | 拦写文件工具 | 不影响跑命令、不影响 MCP |
+| `fs: read/write` | 工具面摘掉 write/edit（read 时，v2.8.0）+ 调用时硬拦 | 不影响跑命令、不影响 MCP |
 | `paths` | **只在 `fs: write` 时生效** | `fs: read` 时写了没用 |
-| `exec: none/safe/any` | 拦跑命令的工具；`safe` 只放行 `cmds` | ❌ **不拦 MCP 子进程**（MCP 由 pi 拉起） |
-| `net: none/allow` | 按工具名关键词（fetch/http/web/curl/request）判定，**目前只记录不拦** | ❌ 不真断网、不拦 MCP、不拦 psql |
+| `exec: none/safe/any` | **工具面直接摘掉** bash（none）或按 `cmds` 白名单拦（safe，v2.8.0 起 L1+L3 双层） | ❌ 不拦 MCP 子进程（MCP 由 pi 拉起） |
+| `net: none/allow` | ① 联网类工具硬拦 ② **bash 命令级**识别 psql/curl/ssh/npm install/git push 等（v2.8.0） | ❌ 不是沙箱：真要硬隔离用 `exec: safe` + `cmds` 白名单 |
 | `cwd` | AGENTS.md 注入、`paths`/`${cwd}` 的基准目录 | 不决定能读哪些文件 |
 | `timeout` / `maxTurns` | 到点停 / 到限标 `partial` | 不影响 MCP |
 | `budget` | 纯显示 | 不做任何限制 |

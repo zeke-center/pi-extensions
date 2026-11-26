@@ -306,12 +306,69 @@ function decide(perms: WorkerPermissions, opts: GuardOpts, toolName: string, arg
 		}
 	}
 
-	// ---------- 4. net：只记录 ----------
+	// ---------- 4. net：工具名 + **命令级**双判据，而且**真拦**（v2.8.0）----------
+	// 以前只看工具名含 fetch/http/web…，而且 logOnly：bash 里的 curl / psql 完全绕过，
+	// 「net: none」等于没写。现在：
+	//   a) 联网类工具（web_fetch 等）→ 硬拦
+	//   b) bash 里的联网命令 → 硬拦（curl/wget/psql/ssh/npm install/…）
+	// ⚠️ 这是**护栏**不是沙箱：真要硬隔离请用 `exec: safe` + `cmds` 白名单。
+	if (perms.net === "none") {
+		if (NET_HINTS.some((h) => name.includes(h))) {
+			return deny("net", `当前 Worker 是 net=none（不可联网），工具：${toolName}`);
+		}
+		if (isExec) {
+			const cmd = extractCommand(args) ?? "";
+			const hit = netCommandIn(cmd);
+			if (hit) {
+				return deny("net", `net=none：命令 ${hit} 要联网（${cmd.slice(0, 80)}）`);
+			}
+		}
+	}
 	if (perms.net === "none" && NET_HINTS.some((h) => name.includes(h))) {
 		return deny("net", `当前 Worker 是 net=none（不可联网），工具：${toolName}`, { logOnly: true });
 	}
 
 	return { block: false };
+}
+
+/**
+ * 命令里有没有「明显要联网」的东西（纯函数）。
+ *
+ * 为什么需要：`net: none` 以前只看工具名，`bash` 里的 psql/curl 一律放行 ——
+ * 于是"无网"的 Worker 实际能直连生产库（别人机器上真踩到了）。
+ * 这里只认**明确联网**的命令前缀，宁可漏一点点，也不误伤 `git status` 这种本地操作。
+ */
+export const NET_COMMAND_PATTERNS: RegExp[] = [
+	/(^|[\s|;&(])curl\b/i,
+	/(^|[\s|;&(])wget\b/i,
+	/(^|[\s|;&(])psql\b/i,
+	/(^|[\s|;&(])mysql\b/i,
+	/(^|[\s|;&(])redis-cli\b/i,
+	/(^|[\s|;&(])mongo(sh)?\b/i,
+	/(^|[\s|;&(])sqlcmd\b/i,
+	/(^|[\s|;&(])ssh\b/i,
+	/(^|[\s|;&(])scp\b/i,
+	/(^|[\s|;&(])sftp\b/i,
+	/(^|[\s|;&(])(nc|ncat|telnet)\b/i,
+	/(^|[\s|;&(])ftp\b/i,
+	/(^|\s)Invoke-WebRequest\b/i,
+	/(^|\s)Invoke-RestMethod\b/i,
+	/(^|\s)iwr\b/i,
+	/(^|[\s|;&(])git\s+(push|pull|fetch|clone|ls-remote)\b/i,
+	/(^|[\s|;&(])(npm|pnpm|yarn)\s+(install|i|add|publish|update)\b/i,
+	/(^|[\s|;&(])pip\s+(install|download)\b/i,
+	/(^|[\s|;&(])docker\s+pull\b/i,
+];
+
+/** 命中的联网命令（返回命令名；没有返回 undefined） */
+export function netCommandIn(cmd: string): string | undefined {
+	const c = String(cmd ?? "");
+	// 复合命令（a && b）里任意一段命中就算
+	for (const re of NET_COMMAND_PATTERNS) {
+		const m = c.match(re);
+		if (m) return (m[0] ?? "").trim().replace(/^[\s|;&(]+/, "");
+	}
+	return undefined;
 }
 
 /** 一行摘要（写 guard.log 用） */

@@ -70,6 +70,45 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// ---------- L1：按权限**摘工具**（v2.8.0）----------
+	// 以前只做 L3（调用时才拒）：模型看到 bash 就会调、被拒、再换个写法试 —— 白烧 token，
+	// 观感也差（"明明写着不执行，为什么还给我 bash"）。这里在工具注册完后直接把不该有的摘掉。
+	const applyPermTools = (): void => {
+		const api = pi as unknown as {
+			setActiveTools?: (names: string[]) => void;
+			getAllTools?: () => { name: string }[];
+			getActiveTools?: () => string[];
+		};
+		if (!api?.setActiveTools) return;
+		const all =
+			typeof api.getAllTools === "function"
+				? api.getAllTools().map((t) => t.name)
+				: ((api.getActiveTools?.() ?? []) as string[]);
+		if (all.length < 3) return; // 工具还没注册完，等下一轮
+		const drop = new Set<string>();
+		// fs=read → 不能写文件
+		if (perms.fs !== "write") for (const n of ["write", "edit", "multi_edit", "apply_patch", "notebook_edit"]) drop.add(n);
+		// exec=none → 不能跑命令（safe/any 都保留 bash，靠 L3 白名单拦）
+		if (perms.exec === "none") for (const n of ["bash", "shell", "exec", "run_command"]) drop.add(n);
+		// net=none → 去掉明显的联网工具（bash 里的联网靠 L3 的命令级拦截）
+		if (perms.net === "none") for (const n of all) if (/fetch|http_request|web_|browser|download/i.test(n)) drop.add(n);
+		const keep = all.filter((n) => !drop.has(n));
+		if (keep.length && keep.length !== all.length) {
+			try {
+				api.setActiveTools(keep);
+				logLine(`L1_MASK removed=${[...drop].filter((n) => all.includes(n)).join(",") || "(none)"}`);
+			} catch {
+				/* 摘不掉就算了，L3 还在 */
+			}
+		}
+	};
+	applyPermTools();
+	// 工具注册可能晚于扩展加载：每轮开始再确认一次（幂等）
+	pi.on("before_agent_start" as never, (() => {
+		applyPermTools();
+		return undefined;
+	}) as never);
+
 	pi.on("tool_call", async (event) => {
 		const d = decideToolCall(perms, opts, event.toolName, event.input);
 		if (!d.block) return undefined;

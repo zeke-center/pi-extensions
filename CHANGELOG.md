@@ -2,6 +2,13 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.8.0
+
+- 修复：**影子目录不带用户扩展** —— 以前影子 `extensions/` 里只有我们自己的 guard，用户装的扩展（如 `pi-mcp-adapter`）一个都没有；如果 MCP 靠扩展加载，worker 里就**一个 MCP 工具都挂不上**（卡片却写着「连接 xxx」）。现在自动继承用户级扩展（目录用 junction，排除 `ai-configure` 自身，失败只记 warning）
+- 修复：**Worker 侧按权限摘工具**（L1）—— 以前 `exec: none` 也给 bash、`fs: read` 也给 edit/write，模型看到就调、被拒不退、白烧 token。现在注册完就摘掉
+- 修复：**`net: none` 从「只记录」改成真拦，并覆盖 bash 命令级** —— 以前只按工具名匹配且 logOnly，`psql`/`curl` 直接绕过（别人机器上真出现过「无网」Worker 连上生产库）
+- 新增：`netCommandIn()` 联网命令识别（psql/mysql/ssh/scp/curl/wget/npm install/git push…）；本地命令（git status/ls/node）不误伤
+
 ## 2.7.0
 
 - 修复：**写错的枚举值以前静默回落默认** —— `exec: restrict`、`net: yes` 这种不存在的值会被悄悄换成默认（`none`），于是「改了配置没反应」。现在卡片 / `/assistants` 列表 / show 详情都会写清「取值不认识（合法：…）→ 按 X 处理」

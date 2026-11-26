@@ -20,6 +20,7 @@
  */
 import {
 	copyFileSync,
+	cpSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -485,10 +486,56 @@ export function installGuard(
 			}
 			copyFileSync(src, to);
 		}
+		inheritUserExtensions(extDir, errors);
 	} catch (e) {
 		errors.push(`守卫复制失败：${e instanceof Error ? e.message : String(e)}`);
 	}
 	return errors;
+}
+
+/** 我们自己这套插件在 extensions/ 下的名字（不能带进影子，否则递归 + 双份 Router） */
+const SELF_EXT_DIR = "ai-configure";
+
+/**
+ * 把**用户级扩展**继承进影子目录（v2.8.0）。
+ *
+ * 踩过的坑（别人的机器）：用户把内置 MCP 关了、改用 `pi-mcp-adapter` 扩展来加载 MCP。
+ * 影子目录以前**只放我们自己的 guard**、一个用户扩展都不带 —— 于是 worker 里没有适配器，
+ * `mcp: xxx` 声明得好好的，工具一个都挂不上，卡片却显示「连接 xxx」。
+ *
+ * 策略：
+ *   - 目录 → 建 **junction**（零拷贝，Windows 不需要管理员权限）；建不成退回复制
+ *   - 单文件 `.ts` → 复制（很小）
+ *   - 跳过我们自己的 `ai-configure`，跳过已存在的同名项
+ *   - **任何失败只记 warning，不抛**（少个扩展不该让整条派活挂掉）
+ */
+function inheritUserExtensions(extDir: string, errors: string[]): void {
+	let entries: string[] = [];
+	try {
+		entries = readdirSync(join(getAgentDir(), "extensions"));
+	} catch {
+		return; // 用户没有 extensions 目录：正常
+	}
+	for (const name of entries) {
+		if (name === SELF_EXT_DIR) continue;
+		const from = join(getAgentDir(), "extensions", name);
+		const to = join(extDir, name);
+		if (existsSync(to)) continue;
+		try {
+			const st = statSync(from);
+			if (st.isDirectory()) {
+				try {
+					symlinkSync(from, to, "junction"); // Windows 目录 junction，零成本
+				} catch {
+					cpSync(from, to, { recursive: true }); // 退回复制
+				}
+			} else if (st.isFile()) {
+				copyFileSync(from, to);
+			}
+		} catch (e) {
+			errors.push(`继承用户扩展失败（${name}）：${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
 }
 
 /** 助理会话根目录：刻意**不在** sessions/ 下，这样 pi 自带的 /resume 看不见助理会话 */
