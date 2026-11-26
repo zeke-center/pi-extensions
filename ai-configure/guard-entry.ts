@@ -40,6 +40,19 @@ function readJson(file: string): Record<string, unknown> | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
+	// 最外层兜底：**守卫坏了也不能让 Worker 起不来**（fail-open 的最后一道）
+	try {
+		initGuard(pi);
+	} catch (e) {
+		try {
+			appendFileSync(join(shadowRoot(), "guard.log"), `${new Date().toISOString()} GUARD_INIT_FAIL ${e instanceof Error ? e.message : String(e)}\n`, "utf8");
+		} catch {
+			/* 连日志都写不了就只能放弃 */
+		}
+	}
+}
+
+export function initGuard(pi: ExtensionAPI): void {
 	const root = shadowRoot();
 	const cfg = readJson(join(root, "guard-config.json"));
 	const perms = readJson(join(root, "permissions.json")) as Perms | undefined;
@@ -102,10 +115,29 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 	};
-	applyPermTools();
-	// 工具注册可能晚于扩展加载：每轮开始再确认一次（幂等）
+	/**
+	 * ⚠️ **绝对不能在工厂函数里直接调 `setActiveTools`**：
+	 * pi 的"动作类"API 在扩展**加载期**会抛
+	 * `Extension runtime not initialized. Action methods cannot be called during extension loading.`
+	 * —— 扩展加载一失败，整个 Worker 进程就起不来（v2.8.0 真踩过，别人的机器全崩）。
+	 * 所以只在**事件回调**里调（那时运行时已就绪），并且整段包 try/catch：
+	 * 守卫自己出问题也绝不能把 worker 弄死（fail-open）。
+	 */
+	const safeApplyPermTools = (): void => {
+		try {
+			applyPermTools();
+		} catch (e) {
+			logLine(`L1_MASK_FAIL ${e instanceof Error ? e.message : String(e)}`);
+		}
+	};
+	// 每轮开始前重放（幂等）：工具注册晚于扩展加载，这里是最稳的时机
 	pi.on("before_agent_start" as never, (() => {
-		applyPermTools();
+		safeApplyPermTools();
+		return undefined;
+	}) as never);
+	// 会话开始也补一次（不同版本的 pi 触发顺序不一样）
+	pi.on("session_start" as never, (() => {
+		safeApplyPermTools();
 		return undefined;
 	}) as never);
 

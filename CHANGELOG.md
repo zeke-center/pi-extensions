@@ -2,6 +2,13 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.9.1
+
+- 修复：**v2.8.0 让所有子助理起不来** —— `guard-entry.ts` 在**扩展加载期**就调了 `pi.setActiveTools()`，pi 抛
+  `Extension runtime not initialized. Action methods cannot be called during extension loading.`，守卫扩展加载失败 → Worker 进程直接死
+  - 现在：动作只在事件回调里调（`before_agent_start` / `session_start`），并且**工厂层 try/catch 兜底**（守卫自己坏了也绝不弄死 Worker，fail-open）
+- 新增：7 条回归断言（模拟「加载期调动作就抛」的 pi，验证不抛、加载期不调、事件里才摘工具、内部异常不外抛）；并修了单测框架一个漏报（独立套件没计入 allOk）
+
 ## 2.9.0
 
 - 新增：**`/aidoctor export` 生成可外发的自检报告** —— 写到项目里 `.pi/pi-extensions-diagnose.md`，**专门给"读报告的 AI"看**：11 个段落（结论 / 环境 / 关键文件 / 配置 / 每个助理的原文+能干什么 / MCP 候选池与影子注入 / 影子目录 / 最近任务 / 日志尾巴 / 采集缺失项 / 还需要用户提供什么），约 700~1800 行

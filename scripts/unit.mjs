@@ -9,7 +9,7 @@
  * 用法：node scripts/unit.mjs
  */
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -275,6 +275,35 @@ let allOk = true;
 // ---------- 套件 3：board（MCP 栏的表头 / 三态标记） ----------
 bundle("board.ts", "board.mjs");
 bundle("diagnose.ts", "diagnose.mjs");
+// guard-entry 在**影子里的布局**是 extensions/guard-entry.ts + extensions/guard/perm-guard.ts，
+// 仓库里 perm-guard.ts 是平铺的 —— 所以先按影子布局复制一份再打包。
+{
+	const stage = join(tmp, "shadowstage", "extensions");
+	mkdirSync(join(stage, "guard"), { recursive: true });
+	copyFileSync(join(ext, "guard-entry.ts"), join(stage, "guard-entry.ts"));
+	copyFileSync(join(ext, "perm-guard.ts"), join(stage, "guard", "perm-guard.ts"));
+	const args = [
+		...esbuild.pre,
+		join(stage, "guard-entry.ts"),
+		"--bundle",
+		"--format=esm",
+		"--platform=node",
+		"--external:node:*",
+		`--alias:@earendil-works/pi-coding-agent=${join(stubs, "pi-coding-agent.ts")}`,
+		`--alias:@earendil-works/pi-tui=${join(stubs, "pi-tui.ts")}`,
+		`--alias:typebox=${join(stubs, "typebox.ts")}`,
+		`--outfile=${join(tmp, "guard-entry.mjs")}`,
+		"--log-level=error",
+	];
+	try {
+		execFileSync(esbuild.cmd, args, { cwd: root, encoding: "utf8", shell: esbuild.shell === true });
+	} catch (e) {
+		console.error("❌ esbuild 打包失败：guard-entry（影子布局）");
+		if (e.stdout) console.error(String(e.stdout));
+		if (e.stderr) console.error(String(e.stderr));
+		process.exit(3);
+	}
+}
 allOk =
 	runSuite("board：MCP 栏表头与连接标记", join(tmp, "board.mjs"), [
 			'ok("表头：没全连上时补 ●n", JSON.stringify(mcpHeaderParts(7, 2)) === JSON.stringify([" MCP 7", " ●2"]));',
@@ -3385,7 +3414,8 @@ allOk =
 if (!allOk) console.log(String.fromCharCode(10) + "❌ 静态检查失败");
 
 // ---------- diagnose：自检报告（脱敏 / 结构 / 能力推导）----------
-runSuite("diagnose：自检报告（脱敏 + 结构）", join(tmp, "diagnose.mjs"), [
+allOk =
+	runSuite("diagnose：自检报告（脱敏 + 结构）", join(tmp, "diagnose.mjs"), [
 	'ok("脱敏：URL 里的密码", !redactSecrets("postgresql://u:123456@h/db").includes("123456"));',
 	'ok("脱敏：DATABASE_URL=…", !redactSecrets("DATABASE_URL=postgres://u:p@h/db").includes("postgres://u:p"));',
 	'ok("脱敏：TOKEN=abc", !redactSecrets("TOKEN=abc123").includes("abc123"));',
@@ -3406,7 +3436,47 @@ runSuite("diagnose：自检报告（脱敏 + 结构）", join(tmp, "diagnose.mjs
 	'ok("报告：11 段结构齐全", ["## 1. 结论","## 2. 环境与路径","## 3. 关键文件清单","## 4. 配置","## 5. 助理","## 6. MCP","## 7. 影子目录","## 8. 最近任务","## 9. 日志尾巴","## 11. 还需要用户提供什么"].every((x) => rep.includes(x)));',
 	'ok("报告：项目未信任会进结论", rep.includes("项目未信任"));',
 	'ok("报告：明确写了已脱敏", rep.includes("已脱敏"));',
-]);
+]) && allOk;
+
+
+// ---------- guard-entry：加载期禁调动作（v2.9.1 回归）----------
+// guard-entry 套件要一个影子目录（含 guard-config.json + permissions.json）
+const guardShadow = join(tmp, "guard-shadow");
+mkdirSync(guardShadow, { recursive: true });
+writeFileSync(join(guardShadow, "guard-config.json"), JSON.stringify({ cwd: tmp, pluginDir: "", protectedPaths: [] }), "utf8");
+writeFileSync(join(guardShadow, "permissions.json"), JSON.stringify({ fs: "read", paths: [], exec: "none", cmds: [], net: "none" }), "utf8");
+
+allOk =
+	runSuite("guard-entry：加载期不许调动作 / 事件里才摘工具", join(tmp, "guard-entry.mjs"), [
+	'const root = process.env.PI_CODING_AGENT_DIR;',
+	'let phase = "loading";',
+	'const calls = [];',
+	'const handlers = {};',
+	'const fakePi = {',
+	'  on: (ev, fn) => { handlers[ev] = fn; },',
+	'  getAllTools: () => [{ name: "read" }, { name: "bash" }, { name: "write" }, { name: "edit" }, { name: "grep" }],',
+	'  getActiveTools: () => ["read", "bash", "write", "edit", "grep"],',
+	'  setActiveTools: (names) => {',
+	'    if (phase === "loading") throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");',
+	'    calls.push(names);',
+	'  },',
+	'};',
+	'let threw = null;',
+	'try { initGuard(fakePi); } catch (e) { threw = e; }',
+	'ok("加载期调用不抛（" + (threw ? threw.message : "ok") + "）", threw === null);',
+	'ok("加载期没有调 setActiveTools", calls.length === 0);',
+	'ok("注册了 before_agent_start", typeof handlers["before_agent_start"] === "function");',
+	'phase = "ready";',
+	'try { handlers["before_agent_start"] && handlers["before_agent_start"](); } catch (e) { threw = e; }',
+	'ok("事件里调用不抛（" + (threw ? threw.message : "ok") + "）", threw === null);',
+	'ok("事件里摘掉了 write/edit（fs=read）", calls.length > 0 && !calls[calls.length - 1].includes("write") && !calls[calls.length - 1].includes("edit"));',
+	'ok("事件里摘掉了 bash（exec=none）", calls.length > 0 && !calls[calls.length - 1].includes("bash"));',
+	'ok("保留 read", calls.length > 0 && calls[calls.length - 1].includes("read"));',
+	'const brokenPi = { on: () => {}, getAllTools: () => [{ name: "a" }, { name: "b" }, { name: "c" }], setActiveTools: () => { throw new Error("boom"); } };',
+	'threw = null;',
+	'try { initGuard(brokenPi); } catch (e) { threw = e; }',
+	'ok("工厂层兜底：内部异常不外抛", threw === null);',
+], { PI_CODING_AGENT_DIR: join(tmp, "guard-shadow") }) && allOk;
 
 rmSync(tmp, { recursive: true, force: true });
 
