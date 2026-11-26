@@ -2,6 +2,14 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.10.2
+
+自测（真机派活 + 读日志）发现的两处**日志自身**的问题：
+
+- 修复：`worker.result` 在**分屏模式**下 `finalAllLen` 恒为 0 —— pane 路径的正文是从 pane 整体读的（不走 rpc 事件流），`sink.finalAll` 是空的 → 日志里 `hasResultInAll:false` / `dropped:0` 会误导人（看着像"回执丢了"）。现在 `finalAll` 兜底成 `final`，两种模式下字段语义一致
+- 修复：`worker.end` 在分屏模式记 `tools: 0` —— pane 路径不统计工具时序，0 会让人以为「它没干活」。改成 0 时不记该字段
+- 降噪：`herdr.fail` 对**收尾清理类**命令（`tab close` / `pane close` / `pane rename`）的 `not_found` 不再记 warn —— herdr 自己也会关 tab，我们再关一次必然 not found，这是正常现象，之前每次都刷一条 warn
+
 ## 2.10.1
 
 **修 4 个真机 bug（用户 20 次派发全中的那批）**

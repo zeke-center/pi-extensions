@@ -540,7 +540,7 @@ export function markEnd(
 				assistant: job.key,
 				status: outcome,
 				ms: job.startedAt ? now - job.startedAt : undefined,
-				tools: job.tools.length,
+				tools: job.tools.length || undefined, // pane 模式不统计工具时序，0 会误导成「没干活」
 				note: note,
 				pane: job.paneId,
 				tab: job.tabId,

@@ -1051,7 +1051,9 @@ interface Sink {
 /** 解析回执 + 顺手记一条「结论长什么样」的埋点（诊断「无回执/正文变短」靠它） */
 function reportOfSink(sink: { final: string; finalAll?: string }): ReturnType<typeof parseReport> {
 	const final = String(sink.final ?? "").trim();
-	const all = String(sink.finalAll ?? "").trim();
+	// pane 模式下正文是从 pane 整体读的（不走 rpc 事件流）→ finalAll 会是空，
+	// 这里兜底成 final，否则日志里 finalAllLen=0 / hasResultInAll=false 会误导人。
+	const all = String(sink.finalAll ?? "").trim() || final;
 	const picked = pickResultText(sink);
 	const rep = parseReport(picked);
 	// ⚠️ 这条是「卡片说无回执、正文只剩一千字」那类问题的**决定性证据**：

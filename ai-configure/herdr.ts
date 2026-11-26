@@ -1,4 +1,4 @@
-﻿/**
+/**
  * herdr.ts —— Herdr 分屏的**薄封装**（Super Agent 的 split / tab UI 模式用）。
  *
  * 为什么要单独一层：
@@ -58,8 +58,11 @@ function run(args: string[]): string | undefined {
 		const ms = Date.now() - t0;
 		const err = e as { code?: string; status?: number | null; signal?: string; killed?: boolean; message?: string };
 		// 非 0 退出 / 超时 / 找不到 herdr —— 一律当失败（**绝不抛**），但要说清是哪种
+		// 收尾清理（关 tab / 关 pane / 改名）遇到 not_found 是**正常**的：
+		// herdr 自己也会关 tab，我们再关一次必然报 not found —— 别把它记成 warn 污染日志。
+		const cleanup = /^(tab close|pane close|pane rename|tab rename)$/.test(sub) && /not_found|not found/i.test(String(err?.message ?? e));
 		logEvent(
-			"herdr.fail",
+			cleanup ? "herdr.cleanup.skip" : "herdr.fail",
 			{
 				cmd: sub,
 				args: args.slice(2, 6),
@@ -70,7 +73,7 @@ function run(args: string[]): string | undefined {
 				killed: err?.killed === true,
 				err: String(err?.message ?? e).slice(0, 200),
 			},
-			"warn",
+			cleanup ? "info" : "warn",
 		);
 		return undefined;
 	}
