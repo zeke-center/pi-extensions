@@ -13,10 +13,10 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { platform, release } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { badEnumValues, configConflicts, permSummary, type WorkerPermissions } from "./permissions";
-import { loadTemplates, projectTrusted, shadowedFiles } from "./delegate";
+import { loadTemplates, projectTrusted, shadowDetail } from "./delegate";
 import { loadMcpPool } from "./mcp-pool";
 import { herdrStatus } from "./herdr";
 
@@ -46,6 +46,8 @@ export interface DiagnoseAssistant {
 	file: string;
 	/** 有没有被另一级的同名文件盖住 */
 	shadowed: boolean;
+	/** 同名但被盖住的那些文件（项目 > 全局 > 包自带；只有第一个生效） */
+	ignoredFiles: string[];
 	extends?: string;
 	base: boolean;
 	demo: boolean;
@@ -78,6 +80,8 @@ export interface DiagnoseFacts {
 	agentDir: string;
 	trusted?: boolean;
 	globalConfig?: Record<string, unknown>;
+	/** pi 自己的 settings.json（脱敏）—— 压缩阈值 / 扩展开关都在这，排障常要看 */
+	piSettings?: Record<string, unknown>;
 	projectConfig?: Record<string, unknown>;
 	assistants: DiagnoseAssistant[];
 	/** 候选池全量（含定义，env 值脱敏、key 保留） */
@@ -138,13 +142,26 @@ export function redactArgList(args: string[]): string[] {
 }
 
 /** JSON 递归打码（键名敏感 → 整个值变 ***） */
+/**
+ * 这个**键名**是不是敏感（值要打码）。
+ *
+ * ⚠️ 别只认 `apikey`/`api_key`：v2.9.1 的报告里 `telemetryKey` 就是明文漏出去的
+ *    （用户机器上实拍）。凡是 key/token/secret/passw/auth/dsn/credential 沾边的一律打码，
+ *    宁可多打（键名还在，读的人仍知道「配了哪一项」）。
+ */
+export function isSensitiveKey(k: string): boolean {
+	return /(^|[_\-. ])(key|keys|token|secret|passw(or)?d|auth|auth(orization)?|credential|credentials|dsn|database_url|conn(ection)?_?str(ing)?)$|key$|token$|secret$|passwd|password|apikey|api_key|private|signature|salt|hash/i.test(
+		k,
+	);
+}
+
 export function redactDeep(v: unknown): unknown {
 	if (typeof v === "string") return redactSecrets(v);
 	if (Array.isArray(v)) return v.map(redactDeep);
 	if (v && typeof v === "object") {
 		const out: Record<string, unknown> = {};
 		for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-			out[k] = /token|secret|password|passwd|apikey|api_key|database_url|dsn|auth/i.test(k) ? "***" : redactDeep(val);
+			out[k] = isSensitiveKey(k) ? "***" : redactDeep(val);
 		}
 		return out;
 	}
@@ -279,6 +296,9 @@ export function buildDiagnoseReport(f: DiagnoseFacts): string {
 	// ---------- 4. 配置 ----------
 	L.push("## 4. 配置（已脱敏）", "", "全局 `<agentDir>/ai-extensions.json`：", "");
 	L.push(...md.code("json", JSON.stringify(redactDeep(f.globalConfig ?? {}), null, 2)), "");
+
+	L.push("<agentDir>/settings.json" + "（pi 自己的全局设置，脱敏）：", "");
+	L.push(...md.code("json", JSON.stringify(redactDeep(f.piSettings ?? {}), null, 2)), "");
 	L.push("项目 `<cwd>/.pi/ai-extensions.json`（无则空对象）：", "");
 	L.push(...md.code("json", JSON.stringify(redactDeep(f.projectConfig ?? {}), null, 2)), "");
 	L.push("> 注意：项目级会**覆盖**全局同名项（`superagent.enabled` 等）；所以「全局关了但项目里开着」是正常现象。", "");
@@ -289,7 +309,7 @@ export function buildDiagnoseReport(f: DiagnoseFacts): string {
 	for (const a of f.assistants) {
 		L.push(`### 5.${f.assistants.indexOf(a) + 1} \`${a.key}\` — ${a.name}`, "");
 		L.push(...md.code("", [
-			`来源        ${a.source}${a.shadowed ? "（另一级有同名文件，已被盖住）" : ""}`,
+			`来源        ${a.source}${a.shadowed ? "　⚠ 同名文件有 " + a.ignoredFiles.length + " 份被盖住（见下）" : ""}`,
 			`文件        ${a.file}`,
 			`类型        ${a.base ? "底座（base，只读，只能被 extends）" : a.demo ? "示例（demo，不能派）" : "可派发"}`,
 			`extends     ${a.extends ?? "(无)"}`,
@@ -302,6 +322,11 @@ export function buildDiagnoseReport(f: DiagnoseFacts): string {
 			`轮数上限    ${a.maxTurns ?? "(用全局配置)"}`,
 		]), "");
 		L.push("**它能做 / 不能做（由权限推导）**：", "", "能做：", ...md.bullets(a.canDo), "", "不能做：", ...md.bullets(a.cannotDo), "");
+		if (a.ignoredFiles.length) {
+			L.push("**被盖住的同名文件**（这些**没有生效**，改它们没用）：", "");
+			for (const f of a.ignoredFiles) L.push("- " + "`" + f + "`");
+			L.push("");
+		}
 		if (a.badEnums.length || a.conflicts.length) {
 			L.push("**配置问题**：", "");
 			for (const b of a.badEnums) L.push(`- ⚠ \`${b.key}: ${b.value}\` 不认识（合法 ${b.allowed.join(" / ")}）→ 实际按 \`${b.used}\` 运行`);
@@ -454,6 +479,29 @@ export function capabilityLines(p: WorkerPermissions): { canDo: string[]; cannot
 	return { canDo: can, cannotDo: cannot };
 }
 
+/**
+ * pi 版本兜底：`ctx.getVersion()` 很多版本根本没有（报告里会变成「(未知)」，
+ * 那整份报告的可比性就没了）。这里直接读 pi 包的 `package.json`，再退到 `npm ls` 之外的常见位置。
+ */
+export function detectPiVersion(): string {
+	const cands = [
+		join(dirname(process.execPath), "..", "lib", "node_modules", "@earendil-works", "pi-coding-agent", "package.json"),
+		join(process.env.APPDATA ?? "", "npm", "node_modules", "@earendil-works", "pi-coding-agent", "package.json"),
+		join(process.env.HOME ?? process.env.USERPROFILE ?? "", ".npm-global", "lib", "node_modules", "@earendil-works", "pi-coding-agent", "package.json"),
+		"/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
+		"/usr/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
+	];
+	for (const p of cands) {
+		try {
+			const j = JSON.parse(readFileSync(p, "utf8")) as { version?: string };
+			if (j.version) return j.version;
+		} catch {
+			/* 下一个 */
+		}
+	}
+	return "(未知)";
+}
+
 export function collectDiagnoseFacts(cwd: string, pluginVersion: string, piVersion = "(未知)"): DiagnoseFacts {
 	const notes: string[] = [];
 	const agentDir = getAgentDir();
@@ -472,9 +520,9 @@ export function collectDiagnoseFacts(cwd: string, pluginVersion: string, piVersi
 	} catch (e) {
 		notes.push(`读助理模板失败：${e instanceof Error ? e.message : String(e)}`);
 	}
-	let shadowed = new Set<string>();
+	let shadowMap = new Map<string, string[]>();
 	try {
-		shadowed = shadowedFiles(cwd, tpls);
+		shadowMap = shadowDetail(cwd, tpls);
 	} catch {
 		/* 忽略 */
 	}
@@ -508,7 +556,8 @@ export function collectDiagnoseFacts(cwd: string, pluginVersion: string, piVersi
 			name: t.name,
 			source: sourceOf(t.file),
 			file: t.file,
-			shadowed: shadowed.has(t.key),
+			shadowed: shadowMap.has(t.key),
+			ignoredFiles: shadowMap.get(t.key) ?? [],
 			extends: t.extends,
 			base: t.base === true,
 			demo: t.demo === true,
@@ -680,13 +729,14 @@ export function collectDiagnoseFacts(cwd: string, pluginVersion: string, piVersi
 
 	return {
 		pluginVersion,
-		piVersion,
+		piVersion: piVersion && piVersion !== "(未知)" ? piVersion : detectPiVersion(),
 		nodeVersion: process.version,
 		os: `${platform()} ${release()}`,
 		cwd,
 		agentDir,
 		trusted: projectTrusted(cwd),
 		globalConfig: readJson(join(agentDir, "ai-extensions.json")),
+	piSettings: readJson(join(agentDir, "settings.json")),
 		projectConfig: readJson(join(cwd, ".pi", "ai-extensions.json")),
 		assistants,
 		mcpPool,
@@ -726,5 +776,3 @@ export function diagnoseSummaryLine(f: DiagnoseFacts): string {
 	if (!block && !warn) return "✅ 自检通过：没发现问题";
 	return `❌ ${block} 个严重 / ⚠ ${warn} 个注意`;
 }
-
-void basename;

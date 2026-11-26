@@ -2,6 +2,16 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.9.2
+
+- 修复：**自检报告的脱敏漏了 `*Key`** —— 用户机器上 `telemetryKey` 明文出现在报告里（`accessKeyId`/`secretKey`/`credential` 同类）。
+  现在按「键名沾 key/token/secret/passw/auth/dsn/credential 就打码」，`telemetryInstallId` 这类不误伤
+- 修复：**报告里 `pi 版本` 一直是「(未知)」** —— 不再依赖 `ctx.getVersion()`（很多版本没有），改为直接读 pi 包的 `package.json`（实测探测到 1.5.2）
+- 修复：**「同名文件被盖住」只比了项目 vs 全局** —— 用户机器上真正的问题是「全局一份旧的 `role-ops.md` 盖住包自带的新版」，报告一字未提 → 现在三级（项目 > 全局 > 包自带）全比，并列出**被盖住的具体文件**、明说「改它们没用」
+- 新增：报告第 4 段补上 **pi 自己的 `settings.json`**（脱敏）—— 压缩阈值 / 扩展开关都在里面，排障常要
+- 修复：`deliverBgTask` 里 2 处直接读缓存 `ctx.isIdle()` 改走 `guardCtx`（会话替换后会抛 `ctx is stale`，回投自证那一瞬间正好跨 `await`）
+- 修复：单测把 5 条 `netCommandIn` 断言放错了 bundle（在 delegate 套件里，`netCommandIn` 根本没定义）→ 每次运行都静默中断，**67 条断言其实从没跑过**；移到 perm-guard 套件后全绿（PASS 1003 → 1073）
+
 ## 2.9.1
 
 - 修复：**v2.8.0 让所有子助理起不来** —— `guard-entry.ts` 在**扩展加载期**就调了 `pi.setActiveTools()`，pi 抛

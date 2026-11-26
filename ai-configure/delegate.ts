@@ -5307,6 +5307,42 @@ export function sourceTag(t: { file: string }, cwd?: string): string {
  * 哪些 key 有「项目级 + 用户级同名」的情况（返回被忽略的那些 key）。
  * 用户级的同名文件仍在，只是**不生效** —— 不标出来就会出现「改了文件却没反应」。
  */
+/**
+ * 同名文件「哪几个被盖住了」。三级来源（项目 > 全局 > 包自带），key 相同的只有第一个生效。
+ * 返回 Map<key, 被忽略的文件绝对路径[]>。
+ *
+ * ⚠️ v2.9.1 报告里只比了「项目 vs 全局」，用户的机器上其实还有更常见的一种：
+ *    **全局一份旧的 `role-ops.md` 盖住了包自带的新版** → 结果 `db`/`server` 的 cwd 跑到别的项目去了，
+ *    而报告里一点提示都没有。所以三级都要比，并且要说清「被盖住的是哪个文件」。
+ */
+export function shadowDetail(cwd: string, tpls: { key: string; file: string }[]): Map<string, string[]> {
+	const norm = (x: string) => x.replace(/[\\/]+/g, "\\").toLowerCase();
+	// 目录优先级：项目 > 全局 > 包自带
+	const dirs = [
+		{ rank: 0, dir: norm(join(cwd, ".pi", "assistants")) },
+		{ rank: 1, dir: norm(join(getAgentDir(), "assistants")) },
+		{ rank: 2, dir: norm(join(PACKAGE_DIR, "assistants")) },
+	];
+	const rankOf = (file: string): number => {
+		const f = norm(file);
+		for (const d of dirs) if (f.startsWith(d.dir)) return d.rank;
+		return 9;
+	};
+	const byKey = new Map<string, { rank: number; file: string }[]>();
+	for (const t of tpls) {
+		const arr = byKey.get(t.key) ?? [];
+		arr.push({ rank: rankOf(t.file), file: t.file });
+		byKey.set(t.key, arr);
+	}
+	const out = new Map<string, string[]>();
+	for (const [k, arr] of byKey) {
+		if (arr.length < 2) continue;
+		arr.sort((a, b) => a.rank - b.rank);
+		out.set(k, arr.slice(1).map((x) => x.file));
+	}
+	return out;
+}
+
 export function shadowedFiles(cwd: string, tpls: { key: string; file: string }[]): Set<string> {
 	// Windows 下 join 出来的分隔符和手写路径可能不一致（"/" vs "\"），比较前统一
 	const norm = (x: string) => x.replace(/[\\/]+/g, "\\").toLowerCase();
@@ -6262,8 +6298,13 @@ async function deliverBgTask(t: BgTaskFile): Promise<void> {
 	if (isExtDisabled()) throw new Error("扩展已停用，不投递");
 	// ⚠️ 只在主会话**空闲**时投：streaming 时 sendUserMessage 只是「入队」
 	//    （用户在 interactive 里按 Esc 中止时 pi 会 clearQueue() 把队列交还给编辑器）
-	if (bgCtx && !bgCtx.isIdle()) {
-		throw new Error("主会话正在跑，等它空闲再投（不排队，避免被 clearQueue 吞掉）");
+	// ⚠️ bgCtx 是缓存的主会话 ctx，会话一替换就「一碰就抛」（stale）→ 必须走 guardCtx
+	if (bgCtx) {
+		const g0 = guardCtx(bgCtx, (c) => c.isIdle() === true);
+		if (g0.stale) bgCtx = undefined;
+		else if (g0.ok && g0.value === false) {
+			throw new Error("主会话正在跑，等它空闲再投（不排队，避免被 clearQueue 吞掉）");
+		}
 	}
 	const text = bgDeliveryText(t);
 	// 同步抛（assertActive / 旧版不认 deliverAs 的 TypeError）算失败；异步吞掉的靠下面自证
@@ -6280,7 +6321,12 @@ async function deliverBgTask(t: BgTaskFile): Promise<void> {
 	// 而且我们会把「发失败」当成功记 delivered:true）。
 	if (sent && typeof (sent as Promise<unknown>).then === "function") await (sent as Promise<unknown>);
 	await sleepRef(DELIVER_PROOF_MS);
-	const started = bgCtx ? !bgCtx.isIdle() : true; // 拿不到 ctx 时无法自证，按成功处理
+	let started = true; // 拿不到 ctx 时无法自证，按成功处理
+	if (bgCtx) {
+		const g1 = guardCtx(bgCtx, (c) => c.isIdle() === true);
+		if (g1.stale) bgCtx = undefined;
+		else if (g1.ok) started = g1.value === false;
+	}
 	if (!started) throw new Error(`${DELIVER_NOT_EFFECTIVE}（agent 仍空闲）——可能是流式竞态，稍后重试`);
 }
 

@@ -1,6 +1,6 @@
 # pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.9.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.9.2**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1343,8 +1343,8 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 | 1 | 结论：❌ 严重 / ⚠ 注意，每条带修法 |
 | 2 | 环境：插件/pi/node 版本、路径、trust 状态、Herdr 可用性、影子目录数 |
 | 3 | 关键文件清单（存在性 + 大小 + 修改时间） |
-| 4 | 全局与项目配置原文（脱敏） |
-| 5 | **每个助理逐一**：来源/类型/extends/描述/工作目录/权限/MCP/模型/超时/轮数 + 「能做 / 不能做」人话 + 原始 frontmatter + 正文开头 |
+| 4 | 全局/项目/pi 自身 `settings.json` 配置原文（脱敏） |
+| 5 | **每个助理逐一**（含「被同名的哪份盖住」）：来源/类型/extends/描述/工作目录/权限/MCP/模型/超时/轮数 + 「能做 / 不能做」人话 + 原始 frontmatter + 正文开头 |
 | 6 | MCP 候选池全量（含 exposure）+ **Worker 实际加载的 mcp.json** |
 | 7 | 影子目录（Worker 的 PI_CODING_AGENT_DIR）概况 |
 | 8 | 最近 20 次派活的状态/原因/耗时/错误 |
