@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { logEvent } from "./log";
 
 /** 允许的子命令 */
 const ALLOWED_SUB = ["status", "diff", "log", "show"] as const;
@@ -30,10 +31,11 @@ type Sub = (typeof ALLOWED_SUB)[number];
 
 /** 允许的 flag（按子命令分开；不在表里的一律拒） */
 const ALLOWED_FLAGS: Record<Sub, string[]> = {
-	status: ["--short", "--porcelain", "--branch", "-s", "-b"],
-	diff: ["--stat", "--name-only", "--name-status", "--cached", "--staged", "-U0", "-U1", "-U3"],
-	log: ["--oneline", "--stat", "--name-only", "-n", "--graph", "--decorate", "--all"],
-	show: ["--stat", "--name-only", "--oneline"],
+	status: ["--short", "--porcelain", "--branch", "-s", "-b", "--"],
+	// -U 的位数不用枚举（写死 -U0/-U1/-U3 时用户传 -U2 就被拒了，纯属自找麻烦）
+	diff: ["--stat", "--name-only", "--name-status", "--cached", "--staged", "--"],
+	log: ["--oneline", "--stat", "--name-only", "-n", "--graph", "--decorate", "--all", "--"],
+	show: ["--stat", "--name-only", "--oneline", "-U"],
 };
 
 const MAX_OUT = 20_000;
@@ -46,7 +48,7 @@ const GitReadParams = Type.Object({
 	args: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"额外参数。flag 只允许 --short/--stat/--name-only/--oneline/-n/-U3 这类查看用参数；也可以是文件路径或 commit hash",
+				"额外参数。flag 只允许 --short/--stat/--name-only/--oneline/-n/-U<n>（任意位数）/-- 这类查看用参数；也可以是文件路径或 commit hash",
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "在哪个仓库执行（默认当前会话目录）" })),
@@ -112,6 +114,7 @@ export function setupGitRead(api: ExtensionAPI): void {
 		): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
 			const sub = params.sub;
 			if (!ALLOWED_SUB.includes(sub)) {
+				logEvent("tool.reject", { tool: "git_read", why: "bad-sub", arg: String(sub) }, "warn");
 				return { content: [{ type: "text", text: refuse(`不支持子命令「${String(sub)}」`) }], isError: true };
 			}
 			const allowed = ALLOWED_FLAGS[sub];
@@ -120,15 +123,22 @@ export function setupGitRead(api: ExtensionAPI): void {
 				const a = String(raw ?? "").trim();
 				if (!a) continue;
 				if (a.startsWith("-")) {
+					// `-U0` / `-U1` / `-U2` / `-U99`：上下文行数是查看用参数，位数不该枚举
+					if (/^-U\d+$/.test(a)) {
+						extra.push(a);
+						continue;
+					}
 					// flag：只认表里的（`-n 5` 这种带值的，值不是 flag 会走下面的分支）
 					const base = a.split("=")[0] ?? a;
 					if (!allowed.some((f) => base === f || base.startsWith(`${f}=`) || base === f.replace(/^-+/, "-"))) {
+						logEvent("tool.reject", { tool: "git_read", why: "not-allowed-flag", arg: a, sub }, "warn");
 						return { content: [{ type: "text", text: refuse(`参数「${a}」不在只读白名单里`) }], isError: true };
 					}
 					extra.push(a);
 				} else {
 					// 非 flag：路径或 commit hash（不允许出现 shell 元字符）
 					if (/[;&|<>`$(){}[\]!*?\n\r]/.test(a)) {
+						logEvent("tool.reject", { tool: "git_read", why: "suspicious-arg", arg: a, sub }, "warn");
 						return { content: [{ type: "text", text: refuse(`参数「${a}」含可疑字符`) }], isError: true };
 					}
 					extra.push(a);

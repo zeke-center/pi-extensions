@@ -21,10 +21,12 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Type } from "typebox";
 import { loadTemplates, runningBgCount, undeliveredBgCount } from "./delegate";
+import { liveJobs as liveJobList } from "./live";
 import { onGateApply } from "./gate";
 import { registerSettings } from "./settings";
 import { guardCtx } from "./shared";
 import { getPlanCfg } from "./shared";
+import { logEvent } from "./log";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -169,8 +171,22 @@ function resetProgressWatch(): void {
 	lastProgressAt = Date.now();
 }
 
+/**
+ * 有助理在后台跑吗？（催 progress 之前要看一眼）
+ *
+ * 以前这个提醒只看「工具调用次数」，不管后台有没有活在跑 —— 模型明明在等 worker 回复，
+ * 面板却每 8 次调用催一次「你的计划可能已作废」，纯噪音（用户真机反馈）。
+ */
+function activeWorkerCount(): number {
+	try {
+		return liveJobList().filter((j) => j.status === "running").length;
+	} catch {
+		return 0;
+	}
+}
+
 /** 给模型的一句提醒（很短，能看懂就行） */
-function progressNag(): string {
+function progressNag(workers = 0): string {
 	const doneN = steps.filter((s) => s.status === "done").length;
 	const doingIdx = steps.findIndex((s) => s.status === "doing");
 	const where =
@@ -179,6 +195,13 @@ function progressNag(): string {
 			: `计划「${title || "(无标题)"}」${doneN}/${steps.length} 步` +
 				(doingIdx >= 0 ? `，卡在第 ${doingIdx + 1} 步「${steps[doingIdx]!.text}」` : "");
 	const mins = Math.floor((Date.now() - lastProgressAt) / 60000);
+	if (workers > 0) {
+		// 有活在看板上跑 → 只轻描淡写提一句「等它们回来再更新」，绝不催
+		return (
+			`\n\n（提示）有 ${workers} 个助理在后台跑：等它们回来再 progress(action="step", status="doing") 就行，` +
+			`现在不用更新 —— ${where}。`
+		);
+	}
 	return (
 		`\n\n⚠ 看板提醒：这轮已经 ${toolCallsSinceProgress} 次工具调用没调 progress()` +
 		(mins >= 2 ? `（距上次更新 ${mins} 分钟）` : "") +
@@ -1217,7 +1240,9 @@ export function setupBoard(api: ExtensionAPI): void {
 		if (event.parentToolCallId) return; // nested 调用不数
 		toolCallsSinceProgress++;
 		if (toolCallsSinceProgress < NAG_EVERY_CALLS) return;
-		const nag = progressNag();
+		const workers = activeWorkerCount();
+		const nag = progressNag(workers);
+		logEvent("board.nudge", { calls: NAG_EVERY_CALLS, workers, steps: steps.length }, workers ? "info" : "warn");
 		toolCallsSinceProgress = 0;
 		return { content: [...event.content, { type: "text" as const, text: nag }] };
 	});

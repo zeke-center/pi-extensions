@@ -1,4 +1,4 @@
-﻿/**
+/**
  * diagnose.ts —— 给别人（以及**读报告的另一个 AI**）用的全量自检报告（v2.9.0）
  *
  * 定位：这不是给人扫一眼的摘要，而是**交给 AI 排障的上下文包**。
@@ -19,6 +19,8 @@ import { badEnumValues, configConflicts, permSummary, type WorkerPermissions } f
 import { loadTemplates, projectTrusted, shadowDetail } from "./delegate";
 import { isSensitiveKey, redactArgList, redactDeep, redactSecrets } from "./redact";
 import { readRecentLogs, summarizeLogs } from "./log";
+// 单测要直接调（生产代码不用，但 re-export 一下最省事）
+export { configureLog, flushLog, logEvent, logSummaryLine, logsDir, setLogSession } from "./log";
 import { loadMcpPool } from "./mcp-pool";
 import { herdrStatus } from "./herdr";
 

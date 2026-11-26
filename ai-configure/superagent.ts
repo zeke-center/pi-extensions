@@ -20,6 +20,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { registerSettings, settingsCtx, type SettingDef } from "./settings";
 import { patchExtCfg, readExtCfg } from "./shared";
 import { readUiConfig, UI_DEFAULTS, type UiMode } from "./herdr";
+import { logEvent } from "./log";
 
 /** 面板里的组名（和文章里的写法一致，带空格） */
 export const SUPERAGENT_GROUP = "Super Agent";
@@ -642,6 +643,10 @@ export function decideRouterToolCall(tool: string, mode: RouterMode): { allow: b
 let routerSession: RouterMode | undefined;
 /** 摘工具前的那一刻快照，用于原样还原 */
 let toolsSnapshot: string[] | undefined;
+/** 上一次实际生效的档位（用来判断「档位变了」→ 提示一次，别静默改能力） */
+let lastAppliedRouter: string | undefined;
+/** 工具还没注册完时，最多重试几次（session_start 那一刻经常还没就绪） */
+const APPLY_RETRY_DELAYS = [300, 1200];
 /** 摘工具用的 api 引用。
  *
  * ⚠️ 名字带 router 前缀是故意的：delegate.ts 里也有个模块级 `apiRef`，
@@ -683,6 +688,7 @@ export function applyRouterTools(): void {
 				api.setActiveTools(toolsSnapshot);
 				toolsSnapshot = undefined;
 			}
+			lastAppliedRouter = undefined;
 			return;
 		}
 		// 只在第一次摘的时候记快照，之后都基于快照算（避免越摘越少）
@@ -693,7 +699,17 @@ export function applyRouterTools(): void {
 				typeof api.getAllTools === "function"
 					? api.getAllTools().map((t) => t.name)
 					: ((api.getActiveTools?.() ?? []) as string[]);
-			if (all.length < 3) return; // 工具还没注册完，此时别动手
+			if (all.length < 3) {
+				// ⚠️ 工具还没注册完（session_start 那一刻很常见）。
+				//    以前这里直接 return → 收窄被推迟到**下一轮** before_agent_start 才生效，
+				//    用户看到的就是「开头能跑命令，用着用着突然变只读」，还以为是插件抽风。
+				//    现在短延时重试两次，尽快把档位定下来。
+				for (const d of APPLY_RETRY_DELAYS) {
+					const timer = setTimeout(() => applyRouterTools(), d);
+					(timer as unknown as { unref?: () => void }).unref?.();
+				}
+				return;
+			}
 			toolsSnapshot = all;
 		}
 		const base = toolsSnapshot;
@@ -702,6 +718,21 @@ export function applyRouterTools(): void {
 				? base.filter((n) => ROUTER_ALLOW.includes(n))
 				: base.filter((n) => !BLOCKED_READONLY.includes(n) && !(n.startsWith("mcp__") && MCP_DANGER.test(n)));
 		api.setActiveTools(keep);
+
+		// 档位变了才提示（同一档位反复应用不刷屏）。以前这是**静默**的，
+		// 用户在会话中途突然没权限，根本不知道是谁改的。
+		if (lastAppliedRouter !== st.router) {
+			const first = lastAppliedRouter === undefined;
+			lastAppliedRouter = st.router;
+			// 主会话工具面变了 → 记一条（用户报过「跑到一半突然不能执行命令」，靠这条定位）
+			logEvent("router.apply", { mode: st.router, before: base.length, after: keep.length, first }, "warn");
+			const keepText = st.router === "blind" ? "只剩派活/看板/读 git" : "不能写文件、不能跑命令";
+			notifyOnce(
+				first
+					? `主会话已切到「${routerLabel(st.router)}」档：${keepText}。要自己动手改配置就 /ai-ext 里把 Router 设成 off。`
+					: `主会话档位已变：${routerLabel(st.router)} —— ${keepText}。`,
+			);
+		}
 
 		// ---------- fail-safe 自检 ----------
 		// 收窄绝不能把 Router 弄成残废（v2.3 真踩过：快照拿早了，bash/read 全没了）。

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * delegate · 派活给临时助理（并行 + 同步停止 + 超时续期）
  *
  * 一个工具：delegate(assistant, task | tasks) —— 起**独立的后台 pi 进程**干活，
@@ -89,6 +89,7 @@ import {
 	herdrDownNote,
 	herdrStatus,
 	markHerdrBroken,
+	herdrBrokenReason,
 	paneClose,
 	paneLabel,
 	paneSummary,
@@ -127,6 +128,10 @@ const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
 const MIN_TIMEOUT_MS = 5 * 1000; // 最少 5 秒
 const STATUS_KEY = "delegate";
 const PARTIAL_LIMIT = 4000; // 半成品最多保留的字符数（超时卡片就靠它，给足）
+/** 全部 assistant 文本累积上限（只为兜底找 <result>，不需要无限长） */
+const FINAL_ALL_LIMIT = 400_000;
+/** 卡片正文上限：超过就截断并标注「完整版见归档」（v2.10.1） */
+const RESULT_TEXT_LIMIT = 40_000; // 半成品最多保留的字符数（超时卡片就靠它，给足）
 const STDERR_LIMIT = 4000;
 /** 时限低于这个就不值得发收尾提醒了（提醒本身也要占掉一个 turn） */
 const MIN_WINDDOWN_MS = 3 * 60 * 1000;
@@ -1009,7 +1014,17 @@ interface ToolRunBrief {
 interface Sink {
 	partial: string;
 	tools: string[];
+	/** 最后一条 assistant 文本（"最终回复"的语义） */
 	final: string;
+	/**
+	 * 本轮**所有** assistant 文本按顺序累积（尾部限长）。
+	 *
+	 * 为什么必须有它：一条任务里 assistant 会发**多条**消息（中间夹工具调用），
+	 * 最后那条往往只是「跑完了」这种短句。只留 final 的话，前面带 <result>
+	 * 的长结论会被**静默丢掉** → 卡片判「无回执」、正文只剩一千多字，
+	 * 而实际工作早做完了（v2.10.0 用户在真机上踩到，20 次派发全中）。
+	 */
+	finalAll: string;
 	stderr: string;
 	/** 工具调用时序（两种模式共用；卡片里看“时间花哪了”） */
 	toolRuns: ToolRunBrief[];
@@ -1022,6 +1037,56 @@ interface Sink {
 	turns: number;
 }
 
+/**
+ * 取「本次要展示/解析的结论」。
+ *
+ * 顺序：
+ *   1. 最终回复里就有 <result> → 用它（最常见、最准）
+ *   2. 最终回复没有，但本轮某条有 → 从累积全文里摘：取最后一个 <result> 块，
+ *      再把「它前面那段正文」带上（结论通常写在回执前面）
+ *   3. 都没有 → 用最终回复（哪怕很短，也是它真说的最后一句话）
+ *
+ * 超过 RESULT_TEXT_LIMIT 就截断并标注 —— 完整版在归档里（/batch <会话ID>）。
+ */
+/** 解析回执 + 顺手记一条「结论长什么样」的埋点（诊断「无回执/正文变短」靠它） */
+function reportOfSink(sink: { final: string; finalAll?: string }): ReturnType<typeof parseReport> {
+	const final = String(sink.final ?? "").trim();
+	const all = String(sink.finalAll ?? "").trim();
+	const picked = pickResultText(sink);
+	const rep = parseReport(picked);
+	// ⚠️ 这条是「卡片说无回执、正文只剩一千字」那类问题的**决定性证据**：
+	//    看 finalLen 远小于 finalAllLen 就知道「最后一条短消息把长结论顶掉了」。
+	logEvent(
+		"worker.result",
+		{
+			finalLen: final.length,
+			finalAllLen: all.length,
+			textLen: picked.length,
+			hasResult: /<result>/i.test(picked),
+			hasResultInAll: /<result>/i.test(all),
+			dropped: final.length < all.length ? all.length - final.length : 0,
+			verdict: (rep as { verdict?: string } | undefined)?.verdict,
+		},
+		/<result>/i.test(all) && !/<result>/i.test(final) ? "warn" : "info",
+	);
+	return rep;
+}
+
+export function pickResultText(sink: { final: string; finalAll?: string }): string {
+	const fin = String(sink.final ?? "").trim();
+	const all = String(sink.finalAll ?? "").trim();
+	const cut = (s: string): string =>
+		s.length > RESULT_TEXT_LIMIT
+			? s.slice(0, RESULT_TEXT_LIMIT) + String.fromCharCode(10, 10) + "…（正文过长已截断，完整版见归档：/batch <会话ID>）"
+			: s;
+	if (!all) return cut(fin);
+	if (/<result>/i.test(fin)) return cut(fin);
+	if (!/<result>/i.test(all)) return cut(fin || all);
+	const idx = all.toLowerCase().lastIndexOf("<result>");
+	const head = all.slice(0, idx).trim();
+	const block = all.slice(idx);
+	return cut(head ? head + String.fromCharCode(10, 10) + block : block);
+}
 function clampTail(s: string, limit: number): string {
 	return s.length > limit ? s.slice(-limit) : s;
 }
@@ -1843,7 +1908,10 @@ function handleEvent(obj: EventRecord, sink: Sink): void {
 	} else if (obj.type === "message_end" && obj.message?.role === "assistant") {
 		sink.turns += 1; // 一轮 = 它的一条 assistant 回复（轮数上限就数这个）
 		const t = extractText(obj.message.content);
-		if (t) sink.final = t;
+		if (t) {
+			sink.final = t;
+			sink.finalAll = sink.finalAll ? clampTail(sink.finalAll + String.fromCharCode(10, 10) + t, FINAL_ALL_LIMIT) : t;
+		}
 	} else if (obj.type === "tool_execution_start") {
 		sink.toolRuns.push({
 			id: String(obj.toolCallId ?? ""),
@@ -3069,6 +3137,14 @@ export async function waitPaneDone(
  * 试着用 Herdr 跑一把。
  * 返回 RunResult = 已经跑完了（不管成败）；返回 undefined = 没走成，调用方退回 rpc 无头模式。
  */
+/**
+ * 本次派活**为什么没用分屏**（只有没走成 pane 才有值）。
+ *
+ * 为什么单独存：tryRunInHerdr 有 4 条提前返回路径（mode 判成 panel / 拿不到主 pane /
+ * 槽位超时 / pane run 失败），以前只把原因塞进 job.note（卡片上），
+ * 日志里只有一句「mode=rpc」—— 事后根本不知道是哪一步挂的。
+ */
+let downgradeWhy: string | undefined;
 async function tryRunInHerdr(
 	tpl: Template,
 	task: string,
@@ -3091,6 +3167,12 @@ async function tryRunInHerdr(
 	let guard: { clear: () => void } | undefined;
 	/** 卡在哪一步（写错误信息用） */
 	let stage = "init";
+	/** 本次为什么没走成 pane —— 每条提前返回都必须写，最后随 worker.mode 一起落日志 */
+	downgradeWhy = undefined;
+	const why = (stageName: string, reason: string): void => {
+		stage = stageName;
+		downgradeWhy = reason;
+	};
 	let result: RunResult | undefined;
 
 	const clearGuard = (): void => {
@@ -3192,15 +3274,19 @@ async function tryRunInHerdr(
 			// 用户配了 auto/split/tab 却掉到 panel → 必须说清楚为什么，别静默降级
 			const wanted = cfg.ui;
 			if ((wanted === "auto" || wanted === "split" || wanted === "tab") && !status.ok) {
+				why("mode", "herdr 不可用（配置=" + wanted + "）：" + status.reason);
 				job.note = herdrDownNote(status.reason, wanted); // 卡片上直接写原因（live.ts 渲染 job.note）
 				notifyHerdrDownOnce(bgCtx, status.reason); // 每会话只提醒一次
 				notifyLive();
+			} else {
+				why("mode", "分屏被判成 panel（配置=" + wanted + "，herdr " + (status.ok ? "可用" : "不可用") + "）");
 			}
 			return undefined;
 		}
 		if (!mainPaneId()) {
 			// 探测说能用，但本会话没有 pane 号 → 切不了，本次会话别再试
 			markHerdrBroken("拿不到本会话的 pane（HERDR_PANE_ID 未设）");
+			why("precheck", "拿不到本会话的 pane（HERDR_PANE_ID 未设）");
 			return undefined;
 		}
 
@@ -3209,7 +3295,7 @@ async function tryRunInHerdr(
 		if (!slot) {
 			// 等满 60s 还是没格 → 降级 rpc（备注要能让用户看出「不是派失败，是没位了」）
 			job.note = SLOT_WAIT_NOTE;
-			logEvent("herdr.slot.timeout", { assistant: tpl.key, waitMs: HERDR_SLOT_WAIT_MS, fallback: "rpc" }, "warn");
+			why("alloc", "等 pane 槽位 " + Math.round(HERDR_SLOT_WAIT_MS / 1000) + "s 超时（并发占满 / 分屏切不出来）");
 			notifyLive();
 			return undefined;
 		}
@@ -3241,6 +3327,7 @@ async function tryRunInHerdr(
 			job.slotIndex = undefined;
 			// 放宽探测后的兜底锁：本会话别再往 pane 里试了（每次白等 10s 超时）
 			markHerdrBroken("pane 里跑不起 pi（pane run 失败）");
+			why("launch", "pane 切出来了但 pi 没跑起来（pane run 失败）");
 			return undefined;
 		}
 
@@ -3499,14 +3586,14 @@ function sessionFileFor(key: string, id: string): string | undefined {
 
 async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promise<RunResult> {
 	const started = Date.now();
-	const sink: Sink = { partial: "", tools: [], final: "", stderr: "", toolRuns: [], turns: 0 };
+	const sink: Sink = { partial: "", tools: [], final: "", finalAll: "", stderr: "", toolRuns: [], turns: 0 };
 	/** 本次生效的轮数上限：模板 frontmatter `maxTurns` > 全局配置 > 默认 60 */
 	const maxTurns = resolveMaxTurns(tpl.maxTurns, readMaxTurns());
 	/** 到点前发过的收尾动作（要在 base() 里带上，所以提到这层） */
 	const windDownLog: string[] = [];
 	const base = (outcome: Outcome, exitCode: number | null): RunResult => ({
 		outcome,
-		text: sink.final.trim(),
+		text: pickResultText(sink),
 		partial: sink.partial,
 		tools: sink.tools,
 		toolRuns: sink.toolRuns.map((t) => ({ name: t.name, ms: t.ms })),
@@ -3514,8 +3601,8 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 		// pi 1.2.0：`-p` 模式下最终回复撞到输出上限时，会打印已产出的文本、
 		// stderr 写 "Response was truncated: the model reached its output token limit."、并以退出码 1 结束。
 		truncated: /output token limit/i.test(sink.stderr),
-		// 回执只从「最终回复」里解析（partial 是半截，不能当证据）
-		report: parseReport(sink.final),
+		// 回执：先看最终回复，没有再退到「本轮所有文本」（partial 是半截，绝不拿来当证据）
+		report: reportOfSink(sink),
 		elapsedMs: Date.now() - started,
 		exitCode,
 		stderrTail: clampTail(sink.stderr.trim(), STDERR_LIMIT),
@@ -3623,7 +3710,23 @@ async function runAssistant(tpl: Template, task: string, opt: RunOptions): Promi
 	// 没走成（非 Herdr / 任何 herdr 调用失败）→ 返回 undefined，下面原封不动走 rpc 无头模式。
 	{
 		const viaPane = await tryRunInHerdr(tpl, task, opt, args, job, sink, base);
-		logEvent("worker.mode", { assistant: tpl.key, mode: viaPane ? "pane" : "rpc", note: job.note }, viaPane ? "info" : "warn");
+		// 分屏降级：**把「哪一步 + 为什么 + 退到哪」一次写全** —— 这是排查"分屏没出来"的第一条
+		if (viaPane) {
+			logEvent("worker.mode", { assistant: tpl.key, mode: "pane", ui: job.uiMode });
+		} else {
+			logEvent(
+				"herdr.downgrade",
+				{
+					assistant: tpl.key,
+					wanted: readUiConfig().ui,
+					fallback: "rpc",
+					why: downgradeWhy ?? "未记录原因（tryRunInHerdr 走了未知分支）",
+					note: job.note,
+					broken: herdrBrokenReason() || undefined,
+				},
+				"warn",
+			);
+		}
 		if (viaPane) return viaPane;
 	}
 

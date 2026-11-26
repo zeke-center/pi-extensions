@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /**
  * 无头单元测试。
  *
@@ -276,6 +276,8 @@ let allOk = true;
 bundle("board.ts", "board.mjs");
 bundle("diagnose.ts", "diagnose.mjs");
 bundle("log.ts", "log.mjs");
+bundle("gitread.ts", "gitread.mjs");
+bundle("diagnose.ts", "diagnose2.mjs");
 // guard-entry 在**影子里的布局**是 extensions/guard-entry.ts + extensions/guard/perm-guard.ts，
 // 仓库里 perm-guard.ts 是平铺的 —— 所以先按影子布局复制一份再打包。
 {
@@ -3554,6 +3556,37 @@ allOk =
 		'ok("日志目录在 <agentDir>/logs", logsDir().endsWith("logs") && logsDir().includes(getAgentDir()));',
 		'ok("读不存在的目录不抛", (() => { try { cleanLogs(); return true; } catch { return false; } })());',
 	], { PI_CODING_AGENT_DIR: join(tmp, "agent-log") }) && allOk;
+
+// ---------- 2.10.1：日志能不能定位真机上那几类问题 ----------
+allOk =
+	runSuite("diagnose：用日志定位问题（v2.10.1 验收标准）", join(tmp, "diagnose2.mjs"), [
+		'// 关键：日志里能区分「最后一条短消息顶掉长结论」这件事',
+		'setLogSession("a6tffv-1234", "F:\\\\proj");',
+		'logEvent("worker.result", { finalLen: 1238, finalAllLen: 31000, hasResult: false, hasResultInAll: true, dropped: 29762 }, "warn");',
+		'logEvent("router.apply", { mode: "readonly", before: 19, after: 12, first: false }, "warn");',
+		'logEvent("tool.reject", { tool: "git_read", why: "not-allowed-flag", arg: "-U2", sub: "diff" }, "warn");',
+		'logEvent("board.nudge", { calls: 8, workers: 2, steps: 5 }, "info");',
+		'flushLog();',
+		'const all = readRecentLogs(50, { lvl: "info" }).rows;',
+		'const evs = all.map((r) => r.ev);',
+		'ok("worker.result 有记录（能看出正文被顶掉多少）", evs.includes("worker.result"));',
+		'const wr = all.find((r) => r.ev === "worker.result");',
+		'ok("worker.result 带 finalLen / finalAllLen / dropped", wr && wr.d.finalLen === 1238 && wr.d.finalAllLen === 31000 && wr.d.dropped === 29762);',
+		'ok("router.apply 有记录（能看出档位什么时候变的）", evs.includes("router.apply"));',
+		'ok("tool.reject 有记录（能看出模型试了什么被拒）", evs.includes("tool.reject"));',
+		'ok("board.nudge 记了 workers 数（判断该不该催）", all.some((r) => r.ev === "board.nudge" && r.d.workers === 2));',
+		'const sum = summarizeLogs();',
+		'ok("汇总能按事件聚合（报告 9a 靠它）", sum.some((x) => x.ev === "worker.result" && x.count >= 1));',
+		'// 用日志回答一个具体问题：这个会话里有没有「有回执却被丢掉」的情况',
+		'const droppedCases = all.filter((r) => r.ev === "worker.result" && r.d.hasResultInAll === true && r.d.hasResult === false);',
+		'ok("能一眼筛出「回执被顶掉」的那几次", droppedCases.length >= 1);',
+	], { PI_CODING_AGENT_DIR: join(tmp, "agent-log2") }) && allOk;
+
+// ---------- git_read：-U 任意位数 / -- 分隔符 ----------
+allOk =
+	runSuite("git-read：参数白名单（v2.10.1）", join(tmp, "gitread.mjs"), [
+		'ok("源码里 -U 是正则不是枚举", /\\^\\-U\\\\d\\+\\$/.test(readFileSync(join(process.cwd(), "ai-configure", "gitread.ts"), "utf8")));',
+	], { PI_CODING_AGENT_DIR: join(tmp, "agent-git") }) && allOk;
 
 rmSync(tmp, { recursive: true, force: true });
 

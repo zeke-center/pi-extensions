@@ -1,4 +1,4 @@
-/**
+﻿/**
  * herdr.ts —— Herdr 分屏的**薄封装**（Super Agent 的 split / tab UI 模式用）。
  *
  * 为什么要单独一层：

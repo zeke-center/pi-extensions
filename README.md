@@ -1,6 +1,6 @@
-﻿# pi-extensions
+# pi-extensions
 
-我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.10.0**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
+我在用的 pi 编码 agent 扩展。**一个目录式插件 `ai-configure/`（入口装配 6 个模块 + 面板动作 actions.ts）** · 当前版本 **v2.10.1**，外加助理模板与提示词模板。全部是「本地 TypeScript」：pi 用 jiti 直接加载，**不需要编译、不需要 npm install**。
 
 ```bash
 pi install git:github.com/zeke-center/pi-extensions   # 在终端里敲，不是在 pi 聊天框里
@@ -1361,6 +1361,10 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 | `herdr.slot.timeout` | 等 pane 槽位满 60s 超时 |
 | `dispatch.reject` | 派活被拒，`why`：`template_not_found` / `template_is_demo` / `template_is_base` / `cwd_not_found` / `shadow_build_failed` / `mcp_not_found` |
 | `worker.end` | Worker 终态（`status` + 耗时 + 工具数 + `note`）；`partial`/`failed` 是 warn/error |
+| `worker.result` | **正文长度 + 回执有无 + 被顶掉多少**（`finalLen` vs `finalAllLen`）—— 卡片「无回执」/正文变短看它 |
+| `router.apply` | 主会话档位变了（工具数 before → after）—— 「突然不能执行命令」看它 |
+| `tool.reject` | 模型试了哪个工具/参数被拒、为什么 |
+| `board.nudge` | 催 progress 时后台有几个 worker |
 | `worker.ext-load.fail` | **扩展加载失败 = Worker 起不来**（v2.8.0 那次全崩就是这个） |
 | `deliver.fail` / `deliver.skip` | 回投失败 / 为什么没投 |
 | `mcp.shadow.build` | 本次派活往影子写了哪些 MCP、漏了哪些 |
