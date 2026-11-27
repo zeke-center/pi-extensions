@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import type { WorkerPermissions } from "./permissions";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { logEvent, logError } from "./log";
+import { stripBom } from "./shared";
 
 /** 一个 MCP server 的原始定义（直接透传 pi 的格式） */
 export type McpServerDef = Record<string, unknown>;
@@ -211,7 +212,7 @@ export function ensureCatalog(): string {
 
 function readMcpFile(file: string): Record<string, McpServerDef> {
 	try {
-		const j = JSON.parse(readFileSync(file, "utf8")) as { mcpServers?: unknown };
+		const j = JSON.parse(stripBom(readFileSync(file, "utf8"))) as { mcpServers?: unknown };
 		const s = j?.mcpServers;
 		if (!s || typeof s !== "object" || Array.isArray(s)) return {};
 		const out: Record<string, McpServerDef> = {};
@@ -352,7 +353,7 @@ export function buildShadow(
 	let settingsBroken = false;
 	if (existsSync(settingsSrc)) {
 		try {
-			const raw = JSON.parse(readFileSync(settingsSrc, "utf8")) as Record<string, unknown>;
+			const raw = JSON.parse(stripBom(readFileSync(settingsSrc, "utf8"))) as Record<string, unknown>;
 			delete raw.packages;
 			settings = raw;
 		} catch {

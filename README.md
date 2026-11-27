@@ -1327,6 +1327,16 @@ pane 标题和卡片上多一个灯。判据看四样东西：**进程还在吗 
 3. 那个 server 的 command 能不能手动跑起来（exe 路径 / 参数 / 环境变量 / 凭据）
 4. worker 那次会话开头有没有 MCP 报错 → `/resume-agent`
 
+### 配置文件被改坏了会怎样（v2.10.3）
+
+`ai-extensions.json` / `mcp.json` / `settings.json` 里任何一个：
+
+- **带 BOM**（Windows 记事本、PowerShell 5.1 `Set-Content -Encoding UTF8` 都会加）→ 自动剥掉，正常读
+- **JSON 语法坏了** → 记 `config.parse.fail` 事件 + 状态栏红字 `⚠ 配置解析失败（已停用 Router）`，
+  并且 **Router 收窄自动停用**（保持全部工具）—— 改坏配置不会把你自己锁死
+
+> 老版本的行为：静默回落默认值（`router` 默认 `blind` = 最严档）→ 工具被摘光，且没有任何提示。
+
 ### 事件日志（v2.10.0，出问题先看这个）
 
 插件自己埋点，**一行一个 JSON**，按天滚：

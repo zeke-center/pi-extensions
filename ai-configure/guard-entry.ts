@@ -30,9 +30,17 @@ function shadowRoot(): string {
 	return dirname(dirname(fileURLToPath(import.meta.url)));
 }
 
+/**
+ * 剥 UTF-8 BOM（本地版）。
+ *
+ * 为什么不用 shared.ts 里那个：Worker 的影子目录里只有 guard-entry.ts + guard/perm-guard.ts，
+ * import 插件其它模块会让扩展加载失败（v2.8.0 真炸过）。
+ */
+const stripBom = (s: string): string => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
+
 function readJson(file: string): Record<string, unknown> | undefined {
 	try {
-		const j = JSON.parse(readFileSync(file, "utf8")) as unknown;
+		const j = JSON.parse(stripBom(readFileSync(file, "utf8"))) as unknown;
 		return j && typeof j === "object" && !Array.isArray(j) ? (j as Record<string, unknown>) : undefined;
 	} catch {
 		return undefined;

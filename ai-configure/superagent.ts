@@ -1,4 +1,4 @@
-/**
+﻿/**
  * superagent.ts —— Super Agent 模式（Router / Worker 双层，参考 DeepSeek Harness 的设计）。
  *
  * 这一层现在负责什么
@@ -18,7 +18,7 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { registerSettings, settingsCtx, type SettingDef } from "./settings";
-import { patchExtCfg, readExtCfg } from "./shared";
+import { cfgParseError, patchExtCfg, readExtCfg } from "./shared";
 import { readUiConfig, UI_DEFAULTS, type UiMode } from "./herdr";
 import { logEvent } from "./log";
 
@@ -82,7 +82,7 @@ function readProjectLayer(cwd: string): Layer {
 	try {
 		const file = projectFile(cwd);
 		if (!existsSync(file)) return "inherit";
-		const raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
+		const raw = JSON.parse(stripBom(readFileSync(file, "utf8"))) as unknown;
 		const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 		const blk = obj.superagent;
 		const b = blk && typeof blk === "object" ? (blk as Record<string, unknown>) : {};
@@ -98,7 +98,7 @@ function writeProjectLayer(cwd: string, v: Layer): void {
 		let all: Record<string, unknown> = {};
 		if (existsSync(file)) {
 			try {
-				const raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
+				const raw = JSON.parse(stripBom(readFileSync(file, "utf8"))) as unknown;
 				if (raw && typeof raw === "object") all = raw as Record<string, unknown>;
 			} catch {
 				all = {};
@@ -156,7 +156,13 @@ export function readSuperAgent(): SuperAgentState {
 		decidedBy,
 		report: readCfgKey("report"),
 		retry: readCfgKey("retry"),
-		router: routerSession ?? readCfgKey("router"),
+		// ⚠️ 配置读坏了 → **fail-open**：不按默认值（blind = 最严档）收窄。
+		//
+		// 真机踩过：Windows 记事本 / PowerShell 5.1 保存会让 ai-extensions.json 多一个 BOM，
+		// JSON.parse 直接报错 → 整份配置读不到 → router 回落默认 blind →
+		// **用户只是改了个设置，插件反而把自己锁成“只能派活”**，而且一句提示都没有。
+		// 读不到就别装懂事：不干预（等同 off），让用户至少保有全部工具。
+		router: cfgParseError() && !routerSession ? ("off" as RouterMode) : (routerSession ?? readCfgKey("router")),
 	};
 }
 
@@ -672,8 +678,10 @@ function isWorkerProc(): boolean {
 }
 
 export function setRouterSession(v: RouterMode | undefined): void {
+	const before = roleSnapshot();
 	routerSession = v;
 	applyRouterTools();
+	queueRoleNotice(before);
 	refreshSuperAgentStatus();
 }
 
@@ -695,6 +703,15 @@ export function applyRouterTools(): void {
 		// 快照取「所有已配置的工具」而不是「当前激活的」：早期调用时内建工具
 		// （bash/read/write/edit/codemode）可能还没注册，拿激活列表当快照会把它们全摘光
 		if (!toolsSnapshot) {
+			// 配置坏了：一定要说出来（静默才最坑），且不参与收窄
+			const cfgErr = cfgParseError();
+			if (cfgErr) {
+				notifyOnce(
+					`⚠️ 配置文件解析失败（${cfgErr.file}）：${cfgErr.err}\n` +
+						`已停用 Router 收窄（保持全部工具），请修好配置或删掉文件让它重生。`,
+				);
+				return;
+			}
 			const all =
 				typeof api.getAllTools === "function"
 					? api.getAllTools().map((t) => t.name)
@@ -834,29 +851,101 @@ export function refreshSuperAgentStatus(): void {
 	if (!ctx) return;
 	try {
 		const st = readSuperAgent();
+		const cfgErr = cfgParseError();
+		if (cfgErr) {
+			// 配置坏了必须**写在状态栏上** —— 用户只要一眼就能知道自己改坏了，而不是惑于「行为怎么变了」
+			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("error", "⚠ 配置解析失败（已停用 Router）"));
+			return;
+		}
 		ctx.ui.setStatus(STATUS_KEY, st.enabled ? `⚡ Super Agent · ${st.decidedBy} · ${routerLabel(st.router)}` : undefined);
 	} catch {
 		/* 状态栏画不出来不影响功能 */
 	}
 }
 
+// ======================= 角色变更告知（v2.10.3）=======================
+
+/**
+ * 「模式/档位刚变过」→ 下一轮要把这事**明确告诉模型**。
+ *
+ * 为什么光改 system prompt 段不够：段被删掉只是「不再嘀喧」，模型上下文里
+ * 之前那些「你是 Router，不要自己动手」的指令**还在历史里**，它会继续照旧执行。
+ * 用户的感受就是「开关了 Super Agent，主会话还按之前的模式跑」。
+ *
+ * 所以这里学 Claude Code 的 system-reminder：变更发生后往 system prompt 里
+ * 插一段**一次性**的覆盖式声明（「之前那套规则作废，现在你是 ……」），下一轮再撤掉。
+ */
+let pendingRoleNotice: string | undefined;
+
+function roleSnapshot(): { enabled: boolean; router: RouterMode } {
+	try {
+		const st = readSuperAgent();
+		return { enabled: st.enabled, router: st.router };
+	} catch {
+		return { enabled: false, router: "off" };
+	}
+}
+
+/** 对比前后，变过就生成一条覆盖式声明 */
+export function buildRoleNotice(
+	before: { enabled: boolean; router: RouterMode },
+	after: { enabled: boolean; router: RouterMode },
+): string | undefined {
+	if (before.enabled === after.enabled && before.router === after.router) return undefined;
+	if (!after.enabled) {
+		return (
+			"[Super Agent 已关闭] 角色变更，立即生效。\n" +
+			"- 之前所有关于「你是 Router、不要自己执行、只能 delegate / progress / git_read / read_result」的规则**全部作废**。\n" +
+			"- 你现在拥有完整工具：需要自己读文件、跑命令、改代码就直接做，不必先派助理。\n" +
+			"- 已经派出去的 Worker 仍会回投结果，收到就直接用。\n"
+		);
+	}
+	const modeText =
+		after.router === "blind"
+			? "「只派活」档：只能用 delegate / progress / git_read / read_result"
+			: after.router === "readonly"
+				? "「只读」档：不能写文件、不能跑命令"
+				: "不限制（工具未收窄）";
+	return (
+		"[Super Agent 已开启] 角色变更，立即生效。\n" +
+		`- 你现在是 **Router**，档位 = ${modeText}。\n` +
+		"- 不要再自己执行：按助理 desc 挑人，用 delegate 派活；多件互不依赖的用 tasks 一次并行派。\n" +
+		"- 该档位下的工具面已经收窄，模型看不到该档位不允许的工具（别去试）。\n"
+	);
+}
+
+/** 记下「待告知」的角色变更（写操作后调） */
+function queueRoleNotice(before: { enabled: boolean; router: RouterMode }): void {
+	const note = buildRoleNotice(before, roleSnapshot());
+	if (note) {
+		pendingRoleNotice = note;
+		logEvent("router.role.change", { toEnabled: roleSnapshot().enabled, toRouter: roleSnapshot().router }, "warn");
+	}
+}
+
 // ======================= 写 =======================
 
 export function setSuperAgentEnabled(v: boolean): void {
+	const before = roleSnapshot();
 	patchExtCfg({ superagent: { ...(readExtCfg().superagent as object), enabled: v } });
 	applyRouterTools();
+	queueRoleNotice(before);
 	refreshSuperAgentStatus();
 }
 
 export function setSuperAgentProject(v: Layer): void {
+	const before = roleSnapshot();
 	writeProjectLayer(cwdNow(), v);
 	applyRouterTools();
+	queueRoleNotice(before);
 	refreshSuperAgentStatus();
 }
 
 export function setSuperAgentSession(v: Layer): void {
+	const before = roleSnapshot();
 	sessionLayer = v;
 	applyRouterTools();
+	queueRoleNotice(before);
 	refreshSuperAgentStatus();
 }
 
@@ -1275,6 +1364,16 @@ export function setupSuperAgent(api: ExtensionAPI): void {
 		} else if (event.systemPromptOptions.sections["superagent-router"]) {
 			// 模式在本会话里被关掉：把段摘掉，别留旧规则误导模型
 			delete event.systemPromptOptions.sections["superagent-router"];
+		}
+		// 模式/档位刚变过 → 插一段**一次性**的覆盖式声明。
+		// 光把旧段删掉不够：模型历史里那些「你是 Router，不要自己动手」还生效，
+		// 不明确说「作废」它会继续照旧执行（用户感受就是「开关了还按旧模式跑」）。
+		const secs = event.systemPromptOptions.sections;
+		if (pendingRoleNotice) {
+			secs["superagent-role-change"] = pendingRoleNotice;
+			pendingRoleNotice = undefined;
+		} else if (secs["superagent-role-change"]) {
+			delete secs["superagent-role-change"]; // 只插一轮，避免长期占 token
 		}
 	});
 	setTimeout(() => {

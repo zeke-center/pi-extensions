@@ -27,6 +27,7 @@ import { registerSettings } from "./settings";
 import { guardCtx } from "./shared";
 import { getPlanCfg } from "./shared";
 import { logEvent } from "./log";
+import { stripBom } from "./shared";
 
 const WIDGET_KEY = "task-board";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -622,7 +623,7 @@ const LEVEL_TAG: Record<McpLevel, string> = { session: "会话", project: "项�
 function readMcpNames(file: string): string[] {
 	try {
 		if (!existsSync(file)) return [];
-		const j = JSON.parse(readFileSync(file, "utf8")) as { mcpServers?: Record<string, unknown> };
+		const j = JSON.parse(stripBom(readFileSync(file, "utf8"))) as { mcpServers?: Record<string, unknown> };
 		return Object.keys(j.mcpServers ?? {});
 	} catch {
 		return [];

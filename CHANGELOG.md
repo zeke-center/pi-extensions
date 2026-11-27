@@ -2,6 +2,34 @@
 
 格式要求：每个版本用 `## x.y.z` 开头（pi 靠它解析，用于更新后显示「Extension Updates」）。
 
+## 2.10.3
+
+**修复：配置文件带 BOM → 整份配置读不到 → 静默回落最严档，把自己锁死**
+
+真机现场：用记事本或 PowerShell 5.1 的 `Set-Content -Encoding UTF8` 保存 `ai-extensions.json`，文件头会多 `EF BB BF`。
+`JSON.parse` **不认 BOM** → 整份配置解析失败 → `superagent.router` 回落默认 `blind`（最严档）→
+用户「只是改了个设置」，插件反而把所有工具摘掉，**且一句提示都没有**。
+
+- 新增 `stripBom()` / `readJsonFile()`（shared.ts）：全部 JSON 读取统一剥 BOM，覆盖 `ai-extensions.json`、
+  `mcp.json`、`mcp-catalog.json`、`settings.json`、影子 `guard-config.json` 等 **15 处**
+- 解析失败**不再静默**：记 `config.parse.fail`（含 file / hadBom / err）+ 状态栏红字「⚠ 配置解析失败（已停用 Router）」
+- **fail-open**：配置读到坏值时，`router` 视为 `off`（不应用收窄）—— 改坏配置不该等于把自己锁死
+- `patchExtCfg` 写入一律**不带 BOM**，写完自动清掉错误现场
+
+**新增：角色变更显式告知模型（开关 Super Agent 后不再「还按旧模式跑」）**
+
+光把 `<superagent-router>` 段删掉不够 —— 模型**历史里的旧指令还在**，它会继续照旧执行。现在：
+
+- 开关模式 / 切 router 档时生成一条覆盖式声明，写进 system prompt 的 `superagent-role-change` 段（**只插一轮**，不长期占 token）：
+  - 关闭：`之前所有「你是 Router、不要自己执行」的规则全部作废，你现在有完整工具`
+  - 开启：`你现在是 Router，档位 = 只读/只派活，工具面已收窄，别再自己执行`
+- 同时记 `router.role.change` 事件（日志里能看出「什么时候切的角色」）
+
+**其它**
+- 修单测框架一个反复踩的坑：同一份 bundle 被两个套件用时会 `Identifier '__R' already declared` 直接崩 —— 现在每次跑都写独立 runner 文件
+- `herdr.downgrade` 真机验证通过：`{"wanted":"panel","fallback":"rpc","why":"分屏被判成 panel（配置=panel，herdr 可用）"}`
+- 新增 17 条断言（BOM 容错 9 条 + 角色声明 8 条）；unit **1121 PASS / 0 FAIL**
+
 ## 2.10.2
 
 自测（真机派活 + 读日志）发现的两处**日志自身**的问题：

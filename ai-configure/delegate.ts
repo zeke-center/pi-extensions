@@ -122,6 +122,7 @@ import { isExtDisabled, onGateApply } from "./gate";
 import { assistantSessionRoot, buildShadow, ensureCatalog, installGuard, loadMcpPool, localCatalogPath, mainSessionMcpServers, MCP_INHERIT, reapStaleShadowDirs, type McpPool, type McpServerDef, type ShadowResult } from "./mcp-pool";
 import { AUTO_DELIVER_MAX_ATTEMPTS, autoDeliverSkipReason, bgPruneReason, mergeBgTask, type BgTaskFile, type BgTaskNext } from "./bg-store";
 import { archiveResult, listArchivedResults, pruneArchivedResults, readArchivedResult, resultPathLine } from "./results";
+import { stripBom } from "./shared";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 单次硬上限 30 分钟
@@ -268,7 +269,7 @@ export function projectTrusted(cwd: string): boolean | undefined {
 	const norm = (x: string) => x.replace(/[\\/]+/g, "\\").replace(/\\$/, "").toLowerCase();
 	let data: Record<string, unknown> = {};
 	try {
-		data = JSON.parse(readFileSync(join(getAgentDir(), "trust.json"), "utf8")) as Record<string, unknown>;
+		data = JSON.parse(stripBom(readFileSync(join(getAgentDir(), "trust.json"), "utf8"))) as Record<string, unknown>;
 	} catch {
 		return undefined;
 	}
@@ -2140,7 +2141,7 @@ function launcherSource(): string {
 		'import { readFileSync, writeFileSync } from "node:fs";',
 		'import { spawn } from "node:child_process";',
 		"const cfgPath = process.argv[2];",
-		'const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));',
+		'const cfg = JSON.parse(stripBom(readFileSync(cfgPath, "utf8")));',
 		'const child = spawn(cfg.node, cfg.args, { stdio: "inherit", env: { ...process.env, ...cfg.env } });',
 		// 把 worker（pi）自己的 pid 落盘：主进程靠它探活/查子进程（健康灯要）
 		'try { writeFileSync(cfgPath + ".pid", String(child.pid || ""), "utf8"); } catch (e) {}',
@@ -4746,7 +4747,7 @@ function writeBgTask(t: BgTaskNext): BgTaskFile | undefined {
 }
 function readBgTask(id: string): BgTaskFile | undefined {
 	try {
-		return JSON.parse(readFileSync(bgFile(id), "utf8")) as BgTaskFile;
+		return JSON.parse(stripBom(readFileSync(bgFile(id), "utf8"))) as BgTaskFile;
 	} catch {
 		return undefined;
 	}
@@ -4757,7 +4758,7 @@ function listBgTasks(dir: string = bgRoot()): BgTaskFile[] {
 			.filter((f) => f.endsWith(".json"))
 			.map((f) => {
 				try {
-					return JSON.parse(readFileSync(join(dir, f), "utf8")) as BgTaskFile;
+					return JSON.parse(stripBom(readFileSync(join(dir, f), "utf8"))) as BgTaskFile;
 				} catch {
 					return undefined;
 				}
@@ -6664,7 +6665,7 @@ function acquireSessionLock(sessionId: string, label: string): { ok: true } | { 
 		/* 已存在 → 看是不是死锁 */
 	}
 	try {
-		const info = JSON.parse(readFileSync(f, "utf8")) as Partial<LockInfo>;
+		const info = JSON.parse(stripBom(readFileSync(f, "utf8"))) as Partial<LockInfo>;
 		if (lockIsStale(info)) {
 			writeFileSync(f, payload, "utf8"); // 接管死锁
 			return { ok: true };
@@ -6702,7 +6703,7 @@ function reapStaleLocks(): void {
 	for (const f of files) {
 		const p = join(root, f);
 		try {
-			const info = JSON.parse(readFileSync(p, "utf8")) as Partial<LockInfo>;
+			const info = JSON.parse(stripBom(readFileSync(p, "utf8"))) as Partial<LockInfo>;
 			if (lockIsStale(info)) rmSync(p, { force: true });
 		} catch {
 			try {
@@ -6755,7 +6756,7 @@ function extensionsConfigFile(): string {
 
 function readExtensionsConfig(): Record<string, unknown> {
 	try {
-		const raw = JSON.parse(readFileSync(extensionsConfigFile(), "utf8")) as Record<string, unknown>;
+		const raw = JSON.parse(stripBom(readFileSync(extensionsConfigFile(), "utf8"))) as Record<string, unknown>;
 		return raw && typeof raw === "object" ? raw : {};
 	} catch {
 		return {}; // 没这个文件 / 坏了 —— 用默认值，不要因为一个配置项把插件搞挂

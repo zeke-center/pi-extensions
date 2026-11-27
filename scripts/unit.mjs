@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
  * 无头单元测试。
  *
@@ -161,14 +161,21 @@ function runSuite(name, bundleFile, bodyLines, env = {}) {
 		"process.exit(__bad.length ? 1 : 0);",
 	];
 	const src = readFileSync(bundleFile, "utf8") + "\n" + [...harness, ...bodyLines, ...report].join("\n") + "\n";
-	writeFileSync(bundleFile, src, "utf8");
+	// ⚠️ 每次跑都写一个**新文件**：以前是原地覆盖 bundleFile，同一个 bundle 被两个套件用时会
+	//    「Identifier '__R' has already been declared」直接崩（已踩三次），且第一个套件的断言残留在里面。
+	let runner = bundleFile;
+	for (let n = 1; ; n++) {
+		runner = bundleFile.replace(/\.mjs$/, `.run${n}.mjs`);
+		if (!existsSync(runner)) break;
+	}
+	writeFileSync(runner, src, "utf8");
 	console.log(`\n─── ${name} ───`);
 	try {
 		const inherited = { ...process.env };
 		// 隔离：外层 shell 里的 PI_SA_UI（压测要 export 它）不许污染断言。
 		// 套件要测环境变量就在断言里自己设 + try/finally 恢复。
 		delete inherited.PI_SA_UI;
-		const out = execFileSync(process.execPath, [bundleFile], {
+		const out = execFileSync(process.execPath, [runner], {
 			env: { ...inherited, ...env },
 			encoding: "utf8",
 		});
@@ -3587,6 +3594,42 @@ allOk =
 	runSuite("git-read：参数白名单（v2.10.1）", join(tmp, "gitread.mjs"), [
 		'ok("源码里 -U 是正则不是枚举", /\\^\\-U\\\\d\\+\\$/.test(readFileSync(join(process.cwd(), "ai-configure", "gitread.ts"), "utf8")));',
 	], { PI_CODING_AGENT_DIR: join(tmp, "agent-git") }) && allOk;
+
+// ---------- v2.10.3：配置容错（BOM）+ 角色变更告知 ----------
+allOk =
+	runSuite("shared：配置读取容错（BOM / 坏 JSON）", join(tmp, "shared.mjs"), [
+		'const bomDir = join(process.env.PI_CODING_AGENT_DIR, "bomtest");',
+		'mkdirSync(bomDir, { recursive: true });',
+		'const bomFile = join(bomDir, "with-bom.json");',
+		'writeFileSync(bomFile, String.fromCharCode(0xFEFF) + JSON.stringify({ a: 1, superagent: { router: "blind" } }), "utf8");',
+		'ok("stripBom 去掉了 BOM", stripBom(String.fromCharCode(0xFEFF) + "{}") === "{}");',
+		'ok("stripBom 对无 BOM 的字符串不动", stripBom("{}") === "{}");',
+		'const v = readJsonFile(bomFile);',
+		'ok("readJsonFile 能吃带 BOM 的 JSON（真机踩过：整份配置读不到→回落 blind 把自己锁死）", !!v && v.a === 1);',
+		'ok("带 BOM 时不记解析错误", cfgParseError() === undefined);',
+		'const badFile = join(bomDir, "broken.json");',
+		'writeFileSync(badFile, "{ this is not json", "utf8");',
+		'ok("坏 JSON 返回 undefined 而不是抛", readJsonFile(badFile) === undefined);',
+		'ok("坏 JSON 会留下现场（能报警，不静默）", !!cfgParseError() && cfgParseError().file === badFile);',
+		'ok("坏 JSON 的错因可读", /JSON|token|Unexpected/i.test(String(cfgParseError().err)));',
+		'clearCfgParseError();',
+		'ok("clearCfgParseError 能清掉", cfgParseError() === undefined);',
+		'ok("文件不存在不算坏（首次使用是正常的）", readJsonFile(join(bomDir, "nope.json")) === undefined && cfgParseError() === undefined);',
+	], { PI_CODING_AGENT_DIR: join(tmp, "agent-cfg") }) && allOk;
+
+allOk =
+	runSuite("superagent：角色变更告知（开关后模型能立刻知道）", join(tmp, "superagent.mjs"), [
+		'const off = buildRoleNotice({ enabled: true, router: "blind" }, { enabled: false, router: "blind" });',
+		'ok("关闭 → 生成声明", !!off && off.includes("已关闭"));',
+		'ok("关闭 → 明确说旧规则作废", !!off && off.includes("作废"));',
+		'ok("关闭 → 明确说现在有完整工具", !!off && off.includes("完整工具"));',
+		'const on = buildRoleNotice({ enabled: false, router: "off" }, { enabled: true, router: "readonly" });',
+		'ok("开启 → 生成声明并点明 Router 角色", !!on && on.includes("Router"));',
+		'ok("开启 → 带上档位说明", !!on && on.includes("只读"));',
+		'ok("档位从只读变只派活 → 也算变更", !!buildRoleNotice({ enabled: true, router: "readonly" }, { enabled: true, router: "blind" }));',
+		'ok("什么都没变 → 不生成（别每轮废话）", buildRoleNotice({ enabled: true, router: "blind" }, { enabled: true, router: "blind" }) === undefined);',
+		'ok("真机原样场景：开启→关闭（只动 enabled）能被识别", !!buildRoleNotice({ enabled: true, router: "off" }, { enabled: false, router: "off" }));',
+	], { PI_CODING_AGENT_DIR: join(tmp, "agent-sa2") }) && allOk;
 
 rmSync(tmp, { recursive: true, force: true });
 

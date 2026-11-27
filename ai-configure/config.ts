@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { showHelp } from "./help";
 import { showDoctor } from "./doctor";
 import { isExtDisabled, onGateApply } from "./gate";
+import { stripBom } from "./shared";
 
 /** Master 密钥：优先环境变量 CENTER_TOKEN；也可用 /ai token 设置（只存在内存） */
 let token = process.env.CENTER_TOKEN ?? "";
@@ -57,7 +58,7 @@ function readProjectMcp(cwd: string): { mcpServers: Record<string, McpEntry> } {
 	const f = projectFilePath(cwd);
 	if (!existsSync(f)) return { mcpServers: {} };
 	try {
-		const j = JSON.parse(readFileSync(f, "utf8")) as { mcpServers?: Record<string, McpEntry> };
+		const j = JSON.parse(stripBom(readFileSync(f, "utf8"))) as { mcpServers?: Record<string, McpEntry> };
 		return { mcpServers: j.mcpServers ?? {} };
 	} catch {
 		return { mcpServers: {} };
